@@ -1,0 +1,21 @@
+# 统一行尾为 LF，避免同一个文件在不同平台上出现「内容相同但 diff 非空」
+#
+# 具体踩过的坑：bindings 生成器写文件时用 LF，Windows 上 git 的 core.autocrlf
+# 把它转成 CRLF 存进仓库，CI（也在 Windows）重新生成后再 git diff 就看到
+# 每一行都"变了"，门禁直接失败，但人眼看内容一模一样。
+* text=auto eol=lf
+
+# 二进制文件不参与行尾转换
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.gz binary
+
+# Windows 批处理必须是 CRLF，否则 cmd 解析异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell 脚本保持 LF（pwsh 两种都认，统一到 LF）
+*.ps1 text eol=lf
