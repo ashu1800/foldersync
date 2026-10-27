@@ -98,8 +98,10 @@ jobs:
         with:
           projectPath: apps/desktop
           args: ${{ matrix.args }}
-          # 不传 tagName，action 就不会尝试创建 release
-          releaseDraft: true
+          # 不传 tagName：action 就不会自己建 release，由下面那步统一做。
+          # 也绝不能传 releaseDraft —— 早期这个参数在，导致 gh release create
+          # 建出来的 release 是草稿，草稿不出现在 releases/latest，
+          # 客户端的 updater 永远 404，自动更新形同虚设。
       - name: 上传产物到 Release
         # 用 find 直接找实际产物再传，不经过中间变量：
         # 早期版本用 mapfile 收集，在 Linux/macOS 上拿到空数组（find 明明有输出），
