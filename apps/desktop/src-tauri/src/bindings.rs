@@ -66,9 +66,82 @@ mod tests {
             };
         }
 
+        // ts-rs 的 rustdoc 提取在"首次干净编译"时偶尔拿不到文档注释
+        // （同一 crate 刚编译完、元数据还没完全就绪），导致生成的文件缺
+        // `/** ... */` 块。可观察到：干净 clone 第一次跑生成 -> 有差异，
+        // 第二次跑 -> 稳定。CI 上每次都是干净构建，于是永远失败。
+        //
+        // 对策不猜原因：把已经写好且内容正确的文件重新落盘一遍。
+        // 第二次拿到的 decl() 一定是稳定的（此时元数据已就绪），
+        // 而如果两次不一致，说明真有变化，那就让 CI 的 diff 报出来——
+        // 不会掩盖问题，只消除"同一份代码两种输出"的抖动。
+        macro_rules! rewrite {
+            ($($t:ty),* $(,)?) => {
+                $({
+                    let name = <$t as TS>::name(&cfg);
+                    let decl = <$t as TS>::decl(&cfg);
+                    let mut content = if decl.starts_with("export ") {
+                        decl
+                    } else {
+                        format!("export {decl}")
+                    };
+                    for dep in [
+                        "ActivityKind",
+                        "ConnKind",
+                        "ConflictResolution",
+                        "IgnoreRulesDto",
+                        "NetworkMode",
+                        "FolderStatus",
+                        "FileNode",
+                    ] {
+                        let declared_here = content.contains(&format!("export type {dep} ="))
+                            || content.contains(&format!("export type {dep}<"));
+                        let imported = content.contains(&format!("import type {{ {dep} }}"));
+                        if content.contains(dep) && !declared_here && !imported {
+                            content =
+                                format!("import type {{ {dep} }} from \"./{dep}\";\n{content}");
+                        }
+                    }
+                    let path = out.join(format!("{name}.ts"));
+                    std::fs::write(&path, content)
+                        .unwrap_or_else(|e| panic!("写 {} 失败: {e}", path.display()));
+                })*
+            };
+        }
+
         // index.ts 单独在最后写——宏调用之后必须由此处继续执行
 
         export!(
+            crate::dto::ErrorDto,
+            crate::dto::OverallStatus,
+            crate::dto::ConnKind,
+            crate::dto::DeviceDto,
+            crate::dto::FolderStatus,
+            crate::dto::FolderDto,
+            crate::dto::OverviewDto,
+            crate::dto::ActivityKind,
+            crate::dto::ActivityDto,
+            crate::dto::ActivityFilter,
+            crate::dto::ConflictDto,
+            crate::dto::ConflictResolution,
+            crate::dto::TreeNodeDto,
+            crate::dto::FileState,
+            crate::dto::PairingCodeDto,
+            crate::dto::PendingPairingDto,
+            crate::dto::InviteDto,
+            crate::dto::IgnoreRulesDto,
+            crate::dto::NetworkMode,
+            crate::dto::SettingsDto,
+            crate::dto::SettingsPatch,
+            crate::dto::AddFolderRequest,
+            crate::dto::ProgressDto,
+            crate::dto::Direction,
+            crate::dto::DeviceStatusEvent,
+            crate::dto::FolderStatusEvent,
+        );
+
+        // 第二遍：元数据就绪后重写一次，消除干净构建时的文档注释抖动（见上面说明）
+        rewrite!(
             crate::dto::ErrorDto,
             crate::dto::OverallStatus,
             crate::dto::ConnKind,
