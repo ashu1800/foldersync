@@ -39,11 +39,37 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             // 日志 guard 必须活得比进程长，否则文件写入会立刻停
             std::mem::forget(log_guard);
             info!(dir = %data_dir.display(), "启动 FolderSync");
+            // 开机自启（提示词 5.1）：设置里开着就登记，关着就撤销。
+            // 失败只记日志——注册表被策略锁住时不该让应用起不来。
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let want = app
+                    .try_state::<Arc<AppState>>()
+                    .map(|s| s.settings_dto().auto_start)
+                    .unwrap_or(false);
+                let mgr = app.autolaunch();
+                let currently = mgr.is_enabled().unwrap_or(false);
+                if want && !currently {
+                    match mgr.enable() {
+                        Ok(()) => info!("已启用开机自启"),
+                        Err(e) => warn!("启用开机自启失败: {e}"),
+                    }
+                } else if !want && currently {
+                    match mgr.disable() {
+                        Ok(()) => info!("已关闭开机自启"),
+                        Err(e) => warn!("关闭开机自启失败: {e}"),
+                    }
+                }
+            }
 
             // daemon 初始化是异步的，塞进 tokio 运行时
             let handle = app.handle().clone();

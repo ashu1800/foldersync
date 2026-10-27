@@ -63,9 +63,16 @@ impl AppState {
 
         let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
         let secret = fs_sync_net::identity::load_or_create_secret(&data_dir)?;
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret)
-            .bind()
+        // 设置要先读：中继/端口绑定需要它
+        let settings = Arc::new(SettingsStore::load(&data_dir.join("settings.json"))?);
+        let settings_snapshot = settings.get();
+        // 按设置里的中继/端口绑定（提示词 4.x）。配置非法时内部会回退到默认，
+        // 不会因为用户填错一个 URL 就启动失败。
+        let net = fs_sync_net::NetConfig {
+            relay_url: settings_snapshot.relay_url.clone(),
+            listen_port: settings_snapshot.listen_port,
+        };
+        let endpoint = fs_sync_net::bind_endpoint_with(&net, secret)
             .await
             .context("iroh 端点绑定失败")?;
         let endpoint_id = endpoint.id();

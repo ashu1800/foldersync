@@ -202,3 +202,35 @@ blob 存储**。watcher 路径有 `ensure_blob`，兜底扫描漏了。
 结论：这类测试的成本很低（40 行），收益是发现了两个都会导致**用户数据在对端缺失**
 的 bug。以后加同步逻辑改动时应该优先跑它。
 
+## 2026-10-27 网络配置（自建中继/固定端口）真的接进 Endpoint 了
+
+之前设置页能存 `relay_url` / `listen_port` / `network_mode`，但 `AppState::init`
+用的是写死的 `presets::N0` —— 三个字段是**死配置**，改了没用。
+
+现在 `fs_sync_net::bind_endpoint_with(config, secret)`：
+- `relay_url` → `builder.relay_mode(RelayMode::custom([url]))`
+- `listen_port` → `builder.bind_addr(0.0.0.0:port)`
+- 两者非法时**回退默认并记 warn**，不让应用起不来
+
+两个实现细节值得记：
+
+1. **`bind_addr` 消耗 builder 且失败不可恢复**。Rust 没法在 `match` 的两个分支里
+   用一个被 move 掉的 builder。所以先用 `TcpListener::bind` 探测端口可用性
+   （探完立刻 drop，否则和 iroh 抢端口），确认可用才真正 `bind_addr`。
+
+2. **设置文件解析失败要回退，不要崩**。`SettingsStore::load` 里已经有这条，
+   实测过：写了一版 `"network_mode": "Auto"`（枚举是 snake_case）时，
+   日志出现"设置文件损坏，改用默认值"，应用正常启动。这是对的行为。
+
+验证方式：settings.json 里写 `relay_url=https://invalid-relay.example.com./`
+和 `listen_port=45678`，启动后日志显示"使用自建中继"，`netstat` 显示
+`UDP 0.0.0.0:45678` 在 listen。
+
+## 2026-10-27 开机自启用 tauri-plugin-autostart
+
+设置里的 `auto_start` 之前也是死字段。现在用官方插件：
+`app.autolaunch().is_enabled()/enable()/disable()`，在 `setup` 里按设置同步一次。
+
+失败只记 warn 不中断启动 —— 有些企业策略会锁注册表，那种情况下应用仍然可用，
+只是不自启。capability 里加了 `autostart:default` 权限。
+
