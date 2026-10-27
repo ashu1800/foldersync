@@ -33,13 +33,15 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
-            args: ""
+            args: "--bundles nsis"
           - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
+            args: "--target aarch64-apple-darwin --bundles app,dmg"
           - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            args: "--target x86_64-apple-darwin --bundles app,dmg"
           - platform: ubuntu-22.04
-            args: ""
+            # 显式列 bundles：不指定时 tauri 在 CI 上会跳过打包（只出裸二进制），
+            # 上一轮 Windows 出了安装包而 Linux 什么都没出就是这个原因。
+            args: "--bundles deb,rpm,appimage"
 
     runs-on: ${{ matrix.platform }}
     steps:
