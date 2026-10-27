@@ -110,6 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
+          VERSION="${TAG#v}"
 
           # 第一个跑到的 job 创建 release，其它 job 追加资产
           if ! gh release view "$TAG" >/dev/null 2>&1; then
@@ -122,14 +123,28 @@ jobs:
           # 注意路径：带 --target 构建时（macOS 两个 job）产物在
           # target/<triple>/release/bundle，不在 target/release/bundle，
           # 所以从 target 往下匹配 */release/bundle/*。
+          #
+          # macOS 的 .app.tar.gz 两个架构同名（都叫 FolderSync.app.tar.gz），
+          # 直接传会互相覆盖，导致两个架构的更新包变成同一个文件。
+          # 上传前改名把架构带上。
           count=0
           while IFS= read -r -d '' f; do
-            echo "uploading $f"
-            gh release upload "$TAG" "$f" --clobber
+            upload="$f"
+            case "$f" in
+              *.app.tar.gz)
+                case "$f" in
+                  *aarch64*) upload="/tmp/FolderSync_${VERSION}_aarch64.app.tar.gz" ;;
+                  *)         upload="/tmp/FolderSync_${VERSION}_x64.app.tar.gz" ;;
+                esac
+                cp "$f" "$upload"
+                ;;
+            esac
+            echo "uploading $upload"
+            gh release upload "$TAG" "$upload" --clobber
             count=$((count + 1))
           done < <(find target -path "*/release/bundle/*" -type f \
             \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
-               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) -print0)
+               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.app.tar.gz" \) -print0)
 
           if [ "$count" -eq 0 ]; then
             echo "no artifacts found" >&2
@@ -156,20 +171,17 @@ jobs:
           files = [f for f in glob.glob("target/**/release/bundle/**/*", recursive=True)
                    if os.path.isfile(f)]
           version = os.environ["VERSION"]
+          # shell 变量在 python 里访问不到，必须从 env 读
+          tag = os.environ["TAG"]
 
           def url(name):
-              # TAG 已带 v 前缀（github.ref_name == "v0.1.0"），别再拼一个 v
-              return f"https://github.com/ashu1800/foldersync/releases/download/{TAG}/{name}"
+              # tag 已带 v 前缀（v0.1.0），别再拼一个 v
+              return f"https://github.com/ashu1800/foldersync/releases/download/{tag}/{name}"
 
           # updater 各平台认的包类型不同：
           #   Windows -> nsis 的 .exe（Tauri 会自己加 .nsis.zip 后缀）
           #   Linux   -> .AppImage
           #   macOS   -> .app.tar.gz（不是 .dmg！dmg 不能原地替换 app）
-          wanted = {
-              ".exe": "windows-x86_64",
-              ".AppImage": "linux-x86_64",
-              ".gz": None,  # .app.tar.gz，按路径里有没有 aarch64 判断架构
-          }
 
           got = {}
           for f in files:
@@ -181,7 +193,11 @@ jobs:
                   continue
 
               if name.endswith(".app.tar.gz"):
-                  target = "darwin-aarch64" if "aarch64" in f else "darwin-x86_64"
+                  arch = "aarch64" if "aarch64" in f else "x64"
+                  target = f"darwin-{'aarch64' if arch == 'aarch64' else 'x86_64'}"
+                  # 上传步骤把它改名成带架构的文件名，URL 必须跟着改，
+                  # 否则两个架构都指向同一个 FolderSync.app.tar.gz
+                  name = f"FolderSync_{version}_{arch}.app.tar.gz"
               elif name.endswith(".exe"):
                   target = "windows-x86_64"
               elif name.endswith(".AppImage"):
