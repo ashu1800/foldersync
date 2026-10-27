@@ -29,11 +29,34 @@ mod tests {
                     let decl = <$t as TS>::decl(&cfg);
                     // ts-rs 的枚举声明不带 `export` 前缀（因为它假设按需内联），
                     // 但我们要每个类型独立成模块，必须显式导出。
-                    let content = if decl.starts_with("export ") {
+                    let mut content = if decl.starts_with("export ") {
                         decl
                     } else {
                         format!("export {decl}")
                     };
+                    // ts-rs 对内联展开的类型（如带 optional_fields 的结构体里引用了
+                    // 另一个枚举）不会自动补 import，生成的文件单独编译会报
+                    // "Cannot find name 'X'"。这里按已知类型名补一遍。
+                    // 新增跨类型引用的 DTO 时如果又漏了，tsc 会立刻报错。
+                    for dep in [
+                        "ActivityKind",
+                        "ConnKind",
+                        "ConflictResolution",
+                        "IgnoreRulesDto",
+                        "NetworkMode",
+                        "FolderStatus",
+                        "FileNode",
+                    ] {
+                        let uses = content.contains(dep);
+                        let declares = content.contains(&format!("type {dep} "))
+                            || content.contains(&format!("type {dep}="))
+                            || content.starts_with(&format!("export type {dep} ="));
+                        let imported = content.contains(&format!("import type {{ {dep} }}"));
+                        if uses && !declares && !imported {
+                            content =
+                                format!("import type {{ {dep} }} from \"./{dep}\";\n{content}");
+                        }
+                    }
                     let path = out.join(format!("{name}.ts"));
                     std::fs::write(&path, content)
                         .unwrap_or_else(|e| panic!("写 {} 失败: {e}", path.display()));

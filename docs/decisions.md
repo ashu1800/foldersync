@@ -276,3 +276,29 @@ cargo test -p fs-sync-net  large_file -- --ignored --nocapture
 配套的实测数据（验收标准 4）：**空闲 CPU 0.29%**（60 秒采样），
 内存 60→61 MB。符合"空闲时 CPU 接近 0，内存稳定"。
 
+## 2026-10-27 ts-rs 漏生成 import，CI 差点放过
+
+`ActivityFilter.ts` 生成出来是：
+
+```ts
+export type ActivityFilter = { folder_id?: string, kind?: ActivityKind, limit?: number, ... };
+```
+
+用了 `ActivityKind` 却**没有 import**。单独编译这个文件报
+`TS2304: Cannot find name 'ActivityKind'`。
+
+原因：ts-rs 对「加了 `#[ts(optional_fields)]` 的结构体里引用另一个枚举」这种组合
+不会自动补 import。其它 DTO（`ActivityDto`、`DeviceDto`）都正常，只有这个漏了。
+
+**为什么之前没发现**：我多次看到 `tsc --noEmit` 没输出就以为通过，
+但其实 PowerShell 里 `pnpm exec tsc` 的 stderr 输出去到了别处，
+`Select-Object -First 5` 截断后看起来是空的。真正检查要看 `$LASTEXITCODE`。
+
+修复方式：在 `bindings.rs` 的 export 宏里，写完文件后扫一遍常见依赖类型名，
+被引用但未声明、未 import 的就补一行 `import type { X } from "./X";`。
+这个后处理是"补漏"而非"生成"，所以列的是已知类型名；新增跨类型引用时如果又漏了，
+`tsc` 在 CI 里会立刻炸 —— 这正是我们要的兜底。
+
+CI 里已经加了 `pnpm exec tsc --noEmit` 和 `git diff --exit-code src/lib/bindings/`，
+两边都能拦住这类问题。
+
