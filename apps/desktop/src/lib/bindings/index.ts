@@ -1,5 +1,3 @@
-// 本文件由 cargo test 自动生成，请勿手改。
-
 export type { ErrorDto } from "./ErrorDto";
 export type { OverallStatus } from "./OverallStatus";
 export type { ConnKind } from "./ConnKind";

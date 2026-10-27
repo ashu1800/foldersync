@@ -13,6 +13,12 @@ mod tests {
     ///
     /// 用 `cargo test` 而不是独立 bin：CI 里的 `cargo test` 就能顺带校验
     /// 类型定义仍可生成，不会出现「改了 Rust 忘了重新生成」的漂移。
+    ///
+    /// **必须用 `TS::export_to_string`**，不能自己拿 `TS::decl` 拼：
+    /// ts-rs 的文件是「文件头 + docs + imports + export type ...」四段拼起来的，
+    /// `decl()` 只有最后一段。早期自己拼导致 rustdoc 全部丢失，而且不同环境
+    /// （本地有增量缓存 / CI 干净构建）拼出来的结果还不一样，CI 的
+    /// `git diff --exit-code` 永远失败。官方函数负责完整拼装，且结果稳定。
     #[test]
     fn export_bindings() {
         let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings");
@@ -26,90 +32,14 @@ mod tests {
             ($($t:ty),* $(,)?) => {
                 $({
                     let name = <$t as TS>::name(&cfg);
-                    let decl = <$t as TS>::decl(&cfg);
-                    // ts-rs 的枚举声明不带 `export` 前缀（因为它假设按需内联），
-                    // 但我们要每个类型独立成模块，必须显式导出。
-                    let mut content = if decl.starts_with("export ") {
-                        decl
-                    } else {
-                        format!("export {decl}")
-                    };
-                    // ts-rs 对内联展开的类型（比如带 optional_fields 的结构体里
-                    // 引用了另一个枚举）不会自动补 import，生成的文件单独编译会报
-                    // "Cannot find name 'X'"。这里补一遍。
-                    //
-                    // 判定"自己声明了这个类型"必须看整段内容而不是 starts_with：
-                    // 生成的文件开头有 ts-rs 的文件头注释和 rustdoc，真正的
-                    // `export type X = ...` 在中间。之前用 starts_with 判断失败，
-                    // 结果给枚举自己加了一行 import 它自己。
-                    for dep in [
-                        "ActivityKind",
-                        "ConnKind",
-                        "ConflictResolution",
-                        "IgnoreRulesDto",
-                        "NetworkMode",
-                        "FolderStatus",
-                        "FileNode",
-                    ] {
-                        let declared_here = content.contains(&format!("export type {dep} ="))
-                            || content.contains(&format!("export type {dep}<"));
-                        let imported = content.contains(&format!("import type {{ {dep} }}"));
-                        if content.contains(dep) && !declared_here && !imported {
-                            content =
-                                format!("import type {{ {dep} }} from \"./{dep}\";\n{content}");
-                        }
-                    }
+                    let content = <$t as TS>::export_to_string(&cfg)
+                        .unwrap_or_else(|e| panic!("生成 {name} 失败: {e}"));
                     let path = out.join(format!("{name}.ts"));
                     std::fs::write(&path, content)
                         .unwrap_or_else(|e| panic!("写 {} 失败: {e}", path.display()));
                 })*
             };
         }
-
-        // ts-rs 的 rustdoc 提取在"首次干净编译"时偶尔拿不到文档注释
-        // （同一 crate 刚编译完、元数据还没完全就绪），导致生成的文件缺
-        // `/** ... */` 块。可观察到：干净 clone 第一次跑生成 -> 有差异，
-        // 第二次跑 -> 稳定。CI 上每次都是干净构建，于是永远失败。
-        //
-        // 对策不猜原因：把已经写好且内容正确的文件重新落盘一遍。
-        // 第二次拿到的 decl() 一定是稳定的（此时元数据已就绪），
-        // 而如果两次不一致，说明真有变化，那就让 CI 的 diff 报出来——
-        // 不会掩盖问题，只消除"同一份代码两种输出"的抖动。
-        macro_rules! rewrite {
-            ($($t:ty),* $(,)?) => {
-                $({
-                    let name = <$t as TS>::name(&cfg);
-                    let decl = <$t as TS>::decl(&cfg);
-                    let mut content = if decl.starts_with("export ") {
-                        decl
-                    } else {
-                        format!("export {decl}")
-                    };
-                    for dep in [
-                        "ActivityKind",
-                        "ConnKind",
-                        "ConflictResolution",
-                        "IgnoreRulesDto",
-                        "NetworkMode",
-                        "FolderStatus",
-                        "FileNode",
-                    ] {
-                        let declared_here = content.contains(&format!("export type {dep} ="))
-                            || content.contains(&format!("export type {dep}<"));
-                        let imported = content.contains(&format!("import type {{ {dep} }}"));
-                        if content.contains(dep) && !declared_here && !imported {
-                            content =
-                                format!("import type {{ {dep} }} from \"./{dep}\";\n{content}");
-                        }
-                    }
-                    let path = out.join(format!("{name}.ts"));
-                    std::fs::write(&path, content)
-                        .unwrap_or_else(|e| panic!("写 {} 失败: {e}", path.display()));
-                })*
-            };
-        }
-
-        // index.ts 单独在最后写——宏调用之后必须由此处继续执行
 
         export!(
             crate::dto::ErrorDto,
@@ -140,39 +70,9 @@ mod tests {
             crate::dto::FolderStatusEvent,
         );
 
-        // 第二遍：元数据就绪后重写一次，消除干净构建时的文档注释抖动（见上面说明）
-        rewrite!(
-            crate::dto::ErrorDto,
-            crate::dto::OverallStatus,
-            crate::dto::ConnKind,
-            crate::dto::DeviceDto,
-            crate::dto::FolderStatus,
-            crate::dto::FolderDto,
-            crate::dto::OverviewDto,
-            crate::dto::ActivityKind,
-            crate::dto::ActivityDto,
-            crate::dto::ActivityFilter,
-            crate::dto::ConflictDto,
-            crate::dto::ConflictResolution,
-            crate::dto::TreeNodeDto,
-            crate::dto::FileState,
-            crate::dto::PairingCodeDto,
-            crate::dto::PendingPairingDto,
-            crate::dto::InviteDto,
-            crate::dto::IgnoreRulesDto,
-            crate::dto::NetworkMode,
-            crate::dto::SettingsDto,
-            crate::dto::SettingsPatch,
-            crate::dto::AddFolderRequest,
-            crate::dto::ProgressDto,
-            crate::dto::Direction,
-            crate::dto::DeviceStatusEvent,
-            crate::dto::FolderStatusEvent,
-        );
-
-        // index.ts 统一再导出，前端只 import 一个入口
-        let mut index = String::from("// 本文件由 cargo test 自动生成，请勿手改。\n\n");
-        for name in [
+        // index.ts 汇总，前端可以 `import { DeviceDto } from "../lib/bindings"`
+        let mut index = String::new();
+        for t in [
             "ErrorDto",
             "OverallStatus",
             "ConnKind",
@@ -200,7 +100,7 @@ mod tests {
             "DeviceStatusEvent",
             "FolderStatusEvent",
         ] {
-            index.push_str(&format!("export type {{ {name} }} from \"./{name}\";\n"));
+            index.push_str(&format!("export type {{ {t} }} from \"./{t}\";\n"));
         }
         std::fs::write(out.join("index.ts"), index).expect("写 index.ts 失败");
     }
