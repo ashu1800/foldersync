@@ -78,7 +78,12 @@ jobs:
         working-directory: apps/desktop
         run: pnpm install --frozen-lockfile
 
-      # tauri-action 会：构建 → 签名 updater 包 → 创建/更新 release → 上传 latest.json
+      # 只用 tauri-action 构建 + 签名，不上传。
+      #
+      # 不用 action 自带的 release 上传，因为它靠 `info.name` 猜产物文件名：
+      # Linux 上 Tauri 把 productName "FolderSync" 转成 kebab-case "folder-sync"，
+      # action 仍按 "FolderSync" 找文件，于是 "No artifacts were found"。
+      # 我们自己 glob 实际产物再上传，跨平台都可靠。
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -90,23 +95,156 @@ jobs:
           CI: true
         with:
           projectPath: apps/desktop
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
-          releaseName: "FolderSync v__VERSION__"
-          releaseBody: |
-            ## 安装
-
-            下载对应平台的安装包直接安装即可。已安装旧版的用户会在应用内收到更新提示。
-
-            | 平台 | 文件 |
-            |------|------|
-            | Windows | `FolderSync___VERSION___x64-setup.exe` |
-            | macOS (Apple Silicon) | `FolderSync___VERSION___aarch64.dmg` |
-            | macOS (Intel) | `FolderSync___VERSION___x64.dmg` |
-            | Linux | `foldersync___VERSION___amd64.AppImage` / `.deb` |
-
-            ## 数据位置
-
-            `~/.foldersync/` —— 升级不会动这个目录，`secret.key` 与索引原样保留。
-          releaseDraft: false
-          prerelease: false
           args: ${{ matrix.args }}
+          # 不传 tagName，action 就不会尝试创建 release
+          releaseDraft: true
+
+      - name: 收集构建产物
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 四平台产物扩展名不同，统一 glob
+          mapfile -t files < <(find target/release/bundle -type f \
+            \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
+               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) 2>/dev/null)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有找到任何产物" >&2
+            exit 1
+          fi
+          printf '找到 %d 个产物:\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          {
+            echo "files<<EOF"
+            printf '%s\n' "${files[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
+          # 第一个跑到的 job 创建 release，其它 job 追加资产
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "FolderSync $TAG" \
+              --notes "见 Release 说明。已安装旧版的用户可在应用内「检查更新」升级。"
+          fi
+          while IFS= read -r f; do
+            [ -n "$f" ] && gh release upload "$TAG" "$f" --clobber
+          done <<< "${{ steps.collect.outputs.files }}"
+
+      - name: 生成平台更新清单碎片
+        # updater 的 latest.json 需要把所有平台合并进一个文件。四个 job 并发跑，
+        # 各自写自己的碎片（updater-<target>.json），最后由专门的 merge job 合并。
+        # 直接并发写同一个 latest.json 会互相覆盖。
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fragments
+          python3 - <<'PY'
+          import glob, json, os, pathlib
+
+          files = [f for f in glob.glob("target/release/bundle/**/*", recursive=True)
+                   if os.path.isfile(f)]
+          version = os.environ["VERSION"]
+
+          def url(name):
+              return f"https://github.com/ashu1800/foldersync/releases/download/v{version}/{name}"
+
+          # updater 认这几种包；deb/rpm 不是 updater 格式，不上报
+          wanted = {
+              ".exe": "windows-x86_64",
+              ".AppImage": "linux-x86_64",
+              ".dmg": None,  # 按文件名里的架构决定
+          }
+
+          got = {}
+          for f in files:
+              if f.endswith(".sig"):
+                  continue
+              ext = pathlib.Path(f).suffix
+              if ext not in wanted:
+                  continue
+              sig = f + ".sig"
+              if not os.path.exists(sig):
+                  continue
+              if ext == ".dmg":
+                  target = "darwin-aarch64" if "aarch64" in f else "darwin-x86_64"
+              else:
+                  target = wanted[ext]
+              got[target] = {
+                  "signature": open(sig).read().strip(),
+                  "url": url(os.path.basename(f)),
+              }
+
+          if not got:
+              # 这个平台没有 updater 格式的产物（比如只出了 deb），不算失败
+              print("本平台无 updater 产物，跳过")
+              raise SystemExit(0)
+
+          for target, entry in got.items():
+              out = pathlib.Path(f"fragments/updater-{target}.json")
+              out.write_text(json.dumps({target: entry}, indent=2))
+              print(f"写出 {out}: {entry['url']}")
+          PY
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: 上传清单碎片
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-fragment-${{ matrix.platform }}-${{ strategy.job-index }}
+          path: fragments/
+          if-no-files-found: ignore
+
+  # 合并四个平台产出的清单碎片，生成 updater 认识的 latest.json
+  latest-json:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 收集各平台碎片
+        uses: actions/download-artifact@v4
+        with:
+          pattern: updater-fragment-*
+          path: fragments
+          merge-multiple: true
+
+      - name: 合并为 latest.json 并上传
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
+          VERSION="${TAG#v}"
+
+          python3 - "$VERSION" <<'PY'
+          import glob, json, pathlib, sys
+          version = sys.argv[1]
+
+          platforms = {}
+          for f in glob.glob("fragments/updater-*.json"):
+              platforms.update(json.loads(pathlib.Path(f).read_text()))
+
+          if not platforms:
+              raise SystemExit("没有任何平台的更新清单，检查构建是否产出了 .sig 文件")
+
+          doc = {
+              "version": version,
+              "notes": f"FolderSync {version}",
+              "platforms": platforms,
+          }
+          pathlib.Path("latest.json").write_text(json.dumps(doc, indent=2))
+          print(json.dumps(doc, indent=2))
+          PY
+
+          gh release upload "$TAG" latest.json --clobber
+          echo "latest.json 已上传，包含 $(python3 -c "import json;print(len(json.load(open('latest.json'))['platforms']))") 个平台"
