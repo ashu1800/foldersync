@@ -167,4 +167,39 @@ mod tests {
             assert!(r.skipped.iter().any(|s| s == "link.txt"));
         }
     }
+
+    /// 规模测试（提示词 7 节）：10 万个小文件的扫描要能跑完且不炸内存。
+    ///
+    /// 标 `#[ignore]`：单跑约几十秒，不该拖慢日常 `cargo test`。
+    /// 用 `cargo test -p fs-sync-core -- --ignored` 显式运行。
+    #[test]
+    #[ignore]
+    fn scan_100k_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 100 个目录 × 1000 个文件
+        for d in 0..100 {
+            let dir = tmp.path().join(format!("d{d:03}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..1000 {
+                std::fs::write(dir.join(format!("f{f:04}.txt")), format!("{d}-{f}")).unwrap();
+            }
+        }
+
+        let matcher = IgnoreMatcher::with_defaults(tmp.path());
+        let start = std::time::Instant::now();
+        let result = scan_folder(tmp.path(), &matcher).unwrap();
+        let elapsed = start.elapsed();
+
+        // 目录本身也计入（同步目录结构需要），所以是 100000 文件 + 100 目录
+        assert_eq!(result.entries.len(), 100_100, "应扫到 10 万文件 + 100 目录");
+        let files = result.entries.values().filter(|e| !e.is_dir).count();
+        assert_eq!(files, 100_000, "文件数应为 10 万");
+        println!("10 万文件扫描耗时: {elapsed:?}");
+
+        // 兜底断言：不能慢到不可用（机械硬盘上会慢些，给足余量）
+        assert!(
+            elapsed < std::time::Duration::from_secs(180),
+            "10 万文件扫描超过 3 分钟: {elapsed:?}"
+        );
+    }
 }

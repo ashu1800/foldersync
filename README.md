@@ -75,6 +75,25 @@ cd apps/desktop && pnpm install && pnpm tauri dev
 | 双向同时新增 | 各自 1.0 ~ 1.1 秒，最终列表一致 |
 | 同文件并发修改 | 生成 `名字.sync-conflict-时间-设备名.扩展名`，两边原文件都保留 |
 | 连接类型演进 | 中继 → 经 Tailscale → 直连（iroh 自动打洞升级） |
+| 10 万文件扫描 | 21 秒（100 目录 × 1000 文件，含 blake3） |
+| 1 GiB 单文件往返 | 见下方"规模测试" |
+| 测试总数 | 177 个（含 16 个双节点集成测试） |
+
+## 规模测试（手工运行，日常测试不跑）
+
+```bash
+cargo test -p fs-sync-core scan_100k -- --ignored --nocapture
+cargo test -p fs-sync-net  large_file -- --ignored --nocapture
+```
+
+| 场景 | 结果 |
+|------|------|
+| 10 万个小文件扫描 | 21 秒（含 blake3 哈希） |
+| 1 GiB 单文件入库 | 2.5 秒 |
+| 1 GiB 单文件导出 | 7.0 秒 |
+| 1 GiB 完整性 | 逐字节一致，同内容同 hash |
+
+这两个测试标了 `#[ignore]`：跑一次要写满磁盘、耗时数分钟，不适合放进每次 CI。
 
 ## 打包与分发
 

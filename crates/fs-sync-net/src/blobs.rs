@@ -114,4 +114,65 @@ mod tests {
         assert!(!has_blob(&store, &"00".repeat(32)).await);
         assert!(!has_blob(&store, "not-a-hash").await);
     }
+
+    /// 大文件往返（提示词 7 节：≥1GB）。
+    ///
+    /// 标 `#[ignore]`：要写 1GB 临时文件，日常测试不该跑。
+    /// 跑法：`cargo test -p fs-sync-net large_file -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn large_file_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp.path().join("blobs")).await.unwrap();
+
+        // 1 GiB + 一点，跨过整数边界
+        const SIZE: usize = 1024 * 1024 * 1024 + 4096;
+        let src = tmp.path().join("big.bin");
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&src).unwrap());
+            // 1 MiB 一块地写，内容用 xorshift 生成（可复现、非全零）
+            let mut chunk = vec![0u8; 1024 * 1024];
+            let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+            let mut written = 0usize;
+            while written < SIZE {
+                for b in chunk.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *b = x as u8;
+                }
+                let take = (SIZE - written).min(chunk.len());
+                f.write_all(&chunk[..take]).unwrap();
+                written += take;
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let hash = add_file(&store, &src).await.unwrap();
+        let add_elapsed = t0.elapsed();
+        println!("1GiB 入库耗时: {add_elapsed:?}");
+
+        // 导回去比对
+        let dest = tmp.path().join("out.bin");
+        let t1 = std::time::Instant::now();
+        export_to(&store, &hash, &dest).await.unwrap();
+        let export_elapsed = t1.elapsed();
+        println!("1GiB 导出耗时: {export_elapsed:?}");
+
+        let a = std::fs::metadata(&src).unwrap().len();
+        let b = std::fs::metadata(&dest).unwrap().len();
+        assert_eq!(a, b, "大小必须一致");
+        assert_eq!(a as usize, SIZE);
+
+        // 逐字节比对（大文件最容易在这里出错）
+        let src_bytes = std::fs::read(&src).unwrap();
+        let dest_bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(src_bytes.len(), dest_bytes.len());
+        assert!(src_bytes == dest_bytes, "1GiB 内容必须完全一致");
+
+        // 内容寻址：同内容再入库应得到同一个 hash
+        let hash2 = add_file(&store, &dest).await.unwrap();
+        assert_eq!(hash, hash2, "内容寻址要求同内容同 hash");
+    }
 }
