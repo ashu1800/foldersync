@@ -4,3 +4,28 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+# 运行时数据目录（测试用），绝不进仓库
+.cli-test/
+.m4-home/
+.t-home/
+.m4-office/
+/large-test.bat
+/final-build.bat
+
+# 本地数据目录
+.foldersync/
+
+# 生成的诊断包
+**/diagnostics/
+# 测试残留目录
+.gui-test/
+.m5/
+.m4-home/
+.t-home/
+.cli-test/
+
+# Tauri 自动生成的 ACL schema（每次 build 重新生成，不该入库）
+apps/desktop/src-tauri/gen/
+# 本机调试用的批处理（含硬编码路径）
+*-office.bat
+serve-*.bat
