@@ -34,10 +34,14 @@ mod tests {
                     } else {
                         format!("export {decl}")
                     };
-                    // ts-rs 对内联展开的类型（如带 optional_fields 的结构体里引用了
-                    // 另一个枚举）不会自动补 import，生成的文件单独编译会报
-                    // "Cannot find name 'X'"。这里按已知类型名补一遍。
-                    // 新增跨类型引用的 DTO 时如果又漏了，tsc 会立刻报错。
+                    // ts-rs 对内联展开的类型（比如带 optional_fields 的结构体里
+                    // 引用了另一个枚举）不会自动补 import，生成的文件单独编译会报
+                    // "Cannot find name 'X'"。这里补一遍。
+                    //
+                    // 判定"自己声明了这个类型"必须看整段内容而不是 starts_with：
+                    // 生成的文件开头有 ts-rs 的文件头注释和 rustdoc，真正的
+                    // `export type X = ...` 在中间。之前用 starts_with 判断失败，
+                    // 结果给枚举自己加了一行 import 它自己。
                     for dep in [
                         "ActivityKind",
                         "ConnKind",
@@ -47,12 +51,10 @@ mod tests {
                         "FolderStatus",
                         "FileNode",
                     ] {
-                        let uses = content.contains(dep);
-                        let declares = content.contains(&format!("type {dep} "))
-                            || content.contains(&format!("type {dep}="))
-                            || content.starts_with(&format!("export type {dep} ="));
+                        let declared_here = content.contains(&format!("export type {dep} ="))
+                            || content.contains(&format!("export type {dep}<"));
                         let imported = content.contains(&format!("import type {{ {dep} }}"));
-                        if uses && !declares && !imported {
+                        if content.contains(dep) && !declared_here && !imported {
                             content =
                                 format!("import type {{ {dep} }} from \"./{dep}\";\n{content}");
                         }
