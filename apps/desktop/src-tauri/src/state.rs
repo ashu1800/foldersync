@@ -288,6 +288,47 @@ pub async fn restore_folders(state: Arc<AppState>) {
     }
 }
 
+/// 重连退避策略（提示词验收：断网再联网后自动恢复，无需用户干预）。
+///
+/// 抽成独立类型是为了能测：`spawn_peer_loop` 本身要真网络，
+/// 但退避计算是纯逻辑，可以断言它不会退化成"永远不等"或"等太久"。
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    next: std::time::Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Backoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new() -> Self {
+        Self {
+            next: Self::INITIAL,
+        }
+    }
+
+    /// 本次该等多久。
+    pub fn current(&self) -> std::time::Duration {
+        self.next
+    }
+
+    /// 连接成功后重置回初始值。
+    pub fn reset(&mut self) {
+        self.next = Self::INITIAL;
+    }
+
+    /// 连接失败后翻倍（封顶 60 秒）。
+    pub fn back_off(&mut self) {
+        self.next = (self.next * 2).min(Self::MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +347,38 @@ mod tests {
     #[test]
     fn hostname_is_non_empty() {
         assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    fn backoff_starts_at_two_seconds() {
+        assert_eq!(Backoff::new().current(), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps_at_sixty() {
+        let mut b = Backoff::new();
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(b.current().as_secs());
+            b.back_off();
+        }
+        assert_eq!(seen[0], 2);
+        assert_eq!(seen[1], 4);
+        assert_eq!(seen[2], 8);
+        assert_eq!(b.current(), std::time::Duration::from_secs(60));
+        assert!(
+            seen.iter().all(|&s| s <= 60),
+            "退避不应超过 60 秒: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_resets_after_success() {
+        let mut b = Backoff::new();
+        b.back_off();
+        b.back_off();
+        assert_eq!(b.current(), std::time::Duration::from_secs(8));
+        b.reset();
+        assert_eq!(b.current(), std::time::Duration::from_secs(2));
     }
 }

@@ -259,3 +259,20 @@ cargo test -p fs-sync-net  large_file -- --ignored --nocapture
 为什么不放进常规 CI：10 万文件要 ~100 秒（建文件 + 扫描），1GiB 要写满一次磁盘。
 让每次 push 都跑这个不合理。真机验收时手工跑一遍。
 
+## 2026-10-27 重连退避抽成可测类型
+
+`spawn_peer_loop` 里原来是内联的 `let mut backoff = Duration::from_secs(2)` +
+每次循环 `backoff = (backoff * 2).min(60s)`。逻辑对，但**没法测**——
+要测它得连真网络。
+
+抽成 `state::Backoff`（current/reset/back_off），3 个单元测试断言：
+- 初始 2 秒
+- 失败后 2→4→8...→封顶 60 秒，且永远不超过 60
+- 成功一次立刻回到 2 秒
+
+最后一条尤其重要：如果失败后忘记 `reset`，一次断网会让重连间隔永久卡在 60 秒，
+用户会觉得"同步坏了"。
+
+配套的实测数据（验收标准 4）：**空闲 CPU 0.29%**（60 秒采样），
+内存 60→61 MB。符合"空闲时 CPU 接近 0，内存稳定"。
+

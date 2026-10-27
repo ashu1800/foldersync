@@ -172,7 +172,7 @@ fn make_event_sink(app: tauri::AppHandle) -> protocol::EventSink {
 /// 断线后指数退避重连（提示词 4.8 / 7：断网再联网自动恢复）。
 fn spawn_peer_loop(state: Arc<AppState>, events: protocol::EventSink) {
     tauri::async_runtime::spawn(async move {
-        let mut backoff = std::time::Duration::from_secs(2);
+        let mut backoff = crate::state::Backoff::new();
         loop {
             let peers = state.trust.devices().unwrap_or_default();
             for peer in peers {
@@ -192,12 +192,14 @@ fn spawn_peer_loop(state: Arc<AppState>, events: protocol::EventSink) {
                 }
 
                 match sync_round(&state, peer_id, &folder_ids, &events).await {
-                    Ok(()) => backoff = std::time::Duration::from_secs(2),
-                    Err(e) => tracing::debug!(peer = %peer.name, "同步会话结束: {e:#}"),
+                    Ok(()) => backoff.reset(),
+                    Err(e) => {
+                        tracing::debug!(peer = %peer.name, "同步会话结束: {e:#}");
+                        backoff.back_off();
+                    }
                 }
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            tokio::time::sleep(backoff.current()).await;
         }
     });
 }
