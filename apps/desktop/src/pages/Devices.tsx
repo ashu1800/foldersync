@@ -127,10 +127,7 @@ export default function Devices() {
             icon="◍"
             title={t("devices.empty")}
             action={
-              <button
-                className="btn btn-primary"
-                onClick={() => setShowAdd(true)}
-              >
+              <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
                 {t("devices.add")}
               </button>
             }
@@ -335,9 +332,7 @@ function AddDeviceModal({
             </p>
           </>
         ) : (
-          <p className="hint">
-            点击下方按钮生成一次性配对码，5 分钟内有效。
-          </p>
+          <p className="hint">点击下方按钮生成一次性配对码，5 分钟内有效。</p>
         )
       ) : (
         <div className="field">

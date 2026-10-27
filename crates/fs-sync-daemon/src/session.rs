@@ -313,7 +313,13 @@ impl SyncSession {
                         Ok(()) => crate::sync::read_blob_bytes(&self.blobs, &lose.hash)
                             .await
                             .ok(),
-                        Err(_) => None,
+                        Err(e) => {
+                            // 拿不到落败版本内容不是致命错误——apply_conflict 会把
+                            // 本地现有文件改名保住（见 engine.rs）。这里记一条日志，
+                            // 不要因为拉取失败就跳过整个冲突处理。
+                            warn!(%path, "落败版本内容不可读，将保留本地文件为副本: {e}");
+                            None
+                        }
                     };
                     match self
                         .engine

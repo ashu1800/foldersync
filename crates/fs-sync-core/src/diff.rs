@@ -213,8 +213,7 @@ mod tests {
     #[test]
     fn remote_dominates_pulls() {
         let l = map(vec![entry("a.txt", "h1", 100, "A", 1)]);
-        let r = map(vec![entry("a.txt", "h2", 200, "B", 1)]);
-        // A1 vs B1 并发？不：给远端更高版本
+        // 让远端版本严格支配本地：{A:2, B:1}
         let mut re = entry("a.txt", "h2", 200, "A", 2);
         re.version.increment("B");
         let r = map(vec![re]);

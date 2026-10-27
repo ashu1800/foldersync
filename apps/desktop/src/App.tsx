@@ -2,13 +2,7 @@
 
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import {
-  NavLink,
-  Navigate,
-  Route,
-  Routes,
-  useLocation,
-} from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import * as api from "./lib/tauri";
 import { useStore } from "./stores/app";
 import { OverallBadge } from "./components/ui";
@@ -114,9 +108,7 @@ export default function App() {
               key={n.to}
               to={n.to}
               end={"end" in n ? n.end : false}
-              className={({ isActive }) =>
-                `nav-item ${isActive ? "active" : ""}`
-              }
+              className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}
             >
               <span aria-hidden>{n.icon}</span>
               {t(`nav.${n.key}`)}

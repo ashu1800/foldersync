@@ -145,8 +145,6 @@ export const useStore = create<State>((set, get) => ({
 
   addConflict: (c) =>
     set((s) =>
-      s.conflicts.some((x) => x.id === c.id)
-        ? s
-        : { conflicts: [c, ...s.conflicts] },
+      s.conflicts.some((x) => x.id === c.id) ? s : { conflicts: [c, ...s.conflicts] },
     ),
 }));

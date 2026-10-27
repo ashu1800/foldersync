@@ -91,11 +91,7 @@ export function Modal({
   }, [onClose]);
 
   return (
-    <div
-      className="modal-backdrop"
-      onClick={onClose}
-      role="presentation"
-    >
+    <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
         className="modal"
         style={width ? { maxWidth: width } : undefined}
@@ -106,11 +102,7 @@ export function Modal({
       >
         <div className="modal-header">
           <h2 className="modal-title">{title}</h2>
-          <button
-            className="btn btn-sm btn-ghost"
-            onClick={onClose}
-            aria-label="close"
-          >
+          <button className="btn btn-sm btn-ghost" onClick={onClose} aria-label="close">
             ✕
           </button>
         </div>

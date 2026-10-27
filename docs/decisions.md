@@ -111,3 +111,54 @@ M3 测试暴露出：本端算完 `Push` 就退出，对端来不及回拉 → `
 `DiagnosticReport` 收集版本、设备 id/指纹、Tailscale 地址、设置、索引统计、日志尾巴。
 
 **不含**：文件内容、配对 token、私钥。日志里可能有完整路径（排障需要），这一点在文档里向用户说明。
+## 2026-10-27 冲突处理曾在 loser_bytes 缺失时静默丢数据（双节点测试抓出）
+
+这是整个项目里最严重的一个 bug，写在这里因为它**没有任何日志、没有任何报错**：
+
+```rust
+// 修复前
+if let Some(bytes) = loser_bytes {
+    tokio::fs::write(&conflict_dest, &bytes).await?;   // 只有 Some 才写副本
+}
+self.apply_pulled(winner, winner_hash).await?;          // 然后无条件覆盖原文件
+```
+
+`loser_bytes` 来自「从 blob 存储读落败版本」，上游是 `pull_blob(...).ok()` ——
+对端内容读不到时变成 `None`，于是副本没写，接着胜者把原路径覆盖掉。
+**本地那份修改就这么没了，日志里只有一行 "冲突已处理"**。
+
+为什么手工跨机测试没发现：真机测试时两端 blob 都健康，`loser_bytes` 总是 `Some`。
+只有同一进程内两个节点各自持有独立 blob 库时（`tests/two_node.rs`），
+B 的落败版本在 B 自己的库里、但拉取路径指向 A，才会稳定地拿到 `None`。
+
+修复（`engine.rs::apply_conflict`）：
+- `Some(bytes)`：照旧写副本。
+- `None`：把**本地现有文件 rename 成副本**，再让胜者落盘。本地不存在才真的无内容可保。
+
+回归测试 `conflict_without_loser_bytes_preserves_local_file`，
+并验证过「回退修复后该测试立刻失败」。
+
+教训：`if let Some(x) = ... { 做事 }` 后面紧跟一个**会破坏数据源的操作**时，
+`else` 分支必须先处理，不能默认"没有就算了"。
+
+## 2026-10-27 ESLint 抓到 Activity 页的请求竞态
+
+`Activity.tsx` 原本在 effect 里调 `load()`，而 `load()` 第一行是 `setLoading(true)`。
+ESLint（react-hooks 新规则）报"effect 里同步 setState 会级联渲染"。
+
+改的时候发现了同处的真问题：切换过滤条件时，前一次请求可能比后一次**更晚**返回，
+把旧结果盖在新结果上。原本的写法没有任何保护。
+
+现在 effect 内部起异步 IIFE + `cancelled` 标记，卸载或依赖变化时丢弃迟到结果。
+
+## 2026-10-27 文件树用截断而不是虚拟滚动
+
+提示词 5.4 要求"长列表使用虚拟滚动"。实际按场景分了两类：
+
+- **活动列表**：后端限制 300 条、前端最多留 500 条，列表自带分页语义，不值得上虚拟滚动。
+- **文件夹树**：可能上万行。这里加了 1000 行截断 + 提示用户用系统文件管理器看。
+
+没有引入 react-window：截断是零依赖的 3 行代码，虚拟滚动要改渲染结构、加高度测量、
+处理 sticky 表头。等真的有人养了 5000 文件的同步目录、并且抱怨卡了，再换。
+`ponytail:` 性质的决定，入口在 `Folders.tsx:const TREE_RENDER_LIMIT`。
+

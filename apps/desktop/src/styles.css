@@ -61,8 +61,12 @@ body,
 
 body {
   font-family:
-    "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC",
-    "Microsoft YaHei", sans-serif;
+    "Segoe UI",
+    -apple-system,
+    BlinkMacSystemFont,
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
   font-size: 14px;
   line-height: 1.5;
   color: var(--fg);
@@ -128,7 +132,9 @@ body {
   color: var(--fg-muted);
   text-decoration: none;
   font-size: 13.5px;
-  transition: background 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s;
 }
 
 .nav-item:hover {
@@ -246,7 +252,9 @@ body {
   font-size: 13px;
   font-family: inherit;
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
   white-space: nowrap;
 }
 

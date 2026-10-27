@@ -100,9 +100,11 @@ mod tests {
 
     #[test]
     fn patch_only_touches_provided_fields() {
-        let mut s = SettingsDto::default();
-        s.upload_limit_kbps = 500;
-        s.device_name = "我的电脑".into();
+        let mut s = SettingsDto {
+            upload_limit_kbps: 500,
+            device_name: "我的电脑".into(),
+            ..Default::default()
+        };
 
         apply_patch(
             &mut s,
@@ -119,9 +121,11 @@ mod tests {
 
     #[test]
     fn explicit_null_clears_optional_fields() {
-        let mut s = SettingsDto::default();
-        s.relay_url = Some("https://relay.example".into());
-        s.listen_port = Some(4433);
+        let mut s = SettingsDto {
+            relay_url: Some("https://relay.example".into()),
+            listen_port: Some(4433),
+            ..Default::default()
+        };
 
         apply_patch(
             &mut s,

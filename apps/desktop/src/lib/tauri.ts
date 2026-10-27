@@ -87,10 +87,8 @@ export const listActivity = (filter: ActivityFilter = {}) =>
 
 export const listConflicts = (folderId?: string) =>
   call<ConflictDto[]>("list_conflicts", { folderId: folderId ?? null });
-export const resolveConflict = (
-  conflictId: string,
-  resolution: ConflictResolution,
-) => call<void>("resolve_conflict", { conflictId, resolution });
+export const resolveConflict = (conflictId: string, resolution: ConflictResolution) =>
+  call<void>("resolve_conflict", { conflictId, resolution });
 
 // ---------- 设置 ----------
 
@@ -101,8 +99,7 @@ export const openLogDir = () => call<string>("open_log_dir");
 export const getLogDir = () => call<string>("get_log_dir");
 export const exportDiagnostics = (outDir?: string) =>
   call<string>("export_diagnostics", { outDir: outDir ?? null });
-export const getLocalInfo = () =>
-  call<Record<string, unknown>>("get_local_info");
+export const getLocalInfo = () => call<Record<string, unknown>>("get_local_info");
 
 // ---------- 事件 ----------
 

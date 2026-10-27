@@ -40,6 +40,11 @@ pub struct FolderRuntime {
 }
 
 impl FolderRuntime {
+    /// 该运行时监听的本地根目录。
+    pub fn root_path(&self) -> std::path::PathBuf {
+        self.session.root.clone()
+    }
+
     /// 启动一个文件夹的实时同步。
     pub async fn start(
         folder_id: String,

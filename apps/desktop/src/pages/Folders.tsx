@@ -4,6 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { FolderDto, IgnoreRulesDto, TreeNodeDto } from "../lib/bindings";
+
+/// 文件树一次最多渲染的行数。超过就截断并提示——上万行 DOM 会明显卡顿。
+const TREE_RENDER_LIMIT = 1000;
 import * as api from "../lib/tauri";
 import { useStore } from "../stores/app";
 import {
@@ -86,10 +89,7 @@ export default function Folders() {
             icon="▤"
             title={t("folders.empty")}
             action={
-              <button
-                className="btn btn-primary"
-                onClick={() => setShowAdd(true)}
-              >
+              <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
                 {t("folders.add")}
               </button>
             }
@@ -124,10 +124,7 @@ export default function Folders() {
                   <td>{f.pending}</td>
                   <td>
                     <div className="btn-row">
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => setDetail(f)}
-                      >
+                      <button className="btn btn-sm" onClick={() => setDetail(f)}>
                         {t("folders.ignoreRules")}
                       </button>
                       <button
@@ -163,12 +160,7 @@ export default function Folders() {
         />
       )}
 
-      {detail && (
-        <FolderDetail
-          folder={detail}
-          onClose={() => setDetail(null)}
-        />
-      )}
+      {detail && <FolderDetail folder={detail} onClose={() => setDetail(null)} />}
     </>
   );
 }
@@ -338,15 +330,10 @@ function AddFolderWizard({
 }
 
 /** 文件夹详情：只读文件树 + 忽略规则编辑。 */
-function FolderDetail({
-  folder,
-  onClose,
-}: {
-  folder: FolderDto;
-  onClose: () => void;
-}) {
+function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => void }) {
   const { t } = useTranslation();
   const [tree, setTree] = useState<TreeNodeDto[]>([]);
+  const [treeTruncated, setTreeTruncated] = useState(0);
   const [rules, setRules] = useState<IgnoreRulesDto | null>(null);
   const [tab, setTab] = useState<"files" | "ignore">("files");
   const [loading, setLoading] = useState(true);
@@ -361,7 +348,10 @@ function FolderDetail({
           api.getFolderTree(folder.id),
           api.getIgnoreRules(folder.id),
         ]);
-        setTree(tr);
+        // 大文件夹全量渲染上万行会卡；超过阈值只渲染前面的，其余提示用户
+        // 用系统文件管理器看。真需要虚拟滚动时再换 react-window。
+        setTreeTruncated(Math.max(0, tr.length - TREE_RENDER_LIMIT));
+        setTree(tr.slice(0, TREE_RENDER_LIMIT));
         setRules(rl);
       } catch (e) {
         setError(api.asCmdError(e).message);
@@ -434,6 +424,15 @@ function FolderDetail({
                 </tr>
               </thead>
               <tbody>
+                {treeTruncated > 0 && (
+                  <tr>
+                    <td colSpan={4} className="hint" style={{ padding: 10 }}>
+                      文件太多，仅显示前 {TREE_RENDER_LIMIT} 项，另有 {treeTruncated}
+                      {}
+                      项未列出。请用系统文件管理器查看完整内容。
+                    </td>
+                  </tr>
+                )}
                 {tree.map((n) => (
                   <tr key={n.path}>
                     <td>
@@ -465,9 +464,7 @@ function FolderDetail({
                 type="checkbox"
                 id="rules-defaults"
                 checked={rules.use_defaults}
-                onChange={(e) =>
-                  setRules({ ...rules, use_defaults: e.target.checked })
-                }
+                onChange={(e) => setRules({ ...rules, use_defaults: e.target.checked })}
               />
               <label htmlFor="rules-defaults">{t("folders.useDefaults")}</label>
             </div>

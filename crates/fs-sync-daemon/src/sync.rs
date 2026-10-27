@@ -263,24 +263,6 @@ pub fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs_sync_core::VersionVector;
-
-    fn entry(path: &str, hash: &str, mtime: i64, dev: &str, counter: u64) -> FileEntry {
-        let mut vv = VersionVector::new();
-        for _ in 0..counter {
-            vv.increment(dev);
-        }
-        FileEntry {
-            path: path.into(),
-            size: 3,
-            mtime,
-            hash: hash.into(),
-            is_dir: false,
-            deleted: false,
-            version: vv,
-            modified_by: dev.into(),
-        }
-    }
 
     #[test]
     fn scan_index_assigns_version_for_new_files() {

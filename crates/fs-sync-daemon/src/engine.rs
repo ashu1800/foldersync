@@ -150,21 +150,43 @@ impl SyncEngine {
     ) -> Result<String> {
         let rel = validate_path(&winner.path)?;
 
-        // 先把落败版本另存（绝不丢数据）
+        // 落败版本必须先落地成副本，否则下面的覆盖就是静默数据丢失。
+        // loser_bytes 拿不到的场景（对端内容不可读、blob 缺失）不能"算了"，
+        // 而是要保住本地现有文件——把它改名成副本，再把胜者写到原路径。
         let stamp = chrono::Utc::now();
         let conflict_rel = conflict_name(&rel, device_name, stamp);
         let conflict_dest = self.root.join(&conflict_rel);
         ensure_within(&self.root, &conflict_dest)?;
 
-        if let Some(bytes) = loser_bytes {
-            if let Some(parent) = conflict_dest.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        match loser_bytes {
+            Some(bytes) => {
+                if let Some(parent) = conflict_dest.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&conflict_dest, &bytes)
+                    .await
+                    .context("写冲突副本失败")?;
             }
-            tokio::fs::write(&conflict_dest, &bytes)
-                .await
-                .context("写冲突副本失败")?;
-            self.suppression.insert(&conflict_rel, "").await;
+            None => {
+                // 没有内容可写：本地已有文件就是唯一的落败版本，直接改名保住它。
+                // 本地不存在时（理论上是第一次同步）才真的无内容可保。
+                let local_abs = self.root.join(&rel);
+                if local_abs.exists() {
+                    if let Some(parent) = conflict_dest.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::rename(&local_abs, &conflict_dest)
+                        .await
+                        .context("保留本地版本失败")?;
+                    warn!(
+                        path = %rel,
+                        copy = %conflict_rel,
+                        "冲突：对端内容不可读，已把本地版本另存为副本"
+                    );
+                }
+            }
         }
+        self.suppression.insert(&conflict_rel, "").await;
 
         // 胜者落到原路径
         self.apply_pulled(winner, winner_hash).await?;
@@ -363,6 +385,47 @@ mod tests {
         // 败者另存，含 .sync-conflict 标记
         assert!(copy.contains(".sync-conflict-"), "冲突副本命名: {copy}");
         assert_eq!(std::fs::read(eng.root.join(&copy)).unwrap(), b"loser");
+    }
+
+    /// 回归：落败版本内容拿不到时，绝不能静默覆盖本地文件。
+    ///
+    /// 曾经的 bug：`if let Some(bytes) = loser_bytes` 在 None 时直接跳过写副本，
+    /// 接着用胜者覆盖原路径 —— 本地那份修改被无声删除。
+    /// 双节点集成测试（tests/two_node.rs::concurrent_edit_keeps_both_versions）
+    /// 第一次跑出来就是这个现象。
+    #[tokio::test]
+    async fn conflict_without_loser_bytes_preserves_local_file() {
+        let (eng, _tmp) = engine().await;
+
+        // 本地已有被修改过的文件（这就是落败版本，唯一的副本在磁盘上）
+        std::fs::write(eng.root.join("doc.txt"), b"local edit").unwrap();
+
+        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"remote winner".to_vec())
+            .await
+            .unwrap();
+        let winner = entry("doc.txt", &hash);
+
+        // loser_bytes = None：模拟对端内容不可读
+        let copy = eng
+            .apply_conflict(&winner, None, &hash, "home-pc")
+            .await
+            .unwrap();
+
+        // 胜者占原路径
+        assert_eq!(
+            std::fs::read(eng.root.join("doc.txt")).unwrap(),
+            b"remote winner"
+        );
+        // 本地版本没丢：被改名成冲突副本
+        assert!(
+            eng.root.join(&copy).exists(),
+            "本地版本应被保留为副本: {copy}"
+        );
+        assert_eq!(
+            std::fs::read(eng.root.join(&copy)).unwrap(),
+            b"local edit",
+            "副本内容应是本地原内容，不能丢"
+        );
     }
 
     #[test]

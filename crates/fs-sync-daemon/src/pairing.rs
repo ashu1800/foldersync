@@ -252,7 +252,7 @@ mod tests {
         let r1 = pm
             .on_pairing_request(peer, &code.token, "b", Duration::from_millis(30))
             .await;
-        assert_eq!(r1.unwrap(), false);
+        assert!(!r1.unwrap());
 
         // token 已消费，第二次必须失败
         let r2 = pm

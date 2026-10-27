@@ -55,9 +55,7 @@ export default function Settings() {
 
   if (loading) return <Loading />;
   if (!s) {
-    return (
-      <ErrorBanner message={error ?? t("common.loadFailed")} />
-    );
+    return <ErrorBanner message={error ?? t("common.loadFailed")} />;
   }
 
   return (
@@ -169,9 +167,7 @@ export default function Settings() {
               onChange={(e) =>
                 setS({ ...s, download_limit_kbps: Number(e.target.value) })
               }
-              onBlur={() =>
-                void save({ download_limit_kbps: s.download_limit_kbps })
-              }
+              onBlur={() => void save({ download_limit_kbps: s.download_limit_kbps })}
             />
           </div>
         </div>
@@ -187,18 +183,14 @@ export default function Settings() {
           <select
             className="select"
             value={s.network_mode}
-            onChange={(e) =>
-              void save({ network_mode: e.target.value as NetworkMode })
-            }
+            onChange={(e) => void save({ network_mode: e.target.value as NetworkMode })}
             aria-label={t("settings.networkMode")}
           >
             <option value="auto">{t("settings.modeAuto")}</option>
             <option value="prefer_tailscale">
               {t("settings.modePreferTailscale")}
             </option>
-            <option value="tailscale_only">
-              {t("settings.modeTailscaleOnly")}
-            </option>
+            <option value="tailscale_only">{t("settings.modeTailscaleOnly")}</option>
           </select>
         </div>
 
@@ -211,9 +203,7 @@ export default function Settings() {
             className="input"
             placeholder={t("settings.relayDefault")}
             value={s.relay_url ?? ""}
-            onChange={(e) =>
-              setS({ ...s, relay_url: e.target.value || null })
-            }
+            onChange={(e) => setS({ ...s, relay_url: e.target.value || null })}
             onBlur={() => void save({ relay_url: s.relay_url })}
           />
           <p className="hint">留空使用默认中继（自动选择最近的节点）。</p>
@@ -313,8 +303,7 @@ function patchToPreview(p: SettingsPatch): Partial<SettingsDto> {
   if (p.device_name !== undefined) out.device_name = p.device_name;
   if (p.auto_start !== undefined) out.auto_start = p.auto_start;
   if (p.close_to_tray !== undefined) out.close_to_tray = p.close_to_tray;
-  if (p.upload_limit_kbps !== undefined)
-    out.upload_limit_kbps = p.upload_limit_kbps;
+  if (p.upload_limit_kbps !== undefined) out.upload_limit_kbps = p.upload_limit_kbps;
   if (p.download_limit_kbps !== undefined)
     out.download_limit_kbps = p.download_limit_kbps;
   if (p.network_mode !== undefined) out.network_mode = p.network_mode;

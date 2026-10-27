@@ -29,26 +29,52 @@ export default function Activity() {
   const [hidden, setHidden] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const rows = await api.listActivity({
-        folder_id: folderFilter || undefined,
-        kind: kindFilter || undefined,
-        limit: 300,
-      });
-      setItems(rows);
-      setError(null);
-    } catch (e) {
-      setError(api.asCmdError(e).message);
-    } finally {
-      setLoading(false);
-    }
-  }, [folderFilter, kindFilter]);
+  const load = useCallback(
+    async (showSpinner = false) => {
+      if (showSpinner) setLoading(true);
+      try {
+        const rows = await api.listActivity({
+          folder_id: folderFilter || undefined,
+          kind: kindFilter || undefined,
+          limit: 300,
+        });
+        setItems(rows);
+        setError(null);
+      } catch (e) {
+        setError(api.asCmdError(e).message);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [folderFilter, kindFilter],
+  );
 
+  // 首次加载与切换过滤条件。
+  // 请求写在 effect 内部而不是调用上面的 load()：一来避免在自己身上触发
+  // setState 级联渲染告警，二来 cancelled 标记能防住"旧请求后到、覆盖新结果"。
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await api.listActivity({
+          folder_id: folderFilter || undefined,
+          kind: kindFilter || undefined,
+          limit: 300,
+        });
+        if (!cancelled) {
+          setItems(rows);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) setError(api.asCmdError(e).message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [folderFilter, kindFilter]);
 
   // 新活动事件：追加到顶部（暂停滚动时不打断用户位置）
   useEffect(() => {
@@ -73,10 +99,7 @@ export default function Activity() {
       <div className="page-header">
         <h1 className="page-title">{t("activity.title")}</h1>
         <div className="btn-row">
-          <button
-            className="btn btn-sm"
-            onClick={() => setPausedScroll((v) => !v)}
-          >
+          <button className="btn btn-sm" onClick={() => setPausedScroll((v) => !v)}>
             {pausedScroll ? t("activity.resumeScroll") : t("activity.pauseScroll")}
           </button>
           <button className="btn btn-sm" onClick={() => setHidden(true)}>

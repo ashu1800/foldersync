@@ -5,13 +5,7 @@ import { useTranslation } from "react-i18next";
 import type { ConflictDto, ConflictResolution } from "../lib/bindings";
 import * as api from "../lib/tauri";
 import { useStore } from "../stores/app";
-import {
-  Empty,
-  ErrorBanner,
-  Loading,
-  formatBytes,
-  formatTime,
-} from "../components/ui";
+import { Empty, ErrorBanner, Loading, formatBytes, formatTime } from "../components/ui";
 
 export default function Conflicts() {
   const { t } = useTranslation();
@@ -31,11 +25,13 @@ export default function Conflicts() {
   // 新冲突事件：直接刷列表（冲突不频繁，不用做局部更新）
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void api.on("conflict://new", () => {
-      void refreshConflicts();
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    void api
+      .on("conflict://new", () => {
+        void refreshConflicts();
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
     return () => unlisten?.();
   }, [refreshConflicts]);
 
@@ -74,7 +70,11 @@ export default function Conflicts() {
         <Loading />
       ) : conflicts.length === 0 ? (
         <div className="card">
-          <Empty icon="✓" title={t("conflicts.empty")} hint="冲突文件会自动保留副本，不会丢失任何一版内容" />
+          <Empty
+            icon="✓"
+            title={t("conflicts.empty")}
+            hint="冲突文件会自动保留副本，不会丢失任何一版内容"
+          />
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -112,7 +112,8 @@ export default function Conflicts() {
                     {t("conflicts.original")}
                   </div>
                   <div className="card-meta">
-                    {t("conflicts.size")}: {c.original_size != null ? formatBytes(c.original_size) : "—"}
+                    {t("conflicts.size")}:{" "}
+                    {c.original_size != null ? formatBytes(c.original_size) : "—"}
                     <br />
                     {t("conflicts.mtime")}: {formatTime(c.original_mtime)}
                   </div>

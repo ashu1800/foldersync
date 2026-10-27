@@ -16,14 +16,7 @@ import {
 
 export default function Dashboard() {
   const { t } = useTranslation();
-  const {
-    overview,
-    devices,
-    folders,
-    loading,
-    error,
-    refreshAll,
-  } = useStore();
+  const { overview, devices, folders, loading, error, refreshAll } = useStore();
 
   useEffect(() => {
     void refreshAll();
@@ -37,15 +30,14 @@ export default function Dashboard() {
         <div>
           <h1 className="page-title">{t("overview.title")}</h1>
           <div className="page-subtitle">
-            {overview?.device_name} · <span className="mono">{overview?.fingerprint}</span>
+            {overview?.device_name} ·{" "}
+            <span className="mono">{overview?.fingerprint}</span>
           </div>
         </div>
         {overview && <OverallBadge status={overview.status} />}
       </div>
 
-      {error && (
-        <ErrorBanner message={error} onRetry={() => void refreshAll()} />
-      )}
+      {error && <ErrorBanner message={error} onRetry={() => void refreshAll()} />}
 
       <div className="stat-row">
         <div className="stat">
@@ -89,7 +81,10 @@ export default function Dashboard() {
         <div className="card-grid">
           {devices.map((d) => (
             <div className="card" key={d.id}>
-              <div className="card-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div
+                className="card-title"
+                style={{ display: "flex", alignItems: "center", gap: 8 }}
+              >
                 <span
                   className={`dot ${d.online ? "dot-success" : "dot-muted"}`}
                   aria-hidden
@@ -105,10 +100,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      <h2
-        className="card-title"
-        style={{ fontSize: 15, margin: "24px 0 10px" }}
-      >
+      <h2 className="card-title" style={{ fontSize: 15, margin: "24px 0 10px" }}>
         {t("overview.folders")}
       </h2>
       {folders.length === 0 ? (

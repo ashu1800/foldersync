@@ -36,6 +36,8 @@ jobs:
         with:
           node-version: 22
       - run: pnpm install --frozen-lockfile
+      - run: pnpm exec prettier --check src
+      - run: pnpm exec eslint src
       # 严格类型检查独立于构建，避免 vite 打包漏掉类型错误
       - run: pnpm exec tsc --noEmit
       - run: pnpm build
