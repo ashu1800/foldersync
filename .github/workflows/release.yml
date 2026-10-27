@@ -118,13 +118,16 @@ jobs:
               --notes "已安装旧版的用户可在应用内检查更新升级。"
           fi
 
-          # 四平台产物扩展名不同，统一找一遍
+          # 四平台产物扩展名不同，统一找一遍。
+          # 注意路径：带 --target 构建时（macOS 两个 job）产物在
+          # target/<triple>/release/bundle，不在 target/release/bundle，
+          # 所以从 target 往下匹配 */release/bundle/*。
           count=0
           while IFS= read -r -d '' f; do
             echo "uploading $f"
             gh release upload "$TAG" "$f" --clobber
             count=$((count + 1))
-          done < <(find target/release/bundle -type f \
+          done < <(find target -path "*/release/bundle/*" -type f \
             \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
                -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) -print0)
 
