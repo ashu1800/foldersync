@@ -1,0 +1,31 @@
+[package]
+name = "fs-sync-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs-sync-core.workspace = true
+fs-sync-net.workspace = true
+fs-sync-store.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+rand.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+iroh-blobs.workspace = true
+futures.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+iroh-blobs.workspace = true
+futures.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true

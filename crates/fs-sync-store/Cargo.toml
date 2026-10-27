@@ -1,0 +1,16 @@
+[package]
+name = "fs-sync-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs-sync-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

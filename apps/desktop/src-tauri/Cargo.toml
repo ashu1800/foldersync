@@ -1,0 +1,36 @@
+[package]
+name = "foldersync-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "foldersync_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+fs-sync-daemon.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ts-rs.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+chrono.workspace = true
+fs-sync-net.workspace = true
+fs-sync-core.workspace = true
+fs-sync-store.workspace = true
+iroh.workspace = true
+iroh-blobs.workspace = true
+blake3.workspace = true
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

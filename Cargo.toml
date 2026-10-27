@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fs-sync-core",
+    "crates/fs-sync-net",
+    "crates/fs-sync-store",
+    "crates/fs-sync-daemon",
+    "apps/cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# 内部 crate
+fs-sync-core = { path = "crates/fs-sync-core" }
+fs-sync-net = { path = "crates/fs-sync-net" }
+fs-sync-store = { path = "crates/fs-sync-store" }
+fs-sync-daemon = { path = "crates/fs-sync-daemon" }
+
+# 网络（版本已锁定，见 README）
+iroh = "1.4.1"
+iroh-blobs = "0.103.1"
+
+# 异步与工具
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 前端类型自动生成（提示词 5.3：避免前后端手写类型漂移）
+ts-rs = { version = "12.0.1", features = ["serde-compat", "no-serde-warnings"] }
+postcard = { version = "1", features = ["use-std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = "1"
+rand = "0.9"
+hex = "0.4"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tempfile = "3"
+
+# 文件系统与存储
+notify = "8"
+notify-debouncer-full = "0.5"
+ignore = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+strip = true

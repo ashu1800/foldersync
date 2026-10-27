@@ -1,0 +1,41 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace -- -D warnings
+      # export_bindings 是 cargo test 的一部分：TS 类型生成失败会在这里暴露
+      - run: cargo test --workspace
+      # 生成物必须与提交的一致，否则说明改了 Rust 忘了重新生成 TS 类型
+      - name: TypeScript 绑定是否最新
+        run: |
+          cargo test -p foldersync-desktop export_bindings
+          git diff --exit-code apps/desktop/src/lib/bindings/
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+      # 严格类型检查独立于构建，避免 vite 打包漏掉类型错误
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm build

@@ -1,0 +1,23 @@
+[package]
+name = "foldersync-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "foldersync"
+path = "src/main.rs"
+
+[dependencies]
+fs-sync-net.workspace = true
+fs-sync-daemon.workspace = true
+fs-sync-store.workspace = true
+fs-sync-core.workspace = true
+iroh.workspace = true
+iroh-blobs.workspace = true
+blake3.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,113 @@
+# FolderSync
+
+文件夹实时双向 P2P 同步软件（iroh + Tauri）。两台电脑（如公司/家里）在 NAT 后也能通过公钥寻址自动打洞直连，不依赖第三方云盘。
+
+## 技术栈与版本锁定
+
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| iroh | **1.4.1** | P2P QUIC 传输，公钥寻址。注意 1.x 已将 `NodeId`/`NodeAddr` 更名为 `EndpointId`/`EndpointAddr`，Endpoint 构建使用 `Endpoint::bind(iroh::endpoint::presets::N0)` |
+| iroh-blobs | **0.103.1** | 内容寻址 blob 传输（0.103.0 已被 yank，勿用） |
+| Tauri | 2.x | 桌面壳（tauri 2.12 验证） |
+| Rust | 1.99+（workspace MSRV 1.91） | edition 2024 |
+| 前端 | React 18 + TypeScript + Vite 6 | pnpm |
+
+iroh 1.4.1 关键 API 速记（以 docs.rs 为准）：
+
+- 绑定：`Endpoint::bind(presets::N0)`（N0 preset = 官方 DNS 寻址 + 官方中继 + ring TLS）。
+- 服务：`Router::builder(endpoint).accept(b"/foldersync/1", handler).spawn()`。
+- 连接：`endpoint.connect(EndpointAddr, alpn)`，`EndpointAddr::from(EndpointId)` 仅凭公钥即可（经 DNS pkarr 发现 + 中继）。
+- 流：`conn.open_bi()` / `conn.accept_bi()`；`send.finish()` 后**不要**在两端都 `conn.closed().await`（会互等，一端直接 drop 即可）。
+
+## 结构
+
+```
+crates/
+  fs-sync-core/    同步引擎纯逻辑（扫描、版本向量、冲突、忽略规则）
+  fs-sync-net/     iroh 传输层（协议、回显、后续 blob 传输）
+  fs-sync-store/   SQLite 持久化
+  fs-sync-daemon/  编排层（core+net+store 组合，供桌面与 CLI 共用）
+apps/
+  cli/             命令行（foldersync serve / ping）
+  desktop/         Tauri 2 + React 前端
+docs/              协议与设计决策
+```
+
+## 运行
+
+```bash
+# CLI：身份与配对
+cargo run -p foldersync-cli -- status                      # 设备 ID、指纹、Tailscale 状态、信任列表
+cargo run -p foldersync-cli -- serve --auto-confirm        # 启动节点（调试用自动确认配对）
+cargo run -p foldersync-cli -- pair                        # 生成配对码（5 分钟、一次性）
+cargo run -p foldersync-cli -- join <配对码>                # 用配对码完成配对
+
+# 同步一个文件夹到对端（M3）
+cargo run -p foldersync-cli -- sync <本地路径> <对端EndpointId>
+
+# M0 连通性自检
+cargo run -p foldersync-cli -- ping <ENDPOINT_ID> "hello"
+
+# 桌面应用（M5 完成前仅有占位窗口）
+cd apps/desktop && pnpm install && pnpm tauri dev
+```
+
+默认数据目录：`~/.foldersync`（可用 `--data-dir` 覆盖），内含 `secret.key`（设备身份）、`state.sqlite3`（索引/信任/活动）、`blobs`（服务端内容缓存）、`blobs-client`（同步客户端缓存）。
+
+> 注意：`serve` 与 `sync` 是两个进程，各自打开独立的 blob 库（redb 不支持跨进程争锁）。要同时跑两者，用不同 `--data-dir` 或等 M4 的常驻单进程模式。
+
+## 当前进度
+
+- [x] M0 脚手架 + iroh 跨机连通验证（家 ↔ 公司，双 NAT，经中继/打洞）
+- [x] M1 本地引擎（core + store，39 个单元测试）
+- [x] M2 配对与连接（真实跨机配对：中继连接、8ms 延迟、双向信任、伪造 token 被拒）
+- [x] M3 单向同步（真实跨机传输 3 个文件含嵌套目录，内容一致，失败 0）
+- [x] M4 双向实时同步（实测：新增 1.0~1.1s、删除 1.0s 双向传播；冲突保留副本不丢数据且不重复）
+- [x] M5 桌面应用（6 个页面、托盘、事件桥接、ts-rs 类型自动生成、中英双语）
+- [x] M6 打磨发布（限速、日志落盘、诊断包导出、NSIS 安装包 8.4 MB）
+
+## 同步实测数据（家 ↔ 公司，经 Tailscale/打洞）
+
+| 场景 | 结果 |
+|------|------|
+| 新增文件（单向） | 1.0 ~ 1.1 秒 |
+| 删除文件（墓碑传播） | 1.0 秒 |
+| 双向同时新增 | 各自 1.0 ~ 1.1 秒，最终列表一致 |
+| 同文件并发修改 | 生成 `名字.sync-conflict-时间-设备名.扩展名`，两边原文件都保留 |
+| 连接类型演进 | 中继 → 经 Tailscale → 直连（iroh 自动打洞升级） |
+
+## 打包与分发
+
+```bash
+cd apps/desktop
+pnpm exec tauri build          # 产出 NSIS 安装包
+```
+
+产物：
+
+| 文件 | 大小 | 说明 |
+|------|------|------|
+| `target/release/bundle/nsis/FolderSync_0.1.0_x64-setup.exe` | 8.4 MB | Windows 安装包（当前用户安装，无需管理员） |
+| `target/release/foldersync-desktop.exe` | 34 MB | 免安装可执行文件 |
+
+安装包内置中文/英文安装向导。macOS/Linux 打包需在对应平台执行同样命令（Tauri bundler 已配置但本机未验证）。
+
+## 数据目录
+
+`~/.foldersync/`（可用 `--data-dir` 覆盖）：
+
+| 路径 | 内容 | 备份价值 |
+|------|------|----------|
+| `secret.key` | 设备身份私钥 | **必须备份**，丢失等于换设备 |
+| `state.sqlite3` | 索引、信任列表、活动、配对 token | 有价值 |
+| `settings.json` | 界面与网络设置 | 可重建 |
+| `logs/foldersync.log.*` | 按天滚动日志 | 排障用 |
+| `blobs/` | 内容缓存（可重建，删了会重新拉取） | 无 |
+
+## 排障
+
+- **界面空白**：debug 构建需要先起 `pnpm dev`（连 5173 端口）；release 构建内置前端资源。
+- **配不上对**：两台机器时钟差太多会让配对码被判过期（5 分钟 TTL）。先对时。
+- **一直走中继**：让两端都加入同一个 Tailscale 网络，连接类型会从「中继」升级到「经 Tailscale」，再尝试打洞到「直连」。
+- **导出诊断包**：设置页 →「导出诊断包」，生成的文件不含文件内容与私钥，可直接贴给开发者。
+- **某个文件夹不动了**：暂停再恢复会重新扫描；仍不动就看日志里有没有 `拉取 blob 失败`。

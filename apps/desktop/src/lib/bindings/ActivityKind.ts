@@ -1,0 +1,1 @@
+export type ActivityKind = "upload" | "download" | "delete" | "conflict" | "error" | "info";

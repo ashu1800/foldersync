@@ -1,0 +1,376 @@
+//! 同步引擎：把 core 的 diff 结果落实为文件操作（M3 单向、M4 双向共用）。
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use fs_sync_core::{FileEntry, SyncAction, conflict_name, validate_path};
+use fs_sync_store::Store;
+use iroh_blobs::store::fs::FsStore;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+/// 自写抑制表：同步落盘后 notify 会再触发一次事件，需忽略。
+/// key = 相对路径，value = (预期 hash, 插入时刻)
+#[derive(Debug, Default)]
+pub struct WriteSuppression {
+    inner: Mutex<HashMap<String, (String, std::time::Instant)>>,
+}
+
+impl WriteSuppression {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记"这次写入是我们自己干的"。
+    pub async fn insert(&self, rel_path: &str, hash: &str) {
+        self.inner.lock().await.insert(
+            rel_path.to_string(),
+            (hash.to_string(), std::time::Instant::now()),
+        );
+    }
+
+    /// 命中则消费并返回 true（一次性）。
+    pub async fn take_if_hit(&self, rel_path: &str, hash: Option<&str>) -> bool {
+        let mut map = self.inner.lock().await;
+        // 过期清理（TTL 5s）
+        map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(5));
+        match map.get(rel_path) {
+            Some((expected, _)) => {
+                let matched = hash.is_none_or(|h| h == expected);
+                if matched {
+                    map.remove(rel_path);
+                }
+                matched
+            }
+            None => false,
+        }
+    }
+
+    /// 清空（暂停同步时调用）。
+    pub async fn clear(&self) {
+        self.inner.lock().await.clear();
+    }
+
+    /// 同步版本的一次性查询（供 notify 回调等非 async 上下文使用）。
+    ///
+    /// 用 `try_lock` 避免在回调线程阻塞：竞争时保守返回"未命中"，
+    /// 最坏情况只是多产生一次事件（后续 hash 比对会过滤掉），不会丢数据。
+    pub fn try_take_if_hit(&self, rel_path: &str) -> bool {
+        let Ok(mut map) = self.inner.try_lock() else {
+            return false;
+        };
+        map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(5));
+        map.remove(rel_path).is_some()
+    }
+}
+
+/// 同步引擎：持有文件夹根目录、索引存储与 blob 存储。
+#[derive(Clone)]
+pub struct SyncEngine {
+    pub folder_id: String,
+    pub root: PathBuf,
+    pub store: Arc<Store>,
+    /// blob 存储实例（**必须共享**：FsStore 每个实例会启动后台 actor 争抢同一 redb 文件）
+    pub blobs: Arc<FsStore>,
+    pub suppression: Arc<WriteSuppression>,
+}
+
+impl SyncEngine {
+    pub fn new(folder_id: String, root: PathBuf, store: Arc<Store>, blobs: Arc<FsStore>) -> Self {
+        Self {
+            folder_id,
+            root,
+            store,
+            blobs,
+            suppression: Arc::new(WriteSuppression::new()),
+        }
+    }
+
+    /// 把远端条目写入本地（内容已从 blob 存储取到）。
+    ///
+    /// 流程（提示词 4.5）：校验路径 → 原子落盘 → 更新索引 → 登记自写抑制。
+    pub async fn apply_pulled(&self, entry: &FileEntry, blob_hash: &str) -> Result<()> {
+        // 安全：路径必过校验（对端不可信）
+        let rel =
+            validate_path(&entry.path).with_context(|| format!("拒绝非法路径: {}", entry.path))?;
+        let dest = self.root.join(&rel);
+
+        // 防御：规范化后必须仍在文件夹内
+        ensure_within(&self.root, &dest)?;
+
+        if entry.is_dir {
+            tokio::fs::create_dir_all(&dest)
+                .await
+                .with_context(|| format!("创建目录失败: {}", dest.display()))?;
+            self.mark_applied(entry).await?;
+            return Ok(());
+        }
+
+        // 从共享 blob 存储导出（原子写）
+        fs_sync_net::blobs::export_to(&self.blobs, blob_hash, &dest).await?;
+
+        // 自写抑制：避免监听循环
+        self.suppression.insert(&rel, blob_hash).await;
+        self.mark_applied(entry).await?;
+
+        info!(path = %rel, size = entry.size, "文件已落盘");
+        Ok(())
+    }
+
+    /// 删除本地文件（墓碑生效）。
+    pub async fn apply_delete(&self, rel_path: &str) -> Result<()> {
+        let rel = validate_path(rel_path).with_context(|| format!("拒绝非法路径: {rel_path}"))?;
+        let dest = self.root.join(&rel);
+        ensure_within(&self.root, &dest)?;
+
+        if dest.is_dir() {
+            // 只删空目录，避免误删用户内容
+            if let Err(e) = tokio::fs::remove_dir(&dest).await {
+                warn!(path = %rel, "目录非空或无法删除，跳过: {e}");
+            }
+        } else if dest.exists() {
+            tokio::fs::remove_file(&dest)
+                .await
+                .with_context(|| format!("删除文件失败: {}", dest.display()))?;
+            self.suppression.insert(&rel, "").await;
+            info!(path = %rel, "文件已删除");
+        }
+        Ok(())
+    }
+
+    /// 冲突处理：胜者内容落原路径，败者另存 `原名.sync-conflict-...`。
+    pub async fn apply_conflict(
+        &self,
+        winner: &FileEntry,
+        loser_bytes: Option<Vec<u8>>,
+        winner_hash: &str,
+        device_name: &str,
+    ) -> Result<String> {
+        let rel = validate_path(&winner.path)?;
+
+        // 先把落败版本另存（绝不丢数据）
+        let stamp = chrono::Utc::now();
+        let conflict_rel = conflict_name(&rel, device_name, stamp);
+        let conflict_dest = self.root.join(&conflict_rel);
+        ensure_within(&self.root, &conflict_dest)?;
+
+        if let Some(bytes) = loser_bytes {
+            if let Some(parent) = conflict_dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&conflict_dest, &bytes)
+                .await
+                .context("写冲突副本失败")?;
+            self.suppression.insert(&conflict_rel, "").await;
+        }
+
+        // 胜者落到原路径
+        self.apply_pulled(winner, winner_hash).await?;
+
+        self.store.log_activity(
+            "conflict",
+            &self.folder_id,
+            &rel,
+            &format!("保留原版本，副本: {conflict_rel}"),
+        )?;
+
+        Ok(conflict_rel)
+    }
+
+    /// 更新本地索引（写入 store）。
+    async fn mark_applied(&self, entry: &FileEntry) -> Result<()> {
+        self.store.upsert_entry(&self.folder_id, entry)?;
+        Ok(())
+    }
+
+    /// 把本地条目推给对端前，确保内容已进 blob 存储，返回 hash。
+    pub async fn ensure_blob(&self, entry: &FileEntry) -> Result<String> {
+        let rel = validate_path(&entry.path)?;
+        let abs = self.root.join(&rel);
+        if fs_sync_net::blobs::has_blob(&self.blobs, &entry.hash).await {
+            return Ok(entry.hash.clone());
+        }
+        fs_sync_net::blobs::add_file(&self.blobs, &abs).await
+    }
+
+    /// 执行一批 diff 动作中「需要本地落盘」的部分，返回需推送的路径列表。
+    pub async fn apply_actions(&self, actions: &[SyncAction]) -> Result<Vec<String>> {
+        let mut to_push = Vec::new();
+        for action in actions {
+            match action {
+                SyncAction::Push { path } => to_push.push(path.clone()),
+                SyncAction::MergeMeta { path, merged } => {
+                    // 内容一致，只更新版本向量
+                    if let Some(mut e) = self
+                        .store
+                        .list_entries(&self.folder_id)?
+                        .into_iter()
+                        .find(|x| &x.path == path)
+                    {
+                        e.version = merged.clone();
+                        self.store.upsert_entry(&self.folder_id, &e)?;
+                    }
+                }
+                SyncAction::Pull { .. } => { /* 由调用方拉取 blob 后调用 apply_pulled */ }
+                SyncAction::Conflict { path, .. } => {
+                    warn!(path = %path, "冲突动作需在完整同步流程中处理");
+                }
+            }
+        }
+        Ok(to_push)
+    }
+}
+
+/// 确认 `path` 规范化后仍在 `root` 内（防路径穿越）。
+pub fn ensure_within(root: &Path, path: &Path) -> Result<()> {
+    let root_c = root
+        .canonicalize()
+        .with_context(|| format!("文件夹根不存在: {}", root.display()))?;
+    // 目标可能还不存在：规范化其最近的已存在祖先
+    let mut parent = path;
+    while !parent.exists() {
+        parent = match parent.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    let parent_c = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    if !parent_c.starts_with(&root_c) {
+        anyhow::bail!(
+            "路径逃逸文件夹根: {} 不在 {} 内",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs_sync_core::VersionVector;
+
+    fn entry(path: &str, hash: &str) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            size: 3,
+            mtime: 1,
+            hash: hash.into(),
+            is_dir: false,
+            deleted: false,
+            version: VersionVector::new(),
+            modified_by: "peer".into(),
+        }
+    }
+
+    async fn engine() -> (SyncEngine, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let blobs = Arc::new(
+            fs_sync_net::blobs::open_store(&tmp.path().join("blobs"))
+                .await
+                .unwrap(),
+        );
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        (SyncEngine::new("f1".into(), root, store, blobs), tmp)
+    }
+
+    #[tokio::test]
+    async fn pulled_file_lands_and_is_suppressed() {
+        let (eng, _tmp) = engine().await;
+        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"abc".to_vec())
+            .await
+            .unwrap();
+
+        let e = entry("dir/a.txt", &hash);
+        eng.apply_pulled(&e, &hash).await.unwrap();
+
+        assert_eq!(std::fs::read(eng.root.join("dir/a.txt")).unwrap(), b"abc");
+        // 自写抑制已登记，且一次性
+        assert!(eng.suppression.take_if_hit("dir/a.txt", Some(&hash)).await);
+        assert!(!eng.suppression.take_if_hit("dir/a.txt", Some(&hash)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal() {
+        let (eng, _tmp) = engine().await;
+        let e = entry("../escape.txt", "");
+        assert!(eng.apply_pulled(&e, "").await.is_err(), "必须拒绝路径穿越");
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_path() {
+        let (eng, _tmp) = engine().await;
+        assert!(
+            eng.apply_pulled(&entry("C:/Windows/evil.dll", ""), "")
+                .await
+                .is_err()
+        );
+        assert!(
+            eng.apply_pulled(&entry("/etc/passwd", ""), "")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_file() {
+        let (eng, _tmp) = engine().await;
+        std::fs::write(eng.root.join("gone.txt"), b"x").unwrap();
+        eng.apply_delete("gone.txt").await.unwrap();
+        assert!(!eng.root.join("gone.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_nonempty_dir() {
+        let (eng, _tmp) = engine().await;
+        std::fs::create_dir_all(eng.root.join("d")).unwrap();
+        std::fs::write(eng.root.join("d/keep.txt"), b"x").unwrap();
+        eng.apply_delete("d").await.unwrap();
+        assert!(eng.root.join("d").exists(), "非空目录不应被删除");
+    }
+
+    #[tokio::test]
+    async fn ensure_blob_adds_file() {
+        let (eng, _tmp) = engine().await;
+        std::fs::write(eng.root.join("a.txt"), b"hello").unwrap();
+        let mut e = entry("a.txt", "");
+        e.hash = blake3::hash(b"hello").to_hex().to_string();
+        let hash = eng.ensure_blob(&e).await.unwrap();
+        assert_eq!(hash, e.hash);
+        assert!(fs_sync_net::blobs::has_blob(&eng.blobs, &hash).await);
+    }
+
+    #[tokio::test]
+    async fn conflict_keeps_both_versions() {
+        let (eng, _tmp) = engine().await;
+        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"winner".to_vec())
+            .await
+            .unwrap();
+        let winner = entry("doc.txt", &hash);
+        let copy = eng
+            .apply_conflict(&winner, Some(b"loser".to_vec()), &hash, "home-pc")
+            .await
+            .unwrap();
+
+        // 胜者占原路径
+        assert_eq!(std::fs::read(eng.root.join("doc.txt")).unwrap(), b"winner");
+        // 败者另存，含 .sync-conflict 标记
+        assert!(copy.contains(".sync-conflict-"), "冲突副本命名: {copy}");
+        assert_eq!(std::fs::read(eng.root.join(&copy)).unwrap(), b"loser");
+    }
+
+    #[test]
+    fn ensure_within_blocks_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(ensure_within(&root, &root.join("ok.txt")).is_ok());
+        assert!(ensure_within(&root, &tmp.path().join("outside.txt")).is_err());
+    }
+}
