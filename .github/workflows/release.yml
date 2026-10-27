@@ -98,44 +98,40 @@ jobs:
           args: ${{ matrix.args }}
           # 不传 tagName，action 就不会尝试创建 release
           releaseDraft: true
-
-      - name: 收集构建产物
-        id: collect
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 四平台产物扩展名不同，统一 glob
-          mapfile -t files < <(find target/release/bundle -type f \
-            \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
-               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) 2>/dev/null)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no artifacts found" >&2
-            exit 1
-          fi
-          printf 'found %d artifacts:\n' "${#files[@]}"
-          printf '  %s\n' "${files[@]}"
-          {
-            echo "files<<EOF"
-            printf '%s\n' "${files[@]}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: 上传到 Release
+      - name: 上传产物到 Release
+        # 用 find 直接找实际产物再传，不经过中间变量：
+        # 早期版本用 mapfile 收集，在 Linux/macOS 上拿到空数组（find 明明有输出），
+        # 白白多花两轮 CI。少一层间接就少一个出错的地方。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
+
           # 第一个跑到的 job 创建 release，其它 job 追加资产
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "FolderSync $TAG" \
-              --notes "见 Release 说明。已安装旧版的用户可在应用内「检查更新」升级。"
+              --notes "已安装旧版的用户可在应用内检查更新升级。"
           fi
-          while IFS= read -r f; do
-            [ -n "$f" ] && gh release upload "$TAG" "$f" --clobber
-          done <<< "${{ steps.collect.outputs.files }}"
+
+          # 四平台产物扩展名不同，统一找一遍
+          count=0
+          while IFS= read -r -d '' f; do
+            echo "uploading $f"
+            gh release upload "$TAG" "$f" --clobber
+            count=$((count + 1))
+          done < <(find target/release/bundle -type f \
+            \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
+               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) -print0)
+
+          if [ "$count" -eq 0 ]; then
+            echo "no artifacts found" >&2
+            exit 1
+          fi
+          echo "uploaded $count artifacts"
+
 
       - name: 生成平台更新清单碎片
         # updater 的 latest.json 需要把所有平台合并进一个文件。四个 job 并发跑，
