@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 允许 release.yml 复用这两个 job 作为发版前的质量门禁
+  workflow_call:
 
 jobs:
   rust:
@@ -12,8 +14,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: 版本号一致性
+        shell: bash
+        run: ./scripts/check-version.sh
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace -- -D warnings
+      # --all-targets 覆盖测试代码，否则测试里的 clippy 问题会漏到主干
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       # export_bindings 是 cargo test 的一部分：TS 类型生成失败会在这里暴露
       - run: cargo test --workspace
       # 生成物必须与提交的一致，否则说明改了 Rust 忘了重新生成 TS 类型
@@ -35,6 +45,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prettier --check src
       - run: pnpm exec eslint src

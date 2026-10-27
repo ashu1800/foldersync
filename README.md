@@ -136,6 +136,50 @@ pnpm exec tauri build          # 产出 NSIS 安装包
 | 断网重连自动恢复 | 无限重连 + 指数退避 2→60 秒，成功即重置 |
 | 关闭再开机自动恢复 | 文件夹配置持久化到 SQLite，启动时 `restore_folders` |
 
+## 自动更新与版本发布
+
+### 客户端行为
+
+应用通过 [Tauri updater](https://v2.tauri.app/plugin/updater/) 检查 GitHub Releases：
+
+- **检查地址**：`https://github.com/ashu1800/foldersync/releases/latest/download/latest.json`
+- **触发方式**：设置页 →「检查更新」（手动，不在后台偷偷检查）
+- **签名校验**：每个更新包都带 minisign 签名，公钥内置在 `tauri.conf.json`
+  的 `plugins.updater.pubkey`。签名不匹配会拒绝安装，不会装到篡改的包。
+- **安装后自动重启**：`relaunch()`，数据目录 `~/.foldersync/` 原样保留。
+
+### 发版流程
+
+```bash
+# 1. 改版本号（三处一起改，脚本会校验一致性）
+./scripts/check-version.sh 0.2.0
+
+# 2. 提交
+git add -A && git commit -m "release: v0.2.0"
+
+# 3. 打 tag 并推送 —— 这一步触发 GitHub Actions 自动构建与发布
+git tag v0.2.0
+git push origin main --tags
+```
+
+推 tag 后 `.github/workflows/release.yml` 会：
+
+1. 先复用 `ci.yml` 跑 fmt/clippy/test/tsc/eslint（不通过就不发版）
+2. 在 Windows / macOS(arm64+x64) / Ubuntu 四平台并行构建
+3. 用 `TAURI_SIGNING_PRIVATE_KEY` 签名更新包
+4. 创建 GitHub Release，上传安装包 + `.sig` + `latest.json`
+5. 已装旧版的用户点「检查更新」就能看到新版本
+
+### 密钥管理
+
+| 项 | 位置 | 说明 |
+|----|------|------|
+| 私钥 | `~/.tauri/foldersync.key`（本机）+ GitHub Secret `TAURI_SIGNING_PRIVATE_KEY` | **丢失后无法再给老用户发更新**，务必备份 |
+| 公钥 | `tauri.conf.json` 的 `plugins.updater.pubkey` | 随代码提交，公开无害 |
+
+私钥没有密码（`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 为空），因为 CI 里无人值守。
+若日后要加密码，改 secret 并给 workflow 传该变量即可。
+
 ## 已知限制
 
 | 限制 | 影响 | 升级路径 |

@@ -1,0 +1,112 @@
+name: Release
+
+# 版本自动发布流程（基于 GitHub Releases + Tauri updater）
+#
+# 触发方式二选一：
+#   1. 推送形如 v0.2.0 的 tag（推荐，`git tag v0.2.0 && git push --tags`）
+#   2. 在 Actions 页面手动 Run workflow
+#
+# 产出：
+#   - 各平台安装包（Windows NSIS/MSI、macOS dmg、Linux AppImage/deb）
+#   - latest.json —— updater 的清单，客户端从这里判断有没有新版本
+#   - 带签名的 .sig 文件（私钥在 TAURI_SIGNING_PRIVATE_KEY secret 里）
+#
+# 关键点：latest.json 必须作为 release 的 asset 上传，且 tag 要是
+# latest（非 prerelease），客户端才能从 /releases/latest/download/latest.json 取到。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  # 先跑一次质量门禁，不通过就不发版
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 系统依赖
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: 安装前端依赖
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      # tauri-action 会：构建 → 签名 updater 包 → 创建/更新 release → 上传 latest.json
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # 私钥没有密码，必须显式给空串 + CI=true：
+          # 只给空串时 tauri CLI 认为"变量未设置"，会交互式提示密码，
+          # 在无 TTY 的 CI 里直接卡死（本地实测过）。
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          CI: true
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseName: "FolderSync v__VERSION__"
+          releaseBody: |
+            ## 安装
+
+            下载对应平台的安装包直接安装即可。已安装旧版的用户会在应用内收到更新提示。
+
+            | 平台 | 文件 |
+            |------|------|
+            | Windows | `FolderSync___VERSION___x64-setup.exe` |
+            | macOS (Apple Silicon) | `FolderSync___VERSION___aarch64.dmg` |
+            | macOS (Intel) | `FolderSync___VERSION___x64.dmg` |
+            | Linux | `foldersync___VERSION___amd64.AppImage` / `.deb` |
+
+            ## 数据位置
+
+            `~/.foldersync/` —— 升级不会动这个目录，`secret.key` 与索引原样保留。
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

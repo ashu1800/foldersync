@@ -42,6 +42,15 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU0QzJGQkQ2Q0Q5QjJGMzAKUldRd0w1dk4xdnZDNUZTTitQQTdMOElXRmhnKzVnYWhHeHpuek4xQzJnR09TQllxelN5RitIakwK",
+      "endpoints": [
+        "https://github.com/ashu1800/foldersync/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

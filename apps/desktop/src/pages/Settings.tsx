@@ -1,6 +1,8 @@
 // 设置页（提示词 5.2.6）。
 
 import { useEffect, useState } from "react";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { useTranslation } from "react-i18next";
 import type { NetworkMode, SettingsDto, SettingsPatch } from "../lib/bindings";
 import * as api from "../lib/tauri";
@@ -18,6 +20,19 @@ export default function Settings() {
   const [version, setVersion] = useState("");
   const [endpointId, setEndpointId] = useState("");
   const [diagPath, setDiagPath] = useState<string | null>(null);
+  // 更新检查（基于 GitHub Releases）
+  const [updateState, setUpdateState] = useState<
+    "idle" | "checking" | "found" | "downloading" | "latest" | "error"
+  >("idle");
+  const [updateInfo, setUpdateInfo] = useState<{
+    version: string;
+    body: string;
+  } | null>(null);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  // 用 state 而不是 ref：渲染时要根据"有没有待安装的更新"决定显示哪个按钮，
+  // ref 变化不会触发重渲染，读它得到的可能是过期值。
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -283,6 +298,107 @@ export default function Settings() {
           >
             导出诊断包
           </button>
+        </div>
+        {/* 检查更新（GitHub Releases） */}
+        <div className="field" style={{ marginTop: 18 }}>
+          <label className="label">检查更新</label>
+          <div className="btn-row">
+            <button
+              className="btn"
+              disabled={updateState === "checking" || updateState === "downloading"}
+              onClick={async () => {
+                setUpdateState("checking");
+                setUpdateError(null);
+                setUpdateInfo(null);
+                try {
+                  const u = await check();
+                  if (!u) {
+                    setUpdateState("latest");
+                    return;
+                  }
+                  setPendingUpdate(u);
+                  setUpdateInfo({
+                    version: u.version,
+                    body: u.body ?? "(无更新说明)",
+                  });
+                  setUpdateState("found");
+                } catch (e) {
+                  setUpdateError(String(e));
+                  setUpdateState("error");
+                }
+              }}
+            >
+              {updateState === "checking" ? "检查中…" : "检查更新"}
+            </button>
+            {updateState === "found" && pendingUpdate && (
+              <button
+                className="btn btn-primary"
+                onClick={async () => {
+                  const u = pendingUpdate;
+                  if (!u) return;
+                  setUpdateState("downloading");
+                  setUpdateProgress(0);
+                  try {
+                    let total = 0;
+                    let got = 0;
+                    await u.downloadAndInstall((ev) => {
+                      if (ev.event === "Started") {
+                        total = ev.data.contentLength ?? 0;
+                      } else if (ev.event === "Progress") {
+                        got += ev.data.chunkLength;
+                        if (total > 0) {
+                          setUpdateProgress(Math.round((got / total) * 100));
+                        }
+                      }
+                    });
+                    // 安装完成，重启进新版
+                    await relaunch();
+                  } catch (e) {
+                    setUpdateError(String(e));
+                    setUpdateState("error");
+                  }
+                }}
+              >
+                下载并安装
+              </button>
+            )}
+          </div>
+          {updateState === "latest" && (
+            <p className="hint" style={{ marginTop: 8 }}>
+              已是最新版本（当前 {version}）。
+            </p>
+          )}
+          {updateState === "found" && updateInfo && (
+            <div className="hint" style={{ marginTop: 8 }}>
+              <p>
+                发现新版本 <b>{updateInfo.version}</b>（当前 {version}）
+              </p>
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap",
+                  maxHeight: 160,
+                  overflow: "auto",
+                  fontSize: 12,
+                  marginTop: 6,
+                }}
+              >
+                {updateInfo.body}
+              </pre>
+            </div>
+          )}
+          {updateState === "downloading" && (
+            <p className="hint" style={{ marginTop: 8 }}>
+              正在下载并安装… {updateProgress}%
+            </p>
+          )}
+          {updateState === "error" && (
+            <p
+              className="hint"
+              style={{ marginTop: 8, color: "var(--danger, #e5484d)" }}
+            >
+              更新失败：{updateError}
+            </p>
+          )}
         </div>
         {diagPath && (
           <p className="hint" style={{ marginTop: 10 }}>
