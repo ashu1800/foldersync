@@ -68,6 +68,22 @@ pub async fn list_devices(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<Devi
     Ok(state.devices().await)
 }
 
+/// 推送单个文件夹的最新状态（提示词 5.3 的 `folder://status`）。
+///
+/// 命令本身已经返回了新状态，但其它窗口/托盘菜单也可能触发变化，
+/// 所以统一用事件广播一次，前端不必重拉整个列表。
+async fn emit_folder_status(app: &tauri::AppHandle, state: &Arc<AppState>, folder_id: &str) {
+    use tauri::Emitter;
+    if let Some(f) = state
+        .folders()
+        .await
+        .into_iter()
+        .find(|f| f.id == folder_id)
+    {
+        let _ = app.emit("folder://status", f);
+    }
+}
+
 /// 生成配对码（5 分钟有效，一次性）。
 #[tauri::command]
 pub async fn create_pairing_code(state: State<'_, Arc<AppState>>) -> CmdResult<PairingCodeDto> {
@@ -308,18 +324,27 @@ pub async fn remove_folder(state: State<'_, Arc<AppState>>, id: String) -> CmdRe
 
 /// 暂停文件夹同步。
 #[tauri::command]
-pub async fn pause_folder(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+pub async fn pause_folder(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> CmdResult<()> {
     state
         .store
         .set_folder_paused(&id, true)
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
     state.stop_folder(&id).await;
+    emit_folder_status(&app, &state, &id).await;
     Ok(())
 }
 
 /// 恢复文件夹同步。
 #[tauri::command]
-pub async fn resume_folder(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+pub async fn resume_folder(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> CmdResult<()> {
     state
         .store
         .set_folder_paused(&id, false)
@@ -335,6 +360,7 @@ pub async fn resume_folder(state: State<'_, Arc<AppState>>, id: String) -> CmdRe
         .start_folder(folder.id, folder.local_path)
         .await
         .map_err(|e| ErrorDto::new("runtime", format!("{e:#}")))?;
+    emit_folder_status(&app, &state, &id).await;
     Ok(())
 }
 
@@ -504,12 +530,11 @@ pub async fn list_activity(
 
 // ---------- 冲突 ----------
 
-/// 列出所有冲突副本文件。
-#[tauri::command]
-pub async fn list_conflicts(
-    state: State<'_, Arc<AppState>>,
-    folder_id: Option<String>,
-) -> CmdResult<Vec<ConflictDto>> {
+/// 收集冲突条目（命令与事件共用）。
+///
+/// 独立出来是因为 `conflict://new` 事件也要用同一套解析逻辑，
+/// 不能在事件路径里复制一份。
+pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<ConflictDto> {
     let mut out = Vec::new();
     for f in state.store.list_folders().unwrap_or_default() {
         if let Some(ref want) = folder_id
@@ -547,7 +572,16 @@ pub async fn list_conflicts(
             });
         }
     }
-    Ok(out)
+    out
+}
+
+/// 列出所有冲突副本文件（提示词 5.2）。
+#[tauri::command]
+pub async fn list_conflicts(
+    state: State<'_, Arc<AppState>>,
+    folder_id: Option<String>,
+) -> CmdResult<Vec<ConflictDto>> {
+    Ok(conflict_dtos_for(&state, folder_id))
 }
 
 /// 从 `名字.sync-conflict-20260101-120000-设备名.ext` 解析原名与设备。
@@ -567,7 +601,7 @@ fn parse_conflict_name(name: &str) -> (String, String) {
     (format!("{stem}{ext}"), device)
 }
 
-/// 解决冲突。
+/// 解决冲突（保留其一或两者）。
 #[tauri::command]
 pub async fn resolve_conflict(
     state: State<'_, Arc<AppState>>,

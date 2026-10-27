@@ -245,6 +245,21 @@ async fn sync_round(
         }
     }
 
+    // 连接建立/升级后推一次设备状态（提示词 5.3）。
+    // 之后前端靠 5 秒轮询兜底刷新 RTT，因为 iroh 内部的路径升级
+    // 不产生我们能看到的事件。
+    if let Some(d) = state
+        .devices()
+        .await
+        .into_iter()
+        .find(|d| d.id == peer_id.to_string())
+    {
+        events(
+            "device://status",
+            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        );
+    }
+
     // 持续收发
     loop {
         tokio::select! {
@@ -253,6 +268,18 @@ async fn sync_round(
                     Ok(m) => m,
                     Err(e) => {
                         state.conns.lock().await.remove(&peer_id.to_string());
+                        // 断开也要通知界面，否则设备一直显示"已连接"
+                        if let Some(d) = state
+                            .devices()
+                            .await
+                            .into_iter()
+                            .find(|d| d.id == peer_id.to_string())
+                        {
+                            events(
+                                "device://status",
+                                serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
                         return Err(anyhow::anyhow!("读对端消息失败: {e}"));
                     }
                 };
@@ -290,6 +317,32 @@ async fn sync_round(
                                         &hint,
                                         &format!("同步 {count} 项"),
                                     );
+                                    // 同步进度事件（提示词 5.3）：一轮同步结束时发一次
+                                    // total = done，界面进度条会立刻收尾。
+                                    let total = stats.pulled + stats.deleted + stats.conflicts;
+                                    events(
+                                        "sync://progress",
+                                        serde_json::json!({
+                                            "folder_id": folder_id,
+                                            "path": hint,
+                                            "done": total,
+                                            "total": total,
+                                            "direction": "download",
+                                        }),
+                                    );
+                                    // 冲突事件：本轮产生了冲突就逐个通知界面
+                                    if stats.conflicts > 0 {
+                                        for c in crate::commands::conflict_dtos_for(state, Some(folder_id.clone()))
+                                        .into_iter()
+                                        .take(stats.conflicts as usize)
+                                        {
+                                            events(
+                                                "conflict://new",
+                                                serde_json::to_value(c)
+                                                    .unwrap_or(serde_json::Value::Null),
+                                            );
+                                        }
+                                    }
                                 }
                                 Ok(_) => {}
                                 Err(e) => warn!("应用对端变更失败: {e:#}"),
