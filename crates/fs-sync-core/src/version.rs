@@ -130,4 +130,18 @@ mod tests {
         assert_eq!(m.get("B"), 1);
         assert_eq!(m.get("C"), 5);
     }
+
+    #[test]
+    fn dominates_single_component() {
+        let mut a = VersionVector::default();
+        a.increment("B");
+        let mut b = a.clone();
+        b.increment("B");
+        assert_eq!(
+            compare(&a, &b),
+            Ordering::DominatedBy,
+            "{{B:1}} 应被 {{B:2}} 支配"
+        );
+        assert_eq!(compare(&b, &a), Ordering::Dominates);
+    }
 }

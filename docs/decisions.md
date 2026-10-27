@@ -162,3 +162,43 @@ ESLint（react-hooks 新规则）报"effect 里同步 setState 会级联渲染"�
 处理 sticky 表头。等真的有人养了 5000 文件的同步目录、并且抱怨卡了，再换。
 `ponytail:` 性质的决定，入口在 `Folders.tsx:const TREE_RENDER_LIMIT`。
 
+## 2026-10-27 兜底扫描漏了 ensure_blob（随机收敛测试抓出）
+
+`full_scan`（每 10 分钟的兜底扫描）发现文件变更后，**只更新了索引、没把内容加进
+blob 存储**。watcher 路径有 `ensure_blob`，兜底扫描漏了。
+
+后果：索引里写着 hash，blob 库里没有内容。本地看一切正常（磁盘文件在），
+对端来拉时报 `encode error: 读取 blob 失败`，重试三次后放弃。
+**这个文件在对端就永远同步不过去**，而且日志里只有一行"拉取失败"。
+
+为什么之前没发现：正常流程里 watcher 会先把内容加入 blob，兜底扫描只是"补漏"，
+手工测试的目录既小又全程走 watcher。只有"绕过应用改文件 + 收敛测试"才踩到。
+
+修复：`full_scan` 在锁外对变更条目逐个 `ensure_blob`（锁外是因为它是异步 I/O，
+持锁会阻塞其它读写）。回归测试 `full_scan_registers_blob_content`。
+
+## 2026-10-27 full_scan 只比 size+mtime 会漏掉等长内容变更
+
+同上的 `full_scan` 判等用了 `size == size && mtime == mtime && is_dir == is_dir`。
+外部程序在**同一秒内**写入**等长**内容时三者全同，变更被漏掉，索引永远停在旧值。
+
+这是"索引与磁盘不一致"的直接来源，而 `diff` 只信索引 —— 于是同步逻辑
+认为一切正常，实际两端内容不同，且不会自愈。
+
+修复：加 `old.hash == fresh.hash`。扫描本来就已经算过 hash（`scan_folder`
+要它），不产生额外 I/O。回归测试
+`full_scan_detects_content_change_with_same_size_and_mtime`。
+
+## 2026-10-27 随机操作序列收敛测试的价值
+
+提示词 7 节要求"随机生成两端的操作序列，断言最终文件树与内容一致"。
+
+写这个测试之前，上面两个 bug 都测不出来；写了之后，它一次就把两个都暴露了
+（先暴露 `ensure_blob` 缺失，修完立刻暴露 `size+mtime` 判等不足）。
+
+用固定种子（xorshift + 常量初值）而不是真随机：失败可复现，
+把种子记下来就能在本地重跑同一个序列。
+
+结论：这类测试的成本很低（40 行），收益是发现了两个都会导致**用户数据在对端缺失**
+的 bug。以后加同步逻辑改动时应该优先跑它。
+

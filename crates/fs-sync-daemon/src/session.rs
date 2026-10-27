@@ -395,13 +395,21 @@ impl SyncSession {
 
         for (path, mut fresh) in scan.entries {
             seen.insert(path.clone());
-            match idx.get(&path) {
-                Some(old)
-                    if !old.deleted
+            // 判等不能只看 size + mtime：外部程序在同一秒内写入等长内容时三者全同，
+            // 会漏掉真实变更，导致「索引说已同步、磁盘还是旧内容」而且永不修正。
+            // 大小和时间戳都相同才去比对 hash（扫一遍已经算过 hash，直接可用）。
+            let unchanged = match idx.get(&path) {
+                Some(old) => {
+                    !old.deleted
                         && old.size == fresh.size
                         && old.mtime == fresh.mtime
-                        && old.is_dir == fresh.is_dir =>
-                {
+                        && old.is_dir == fresh.is_dir
+                        && old.hash == fresh.hash
+                }
+                None => false,
+            };
+            match idx.get(&path) {
+                _ if unchanged => {
                     // 未变化
                 }
                 old => {
@@ -414,6 +422,22 @@ impl SyncSession {
                 }
             }
         }
+
+        // 关键：扫描发现的新内容必须进 blob 存储，否则索引里有 hash、
+        // 对端却拉不到内容（报 "encode error: 读取 blob 失败"）。
+        // watcher 路径靠 ensure_blob 做这件事，兜底扫描漏了就会让对端永久卡住。
+        let to_blob: Vec<FileEntry> = changed
+            .iter()
+            .filter(|e| !e.is_dir && !e.deleted)
+            .cloned()
+            .collect();
+        drop(idx);
+        for e in to_blob {
+            if let Err(err) = self.engine.ensure_blob(&e).await {
+                warn!(path = %e.path, "兜底扫描加入 blob 失败: {err}");
+            }
+        }
+        let mut idx = self.index.lock().await;
 
         // 扫描中消失的 → 墓碑
         let gone: Vec<String> = idx

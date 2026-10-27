@@ -98,6 +98,34 @@ async fn node(name: &str) -> Node {
 }
 
 /// 本地写入：产生条目 + 内容进 blob（模拟 watcher + 事件循环）。
+///
+/// 内容与上次完全一致时 `on_local_event` 返回 None——这是正确的去重
+/// （否则每个防抖事件都会推一次相同内容），这里按 `Option` 返回。
+async fn write_opt(node: &Node, rel: &str, content: &[u8]) -> Option<FileEntry> {
+    let path = node.root().join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, content).unwrap();
+    let entry = node
+        .runtime
+        .session
+        .on_local_event(fs_sync_daemon::FileEvent {
+            path: rel.into(),
+            kind: fs_sync_daemon::EventKind::Changed,
+        })
+        .await
+        .unwrap();
+    if let Some(ref e) = entry
+        && !e.is_dir
+        && !e.deleted
+    {
+        node.runtime.session.engine.ensure_blob(e).await.unwrap();
+    }
+    entry
+}
+
+/// 写入并要求确实产生条目（测试自己可控的内容用它）。
 async fn write(node: &Node, rel: &str, content: &[u8]) -> FileEntry {
     let path = node.root().join(rel);
     if let Some(parent) = path.parent() {
@@ -140,6 +168,10 @@ async fn remove(node: &Node, rel: &str) -> FileEntry {
 }
 
 /// 一次同步：`from` 的全量索引推给 `to`，`to` 依 diff 拉取/删除。
+///
+/// 注意这里发的是**全量索引**，模拟真实会话里"连接建立时交换一次完整索引"
+/// 那一步。真实的增量同步只推本地刚变更的条目（IndexUpdate），全量交换只在
+/// 建立连接时发生一次 —— 每轮都发全量会让两端互相覆盖，测出来的现象是假的。
 async fn sync(from: &Node, to: &Node) -> Result<()> {
     let entries: HashMap<String, FileEntry> =
         from.runtime.session.snapshot().await.into_iter().collect();
@@ -449,4 +481,171 @@ async fn conflict_copy_uses_device_name() {
             "设备名不该是 64 位 hex（说明误传了 device_id）: {device}"
         );
     }
+}
+
+#[tokio::test]
+async fn rename_propagates_as_delete_plus_create() {
+    let a = node("A").await;
+    let b = node("B").await;
+
+    write(&a, "old-name.txt", b"content").await;
+    sync(&a, &b).await.unwrap();
+    assert!(b.read("old-name.txt").is_some());
+
+    // 文件系统层面 rename = 删除旧名 + 新增新名，watcher 就是这么报的
+    std::fs::rename(a.root().join("old-name.txt"), a.root().join("new-name.txt")).unwrap();
+    a.runtime
+        .session
+        .on_local_event(fs_sync_daemon::FileEvent {
+            path: "old-name.txt".into(),
+            kind: fs_sync_daemon::EventKind::Removed,
+        })
+        .await
+        .unwrap();
+    let e = a
+        .runtime
+        .session
+        .on_local_event(fs_sync_daemon::FileEvent {
+            path: "new-name.txt".into(),
+            kind: fs_sync_daemon::EventKind::Changed,
+        })
+        .await
+        .unwrap()
+        .expect("新名字应产生条目");
+    a.runtime.session.engine.ensure_blob(&e).await.unwrap();
+
+    sync_rounds(&a, &b, 2).await;
+
+    assert!(b.read("new-name.txt").is_some(), "新名字应同步过去");
+    assert!(b.read("old-name.txt").is_none(), "旧名字应消失");
+    assert_eq!(
+        b.read("new-name.txt").as_deref(),
+        Some(b"content".as_slice())
+    );
+}
+
+/// 收敛性（提示词 7 节）：固定种子的随机操作序列，两端最终必须一致。
+///
+/// 用固定种子而不是真随机：失败可复现。发现问题时把种子记下来就能重跑。
+#[tokio::test]
+async fn random_operation_sequence_converges() {
+    let a = node("A").await;
+    let b = node("B").await;
+
+    // xorshift：不引依赖，够用
+    let mut seq: u32 = 0;
+    let mut seed: u64 = 0x5DEE_CE66_D1CE_1234;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for step in 0..40 {
+        let target = if next() % 2 == 0 { &a } else { &b };
+        let path = format!("f{}.txt", next() % 8);
+        let op = next() % 3;
+
+        match op {
+            0 => {
+                // 写
+                // 内容带上步号，避免偶尔写成与上次相同的内容被去重
+                let body = format!("step{step}-{seq}").into_bytes();
+                seq += 1;
+                write_opt(target, &path, &body).await;
+            }
+            1 => {
+                // 删（文件可能不存在，忽略）
+                if target.read(&path).is_some() {
+                    remove(target, &path).await;
+                }
+            }
+            _ => {
+                // 同步一轮，让状态交错
+                sync_both(&a, &b).await.unwrap();
+            }
+        }
+    }
+
+    // 收尾：真实产品每 10 分钟做一次兜底全量扫描，把「绕过应用改的文件」
+    // 和「watcher 漏掉的事件」重新纳入索引。这里显式跑同样的流程，
+    // 顺带验证 full_scan 确实能修正磁盘与索引的偏差。
+    // 顺序很重要：先各自扫描修正索引，再同步，最后再同步一轮把上一步的修正传播出去。
+    for _ in 0..4 {
+        let _ = a.runtime.session.full_scan().await.unwrap();
+        let _ = b.runtime.session.full_scan().await.unwrap();
+        sync_both(&a, &b).await.unwrap();
+        sync_both(&a, &b).await.unwrap();
+    }
+
+    // 冲突副本名带时间戳，比较前剔除
+    let mut fa = a.files();
+    let mut fb = b.files();
+    fa.retain(|p| !p.contains(".sync-conflict-"));
+    fb.retain(|p| !p.contains(".sync-conflict-"));
+    assert_eq!(fa, fb, "随机操作后两端文件树必须一致");
+    for p in &fa {
+        assert_eq!(
+            a.read(p).as_deref().map(String::from_utf8_lossy),
+            b.read(p).as_deref().map(String::from_utf8_lossy),
+            "文件内容必须一致: {p}"
+        );
+    }
+}
+
+/// 回归：兜底扫描发现的新内容必须同时进 blob 存储。
+///
+/// 曾经的 bug：`full_scan` 只更新索引和新版本，忘了 `ensure_blob`。
+/// 结果是索引里有 hash、blob 库里没有内容，对端拉取时报
+/// "encode error: 读取 blob 失败"，而本地看起来一切正常（磁盘文件在），
+/// 只有在随机操作序列的收敛测试里才暴露出来。
+#[tokio::test]
+async fn full_scan_registers_blob_content() {
+    let a = node("A").await;
+    let b = node("B").await;
+
+    // 绕过 watcher 直接写盘：模拟"用户用别的程序改了文件"
+    std::fs::write(a.root().join("outside.txt"), b"written behind our back").unwrap();
+
+    let changed = a.runtime.session.full_scan().await.unwrap();
+    assert!(!changed.is_empty(), "兜底扫描应发现这个文件");
+
+    let entry = changed
+        .iter()
+        .find(|e| e.path == "outside.txt")
+        .expect("应包含 outside.txt")
+        .clone();
+
+    // 内容真的进了 blob 库（对端才能拉到）
+    assert!(
+        fs_sync_net::blobs::has_blob(&a.blobs, &entry.hash).await,
+        "兜底扫描必须把内容加入 blob 存储"
+    );
+
+    // 端到端：对端能拿到
+    sync(&a, &b).await.unwrap();
+    assert_eq!(
+        b.read("outside.txt").as_deref(),
+        Some(b"written behind our back".as_slice()),
+        "绕过 watcher 写的内容也应同步过去"
+    );
+}
+
+/// 回归：同大小同 mtime 但内容不同，兜底扫描必须能发现。
+#[tokio::test]
+async fn full_scan_detects_content_change_with_same_size_and_mtime() {
+    let a = node("A").await;
+
+    write(&a, "same.txt", b"AAAA").await;
+    let _ = a.runtime.session.full_scan().await.unwrap();
+
+    // 等一帧确保时间推进不会碰巧帮忙；直接按同尺寸覆盖
+    std::fs::write(a.root().join("same.txt"), b"BBBB").unwrap();
+
+    let changed = a.runtime.session.full_scan().await.unwrap();
+    assert!(
+        changed.iter().any(|e| e.path == "same.txt"),
+        "等长内容变更必须被发现（不能只比 size/mtime）"
+    );
 }
