@@ -109,10 +109,10 @@ jobs:
             \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
                -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.sig" \) 2>/dev/null)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "没有找到任何产物" >&2
+            echo "no artifacts found" >&2
             exit 1
           fi
-          printf '找到 %d 个产物:\n' "${#files[@]}"
+          printf 'found %d artifacts:\n' "${#files[@]}"
           printf '  %s\n' "${files[@]}"
           {
             echo "files<<EOF"
@@ -145,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p fragments
-          python3 - <<'PY'
+          python - <<'PY'
           import glob, json, os, pathlib
 
           files = [f for f in glob.glob("target/release/bundle/**/*", recursive=True)
@@ -183,16 +183,19 @@ jobs:
 
           if not got:
               # 这个平台没有 updater 格式的产物（比如只出了 deb），不算失败
-              print("本平台无 updater 产物，跳过")
+              print("no updater artifacts on this platform, skipping")
               raise SystemExit(0)
 
           for target, entry in got.items():
               out = pathlib.Path(f"fragments/updater-{target}.json")
               out.write_text(json.dumps({target: entry}, indent=2))
-              print(f"写出 {out}: {entry['url']}")
+              print(f"wrote {out}: {entry['url']}")
           PY
         env:
           VERSION: ${{ github.ref_name }}
+          # Windows runner 的 Python 默认 stdout 是 cp1252，输出中文会
+          # UnicodeEncodeError 崩掉（实测过）。脚本输出一律英文。
+          PYTHONIOENCODING: utf-8
 
       - name: 上传清单碎片
         uses: actions/upload-artifact@v4
@@ -226,7 +229,7 @@ jobs:
           TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
           VERSION="${TAG#v}"
 
-          python3 - "$VERSION" <<'PY'
+          python - "$VERSION" <<'PY'
           import glob, json, pathlib, sys
           version = sys.argv[1]
 
@@ -235,7 +238,7 @@ jobs:
               platforms.update(json.loads(pathlib.Path(f).read_text()))
 
           if not platforms:
-              raise SystemExit("没有任何平台的更新清单，检查构建是否产出了 .sig 文件")
+              raise SystemExit("no updater manifests found; check builds produced .sig files")
 
           doc = {
               "version": version,
@@ -247,4 +250,4 @@ jobs:
           PY
 
           gh release upload "$TAG" latest.json --clobber
-          echo "latest.json 已上传，包含 $(python3 -c "import json;print(len(json.load(open('latest.json'))['platforms']))") 个平台"
+          echo "latest.json uploaded, platforms: $(python -c "import json;print(len(json.load(open('latest.json'))['platforms']))")"
