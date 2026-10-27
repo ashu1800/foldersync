@@ -153,37 +153,45 @@ jobs:
           "$PY" - <<'PYEOF'
           import glob, json, os, pathlib
 
-          files = [f for f in glob.glob("target/release/bundle/**/*", recursive=True)
+          files = [f for f in glob.glob("target/**/release/bundle/**/*", recursive=True)
                    if os.path.isfile(f)]
           version = os.environ["VERSION"]
 
           def url(name):
-              return f"https://github.com/ashu1800/foldersync/releases/download/v{version}/{name}"
+              # TAG 已带 v 前缀（github.ref_name == "v0.1.0"），别再拼一个 v
+              return f"https://github.com/ashu1800/foldersync/releases/download/{TAG}/{name}"
 
-          # updater 认这几种包；deb/rpm 不是 updater 格式，不上报
+          # updater 各平台认的包类型不同：
+          #   Windows -> nsis 的 .exe（Tauri 会自己加 .nsis.zip 后缀）
+          #   Linux   -> .AppImage
+          #   macOS   -> .app.tar.gz（不是 .dmg！dmg 不能原地替换 app）
           wanted = {
               ".exe": "windows-x86_64",
               ".AppImage": "linux-x86_64",
-              ".dmg": None,  # 按文件名里的架构决定
+              ".gz": None,  # .app.tar.gz，按路径里有没有 aarch64 判断架构
           }
 
           got = {}
           for f in files:
               if f.endswith(".sig"):
                   continue
-              ext = pathlib.Path(f).suffix
-              if ext not in wanted:
-                  continue
+              name = os.path.basename(f)
               sig = f + ".sig"
               if not os.path.exists(sig):
                   continue
-              if ext == ".dmg":
+
+              if name.endswith(".app.tar.gz"):
                   target = "darwin-aarch64" if "aarch64" in f else "darwin-x86_64"
+              elif name.endswith(".exe"):
+                  target = "windows-x86_64"
+              elif name.endswith(".AppImage"):
+                  target = "linux-x86_64"
               else:
-                  target = wanted[ext]
+                  continue
+
               got[target] = {
                   "signature": open(sig).read().strip(),
-                  "url": url(os.path.basename(f)),
+                  "url": url(name),
               }
 
           if not got:
@@ -198,6 +206,8 @@ jobs:
           PYEOF
         env:
           VERSION: ${{ github.ref_name }}
+          # release 的 tag 名（带 v 前缀），拼下载 URL 用
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}
           # Windows runner 的 Python 默认 stdout 是 cp1252，输出中文会
           # UnicodeEncodeError 崩掉（实测过）。脚本输出一律英文。
           PYTHONIOENCODING: utf-8
