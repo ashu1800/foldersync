@@ -114,9 +114,14 @@ jobs:
           TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
           VERSION="${TAG#v}"
 
-          # 第一个跑到的 job 创建 release，其它 job 追加资产
+          # 第一个跑到的 job 创建 release，其它 job 追加资产。
+          #
+          # 必须显式 --draft=false：gh release create 会建出草稿，
+          # 而草稿不出现在 releases/latest，客户端的 updater 直接 404。
+          # 这个坑害得自动更新整个链路失效过，别删这个参数。
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
+              --draft=false \
               --title "FolderSync $TAG" \
               --notes "已安装旧版的用户可在应用内检查更新升级。"
           fi
