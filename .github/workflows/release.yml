@@ -145,7 +145,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p fragments
-          python - <<'PY'
+          # python vs python3：Windows runner 只有 python，macOS 只有 python3。
+          # 写死任何一个都会在别的平台 exit 127。
+          PY=$(command -v python3 || command -v python)
+          [ -n "$PY" ] || { echo "no python found" >&2; exit 1; }
+          "$PY" - <<'PYEOF'
           import glob, json, os, pathlib
 
           files = [f for f in glob.glob("target/release/bundle/**/*", recursive=True)
@@ -190,7 +194,7 @@ jobs:
               out = pathlib.Path(f"fragments/updater-{target}.json")
               out.write_text(json.dumps({target: entry}, indent=2))
               print(f"wrote {out}: {entry['url']}")
-          PY
+          PYEOF
         env:
           VERSION: ${{ github.ref_name }}
           # Windows runner 的 Python 默认 stdout 是 cp1252，输出中文会
@@ -229,7 +233,9 @@ jobs:
           TAG="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}"
           VERSION="${TAG#v}"
 
-          python - "$VERSION" <<'PY'
+          PY=$(command -v python3 || command -v python)
+          [ -n "$PY" ] || { echo "no python found" >&2; exit 1; }
+          "$PY" - "$VERSION" <<'PYEOF'
           import glob, json, pathlib, sys
           version = sys.argv[1]
 
@@ -247,7 +253,8 @@ jobs:
           }
           pathlib.Path("latest.json").write_text(json.dumps(doc, indent=2))
           print(json.dumps(doc, indent=2))
-          PY
+          PYEOF
 
           gh release upload "$TAG" latest.json --clobber
-          echo "latest.json uploaded, platforms: $(python -c "import json;print(len(json.load(open('latest.json'))['platforms']))")"
+          COUNT=$("$PY" -c "import json;print(len(json.load(open('latest.json'))['platforms']))")
+          echo "latest.json uploaded, platforms: $COUNT"
