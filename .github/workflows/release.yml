@@ -128,16 +128,22 @@ jobs:
           #
           # macOS 的 .app.tar.gz 两个架构同名（都叫 FolderSync.app.tar.gz），
           # 直接传会互相覆盖，导致两个架构的更新包变成同一个文件。
-          # 上传前改名把架构带上。
+          # 上传前改名把架构带上，配套的 .sig 也要同步改名。
           count=0
           while IFS= read -r -d '' f; do
             upload="$f"
             case "$f" in
-              *.app.tar.gz)
+              *.app.tar.gz|*.app.tar.gz.sig)
+                # 取架构：路径里带 aarch64 就是 arm，否则 x64
                 case "$f" in
-                  *aarch64*) upload="/tmp/FolderSync_${VERSION}_aarch64.app.tar.gz" ;;
-                  *)         upload="/tmp/FolderSync_${VERSION}_x64.app.tar.gz" ;;
+                  *aarch64*) arch="aarch64" ;;
+                  *)         arch="x64" ;;
                 esac
+                case "$f" in
+                  *.sig) base="FolderSync_${VERSION}_${arch}.app.tar.gz.sig" ;;
+                  *)     base="FolderSync_${VERSION}_${arch}.app.tar.gz" ;;
+                esac
+                upload="/tmp/$base"
                 cp "$f" "$upload"
                 ;;
             esac
@@ -146,7 +152,8 @@ jobs:
             count=$((count + 1))
           done < <(find target -path "*/release/bundle/*" -type f \
             \( -name "*.exe" -o -name "*.msi" -o -name "*.dmg" -o -name "*.deb" \
-               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.app.tar.gz" \) -print0)
+               -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.app.tar.gz" \
+               -o -name "*.sig" \) -print0)
 
           if [ "$count" -eq 0 ]; then
             echo "no artifacts found" >&2
