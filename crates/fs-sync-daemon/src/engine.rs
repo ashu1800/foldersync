@@ -57,12 +57,28 @@ impl WriteSuppression {
     ///
     /// 用 `try_lock` 避免在回调线程阻塞：竞争时保守返回"未命中"，
     /// 最坏情况只是多产生一次事件（后续 hash 比对会过滤掉），不会丢数据。
+    /// 同步版本（供 notify 回调线程使用，那里不能 await）。
+    ///
+    /// 拿不到锁时**短暂自旋**而不是直接放弃：`insert` 与事件回调几乎同时发生是
+    /// 常态（我们刚写完文件，watcher 立刻报事件），此时放弃就等于把自己的写入
+    /// 当成外部变更，触发一次无谓的回写。实测在 CI 的慢机器上会稳定复现。
+    ///
+    /// 自旋上限 50ms：真的锁不上就说明有别的长事务在跑，此时选择"不抑制"
+    /// 更安全（宁可多同步一次，不能漏掉外部变更）。
     pub fn try_take_if_hit(&self, rel_path: &str) -> bool {
-        let Ok(mut map) = self.inner.try_lock() else {
-            return false;
-        };
-        map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(5));
-        map.remove(rel_path).is_some()
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        loop {
+            match self.inner.try_lock() {
+                Ok(mut map) => {
+                    map.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(5));
+                    return map.remove(rel_path).is_some();
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(_) => return false,
+            }
+        }
     }
 }
 

@@ -176,12 +176,15 @@ mod tests {
         let sup = std::sync::Arc::new(WriteSuppression::new());
         let (mut rx, _deb) = watch_folder(&root, matcher, sup.clone(), 100).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 等 watcher 真正就绪：慢速 CI 上 inotify/ReadDirectoryChangesW 注册需要时间，
+        // 立刻写文件会漏事件，导致"没收到事件"被误判成"抑制成功"或者反之。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
         // 先登记抑制，再写文件
         sup.insert("own.txt", "").await;
         std::fs::write(root.join("own.txt"), b"self").unwrap();
 
-        // 5 秒内不应收到该文件事件
+        // 2 秒内不应收到该文件事件（debounce 100ms，留足余量）
         let got = tokio::time::timeout(Duration::from_secs(2), async {
             while let Some(e) = rx.recv().await {
                 if e.path == "own.txt" {
