@@ -69,18 +69,18 @@ impl Default for NetConfig {
     }
 }
 
-/// 自建中继 + 官方中继的组合 RelayMap。
+/// 中继表：**只放自建中继**。
 ///
-/// 自建排前面（首选），但**必须**把官方中继也留着。
+/// 为什么不把官方中继一起放进来做兜底：iroh 会按延迟在多个 relay 之间自动切换
+/// home relay。混着放之后，两端会各自在不同时刻跳到不同的中继上，而中继只在
+/// 「连在同一个中继上」的节点之间转发 —— 于是配对时好时坏，诊断日志里能看到
+/// 每秒都在 sync.ashu180.top / usw1 / aps1 / euc1 之间来回跳。
 ///
-/// 踩过的坑：早期只放自建的，结果和还在用官方中继的对端完全连不上。中继只转发到
-/// "连在同一个中继上"的节点，两端各在一个中继上时没有任何共享通路，打洞再失败就
-/// 直接超时（实测配对 10 秒 timeout，界面只显示"连接对码失败"）。
+/// 只放一个中继，选路就没有了歧义，两端必然在同一个中继上。
+/// 代价：自建中继挂了就没有中继可用（直连/Tailscale 仍然能用）。
+/// 要换回官方中继，把 `relay_url` 设成 `None` 即可（那条路径走 presets::N0）。
 fn relay_map_with(custom: iroh::RelayUrl) -> iroh::RelayMap {
-    // RelayMap 内部是 Arc，extend 接收 &self，不需要 mut
-    let map = iroh::RelayMode::custom([custom]).relay_map();
-    map.extend(&iroh::RelayMode::Default.relay_map());
-    map
+    iroh::RelayMode::custom([custom]).relay_map()
 }
 
 /// 按配置绑定 Endpoint。
@@ -95,7 +95,7 @@ pub async fn bind_endpoint_with(config: &NetConfig, secret: SecretKey) -> Result
         match url.parse::<iroh::RelayUrl>() {
             Ok(relay) => {
                 builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)));
-                tracing::info!(%url, "使用自建中继（官方中继保留为兜底）");
+                tracing::info!(%url, "使用自建中继（只连这一个，避免多中继来回跳）");
             }
             Err(e) => {
                 tracing::warn!(%url, "自建中继 URL 无效，回退到官方中继: {e}");
@@ -177,16 +177,13 @@ pub type Shared<T> = Arc<tokio::sync::RwLock<T>>;
 mod tests {
     use super::*;
 
-    /// 只有自建中继会和对端失去共享通路，必须保留官方中继兜底。
+    /// 只放自建中继。混入官方中继会让 iroh 在多个 relay 间跳来跳去，
+    /// 两端落到不同中继上就配不上对（诊断日志里抓到的抖动）。
     #[test]
-    fn relay_map_keeps_official_fallbacks() {
+    fn relay_map_has_exactly_the_custom_relay() {
         let custom: iroh::RelayUrl = "https://sync.ashu180.top:8444".parse().unwrap();
         let map = relay_map_with(custom.clone());
         assert!(map.contains(&custom), "自建中继必须在 map 里");
-        assert!(
-            map.len() >= 2,
-            "官方中继必须保留为兜底，实际只有 {} 个中继",
-            map.len()
-        );
+        assert_eq!(map.len(), 1, "relay map 只能有自建中继，否则会来回跳");
     }
 }

@@ -687,7 +687,14 @@ pub async fn update_settings(
 /// 打开日志目录（调用系统文件管理器）。
 #[tauri::command]
 pub async fn open_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> {
-    Ok(state.data_dir.join("logs").to_string_lossy().to_string())
+    let dir = state.data_dir.join("logs");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.to_string_lossy().to_string();
+    // 之前这个命令只返回路径、前端复制到剪贴板，按钮写「打开」却什么都没打开。
+    // 这里真的调用系统文件管理器。
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|e| ErrorDto::new("open_failed", format!("打开日志目录失败: {e}")))?;
+    Ok(path)
 }
 
 /// 本机信息（调试/诊断用）。

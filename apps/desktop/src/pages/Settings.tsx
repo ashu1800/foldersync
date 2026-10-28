@@ -277,8 +277,7 @@ export default function Settings() {
             className="btn"
             onClick={async () => {
               try {
-                const dir = await api.getLogDir();
-                await navigator.clipboard?.writeText(dir).catch(() => {});
+                await api.openLogDir();
                 setError(null);
               } catch (e) {
                 setError(api.asCmdError(e).message);
