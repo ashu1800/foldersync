@@ -30,6 +30,7 @@
     ],
     "windows": {
       "nsis": {
+        "installerHooks": "./installer.nsh",
         "installMode": "currentUser",
         "languages": [
           "SimpChinese",

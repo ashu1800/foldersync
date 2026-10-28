@@ -493,11 +493,12 @@ async fn pair(data_dir: &std::path::Path) -> Result<()> {
     let trust = Trust::new(store.clone());
     let pairing = PairingManager::new(trust, my_id, store);
 
+    // CLI 的 pair 只生成码，实际监听在 serve 进程里，拿不到端口，
+    // 所以这里只带中继（桌面端会额外带 Tailscale 直连地址）。
     let ts = detect_tailscale();
     let code = pairing
-        .create_code(Some(fs_sync_net::DEFAULT_RELAY_URL))
+        .create_code(Vec::new(), Some(fs_sync_net::DEFAULT_RELAY_URL))
         .await;
-    let _ = &ts.ips; // Tailscale 直连地址改由 iroh 自己的发现机制维护
     println!("配对码（5 分钟内有效，一次性）：\n");
     println!("{}", pc::encode(&code));
     println!("\n对端执行：foldersync join <上面的配对码>");

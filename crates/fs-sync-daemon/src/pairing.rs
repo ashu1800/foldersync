@@ -61,8 +61,9 @@ impl PairingManager {
     /// `relay` 是本机正在用的中继 URL，会写进配对码 —— 拨号方据此直连中继，
     /// 不依赖 DNS 地址发现。之前只写 EndpointId，DNS 一旦被墙/被代理干扰就
     /// 必然超时（实测跨省两台机器都连不上）。
-    pub async fn create_code(&self, relay: Option<&str>) -> PairingCode {
-        let code = fs_sync_net::pairing::generate(&self.my_id.to_string(), now_secs(), relay);
+    pub async fn create_code(&self, addrs: Vec<String>, relay: Option<&str>) -> PairingCode {
+        let mut code = fs_sync_net::pairing::generate(&self.my_id.to_string(), now_secs(), relay);
+        code.addrs = addrs;
         // 持久化 token，供另一个进程（serve）校验
         if let Err(e) = self
             .store
@@ -215,7 +216,7 @@ mod tests {
             iroh::SecretKey::generate().public(),
             store.clone(),
         );
-        let code = pairer.create_code(None).await;
+        let code = pairer.create_code(Vec::new(), None).await;
 
         // 模拟 `foldersync serve` 进程（不同的 PairingManager 实例，同一 Store）
         let server = PairingManager::new(
@@ -245,7 +246,7 @@ mod tests {
     async fn token_is_single_use() {
         let (pm, _) = manager();
         let peer = iroh::SecretKey::generate().public();
-        let code = pm.create_code(None).await;
+        let code = pm.create_code(Vec::new(), None).await;
 
         // 第一次使用：等待确认超时 → false
         let r1 = pm
@@ -264,7 +265,7 @@ mod tests {
     async fn accept_writes_trust() {
         let (pm, store) = manager();
         let peer = iroh::SecretKey::generate().public();
-        let code = pm.create_code(None).await;
+        let code = pm.create_code(Vec::new(), None).await;
 
         let pm2 = pm.clone();
         let peer_name = "company-pc";
@@ -304,7 +305,7 @@ mod tests {
     async fn reject_does_not_write_trust() {
         let (pm, store) = manager();
         let peer = iroh::SecretKey::generate().public();
-        let code = pm.create_code(None).await;
+        let code = pm.create_code(Vec::new(), None).await;
         let token = code.token.clone();
 
         let pm2 = pm.clone();
