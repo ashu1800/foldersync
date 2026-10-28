@@ -77,10 +77,27 @@ impl Default for NetConfig {
 /// 每秒都在 sync.ashu180.top / usw1 / aps1 / euc1 之间来回跳。
 ///
 /// 只放一个中继，选路就没有了歧义，两端必然在同一个中继上。
+///
 /// 代价：自建中继挂了就没有中继可用（直连/Tailscale 仍然能用）。
 /// 要换回官方中继，把 `relay_url` 设成 `None` 即可（那条路径走 presets::N0）。
 fn relay_map_with(custom: iroh::RelayUrl) -> iroh::RelayMap {
     iroh::RelayMode::custom([custom]).relay_map()
+}
+
+/// 自建中继模式下用 `presets::Minimal`，**不装 N0 的 DNS/pkarr 地址发现**。
+///
+/// 为什么：`presets::N0` 会挂上 `PkarrPublisher` / `PkarrResolver` /
+/// `DnsAddressLookup`，这些都要去问境外的 `dns.iroh.link`。国内网络下这些查询
+/// 要么被墙要么极慢，而 `endpoint.connect(addr)` 会带着它们一起跑，
+/// 结果就是明明配了直连地址，却卡到 30 秒超时（实测两台机器都这样）。
+///
+/// 我们并不需要地址发现：配对码里已经带上了中继 URL 和本机 Tailscale 直连地址，
+/// 拨号方拿到的就是完整地址。去掉它反而更快、更可控。
+fn builder_with_relay(secret: SecretKey, relay: iroh::RelayUrl) -> iroh::endpoint::Builder {
+    tracing::info!(url = %relay, "使用自建中继（关闭 DNS 发现，只连这一个中继）");
+    Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
+        .relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)))
 }
 
 /// 按配置绑定 Endpoint。
@@ -89,19 +106,23 @@ fn relay_map_with(custom: iroh::RelayUrl) -> iroh::RelayMap {
 /// 配置项非法（比如中继 URL 写错）时**回退到默认配置**而不是启动失败——
 /// 用户填错一个 URL 不应该让整个应用起不来。
 pub async fn bind_endpoint_with(config: &NetConfig, secret: SecretKey) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+    // 先解析中继：解析成功走 Minimal（无 DNS 发现），失败/没配才回退 N0。
+    let custom_relay =
+        config
+            .relay_url
+            .as_deref()
+            .and_then(|url| match url.parse::<iroh::RelayUrl>() {
+                Ok(relay) => Some(relay),
+                Err(e) => {
+                    tracing::warn!(url, "自建中继 URL 无效，回退到官方中继: {e}");
+                    None
+                }
+            });
 
-    if let Some(ref url) = config.relay_url {
-        match url.parse::<iroh::RelayUrl>() {
-            Ok(relay) => {
-                builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)));
-                tracing::info!(%url, "使用自建中继（只连这一个，避免多中继来回跳）");
-            }
-            Err(e) => {
-                tracing::warn!(%url, "自建中继 URL 无效，回退到官方中继: {e}");
-            }
-        }
-    }
+    let mut builder = match custom_relay.clone() {
+        Some(relay) => builder_with_relay(secret.clone(), relay),
+        None => Endpoint::builder(presets::N0).secret_key(secret.clone()),
+    };
 
     if let Some(port) = config.listen_port {
         let addr: std::net::SocketAddr = match format!("0.0.0.0:{port}").parse() {
@@ -123,13 +144,10 @@ pub async fn bind_endpoint_with(config: &NetConfig, secret: SecretKey) -> Result
                         // 这里 builder 已被消耗，无法继续用；
                         // 直接换一个全新 builder 走默认配置。
                         tracing::warn!(port, "监听地址无效，改用默认配置: {e}");
-                        let mut fresh = Endpoint::builder(presets::N0);
-                        if let Some(ref url) = config.relay_url
-                            && let Ok(relay) = url.parse::<iroh::RelayUrl>()
-                        {
-                            fresh =
-                                fresh.relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)));
-                        }
+                        let fresh = match custom_relay {
+                            Some(relay) => builder_with_relay(secret.clone(), relay),
+                            None => Endpoint::builder(presets::N0).secret_key(secret.clone()),
+                        };
                         return fresh.bind().await.context("iroh Endpoint 绑定失败");
                     }
                 }
