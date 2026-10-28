@@ -36,14 +36,30 @@ async fn relay_accepts_connection() {
         .is_ok();
     assert!(ok, "20 秒内没能连上中继 {relay}");
 
-    let mut watcher = endpoint.home_relay_status();
-    let connected = watcher
-        .get()
-        .into_iter()
-        .filter(|s| s.is_connected())
-        .count();
-    assert!(connected > 0, "中继状态里没有已连接项");
-    println!("已连上 {connected} 个中继：{relay}");
+    // 自建中继必须真的连上（否则等于没用上自己的服务器）。
+    // 多个中继是并发连接的，online() 只保证"至少一个"通了，所以这里再等一会儿。
+    let custom: iroh::RelayUrl = relay.parse().expect("中继 URL 非法");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let statuses = loop {
+        let mut watcher = endpoint.home_relay_status();
+        let statuses = watcher.get();
+        if statuses
+            .iter()
+            .any(|s| s.is_connected() && *s.url() == custom)
+        {
+            break statuses;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("自建中继 {relay} 15 秒内没连上，实际状态: {statuses:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let connected = statuses.iter().filter(|s| s.is_connected()).count();
+    println!(
+        "中继 map 共 {} 个，已连上 {connected} 个，其中自建 {relay} 已连上",
+        statuses.len()
+    );
 
     endpoint.close().await;
 }

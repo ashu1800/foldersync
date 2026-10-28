@@ -69,6 +69,20 @@ impl Default for NetConfig {
     }
 }
 
+/// 自建中继 + 官方中继的组合 RelayMap。
+///
+/// 自建排前面（首选），但**必须**把官方中继也留着。
+///
+/// 踩过的坑：早期只放自建的，结果和还在用官方中继的对端完全连不上。中继只转发到
+/// "连在同一个中继上"的节点，两端各在一个中继上时没有任何共享通路，打洞再失败就
+/// 直接超时（实测配对 10 秒 timeout，界面只显示"连接对码失败"）。
+fn relay_map_with(custom: iroh::RelayUrl) -> iroh::RelayMap {
+    // RelayMap 内部是 Arc，extend 接收 &self，不需要 mut
+    let map = iroh::RelayMode::custom([custom]).relay_map();
+    map.extend(&iroh::RelayMode::Default.relay_map());
+    map
+}
+
 /// 按配置绑定 Endpoint。
 ///
 /// 与 [`bind_endpoint`] 的区别是：可以指定自建中继、固定端口。
@@ -80,8 +94,8 @@ pub async fn bind_endpoint_with(config: &NetConfig, secret: SecretKey) -> Result
     if let Some(ref url) = config.relay_url {
         match url.parse::<iroh::RelayUrl>() {
             Ok(relay) => {
-                builder = builder.relay_mode(iroh::RelayMode::custom([relay]));
-                tracing::info!(%url, "使用自建中继");
+                builder = builder.relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)));
+                tracing::info!(%url, "使用自建中继（官方中继保留为兜底）");
             }
             Err(e) => {
                 tracing::warn!(%url, "自建中继 URL 无效，回退到官方中继: {e}");
@@ -113,7 +127,8 @@ pub async fn bind_endpoint_with(config: &NetConfig, secret: SecretKey) -> Result
                         if let Some(ref url) = config.relay_url
                             && let Ok(relay) = url.parse::<iroh::RelayUrl>()
                         {
-                            fresh = fresh.relay_mode(iroh::RelayMode::custom([relay]));
+                            fresh =
+                                fresh.relay_mode(iroh::RelayMode::Custom(relay_map_with(relay)));
                         }
                         return fresh.bind().await.context("iroh Endpoint 绑定失败");
                     }
@@ -157,3 +172,21 @@ pub fn addr_from_id(id: EndpointId) -> EndpointAddr {
 
 /// 供后续里程碑使用的共享状态容器。
 pub type Shared<T> = Arc<tokio::sync::RwLock<T>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只有自建中继会和对端失去共享通路，必须保留官方中继兜底。
+    #[test]
+    fn relay_map_keeps_official_fallbacks() {
+        let custom: iroh::RelayUrl = "https://sync.ashu180.top:8444".parse().unwrap();
+        let map = relay_map_with(custom.clone());
+        assert!(map.contains(&custom), "自建中继必须在 map 里");
+        assert!(
+            map.len() >= 2,
+            "官方中继必须保留为兜底，实际只有 {} 个中继",
+            map.len()
+        );
+    }
+}
