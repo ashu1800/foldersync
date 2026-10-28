@@ -494,7 +494,10 @@ async fn pair(data_dir: &std::path::Path) -> Result<()> {
     let pairing = PairingManager::new(trust, my_id, store);
 
     let ts = detect_tailscale();
-    let code = pairing.create_code(&ts.ips).await;
+    let code = pairing
+        .create_code(Some(fs_sync_net::DEFAULT_RELAY_URL))
+        .await;
+    let _ = &ts.ips; // Tailscale 直连地址改由 iroh 自己的发现机制维护
     println!("配对码（5 分钟内有效，一次性）：\n");
     println!("{}", pc::encode(&code));
     println!("\n对端执行：foldersync join <上面的配对码>");

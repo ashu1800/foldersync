@@ -87,7 +87,9 @@ async fn emit_folder_status(app: &tauri::AppHandle, state: &Arc<AppState>, folde
 /// 生成配对码（5 分钟有效，一次性）。
 #[tauri::command]
 pub async fn create_pairing_code(state: State<'_, Arc<AppState>>) -> CmdResult<PairingCodeDto> {
-    let code = state.pairing.create_code(&[]).await;
+    // 把当前中继写进配对码，对端不依赖 DNS 发现也能连上
+    let relay = state.settings.get().relay_url;
+    let code = state.pairing.create_code(relay.as_deref()).await;
     let encoded = fs_sync_net::pairing::encode(&code);
     let expires_at = code.expires_at as i64;
     Ok(PairingCodeDto {
@@ -117,9 +119,12 @@ pub async fn accept_pairing_code(
         .parse::<iroh::EndpointId>()
         .map_err(|e| ErrorDto::new("bad_code", format!("配对码中的设备 ID 无效: {e}")))?;
 
+    // 用配对码里的完整地址（含中继）拨号，而不是只给 EndpointId 等 DNS 解析
+    let addr = fs_sync_net::pairing::to_endpoint_addr(&parsed)
+        .map_err(|e| ErrorDto::new("bad_code", format!("配对码地址无效: {e}")))?;
     let conn = state
         .endpoint
-        .connect(peer, fs_sync_net::ALPN)
+        .connect(addr, fs_sync_net::ALPN)
         .await
         .map_err(|e| ErrorDto::new("connect_failed", format!("连接对端失败: {e}")))?;
     let (mut send, mut recv) = conn

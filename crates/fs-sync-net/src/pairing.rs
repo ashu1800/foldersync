@@ -20,16 +20,23 @@ pub struct PairingCode {
     /// 附加直连地址（如本机 Tailscale IP:端口），可为空
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// 生成方使用的中继 URL。
+    ///
+    /// 必须带上：拨号方如果 DNS 发现被墙/被代理干扰，只靠 EndpointId 是找不到人的，
+    /// 连接会直接超时。带上中继后，双方只要都能连到这个中继就能建立连接。
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 /// 生成新配对码。
-pub fn generate(my_id: &str, now: u64) -> PairingCode {
+pub fn generate(my_id: &str, now: u64, relay: Option<&str>) -> PairingCode {
     let token: [u8; 16] = rand::rng().random();
     PairingCode {
         endpoint_id: my_id.to_string(),
         token: hex::encode(token),
         expires_at: now + DEFAULT_TTL_SECS,
         addrs: Vec::new(),
+        relay: relay.map(str::to_string),
     }
 }
 
@@ -65,6 +72,12 @@ pub fn to_endpoint_addr(code: &PairingCode) -> Result<EndpointAddr> {
         .parse()
         .context("配对码中的 EndpointId 无效")?;
     let mut addr = EndpointAddr::from(id);
+    if let Some(ref relay) = code.relay {
+        match relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => addr = addr.with_relay_url(url),
+            Err(e) => tracing::warn!(%relay, "配对码里的中继 URL 无效: {e}"),
+        }
+    }
     for s in &code.addrs {
         if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
             addr.addrs.insert(TransportAddr::Ip(sa));
@@ -88,7 +101,7 @@ mod tests {
     #[test]
     fn roundtrip_and_expiry() {
         let id = iroh::SecretKey::generate().public().to_string();
-        let code = generate(&id, 1_000_000);
+        let code = generate(&id, 1_000_000, None);
         let text = encode(&code);
         assert!(text.starts_with("foldersync:"));
         assert_eq!(decode(&text, 1_000_000).unwrap(), code);
@@ -107,21 +120,21 @@ mod tests {
 
     #[test]
     fn token_is_hex16_bytes() {
-        let code = generate(&iroh::SecretKey::generate().public().to_string(), 0);
+        let code = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
         assert_eq!(code.token.len(), 32);
         assert_eq!(hex::decode(&code.token).unwrap().len(), 16);
     }
 
     #[test]
     fn tokens_differ_between_codes() {
-        let a = generate(&iroh::SecretKey::generate().public().to_string(), 0);
-        let b = generate(&iroh::SecretKey::generate().public().to_string(), 0);
+        let a = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
+        let b = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
         assert_ne!(a.token, b.token);
     }
 
     #[test]
     fn extra_addrs_survive_roundtrip() {
-        let mut code = generate(&iroh::SecretKey::generate().public().to_string(), 0);
+        let mut code = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
         code.addrs = vec!["100.102.104.88:40000".into(), "bad-addr".into()];
         let text = encode(&code);
         let got = decode(&text, 0).unwrap();
