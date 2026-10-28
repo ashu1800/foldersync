@@ -302,3 +302,41 @@ export type ActivityFilter = { folder_id?: string, kind?: ActivityKind, limit?: 
 CI 里已经加了 `pnpm exec tsc --noEmit` 和 `git diff --exit-code src/lib/bindings/`，
 两边都能拦住这类问题。
 
+
+## 2026-10-28 自建 iroh 中继部署（sync.ashu180.top）
+
+公网中继落地在 66.42.99.110（Vultr 新加坡，和 searxng/llm-relay/postgres 同机）。
+
+**为什么用 8444 而不是 443**：这台机器的 80/443 被 nginx 占着，上面跑了
+ashu180.top / llm / magpie / reelshort 四个站点。有两个选择：
+
+1. nginx `stream` + `ssl_preread` 按 SNI 分流 —— 443 还要从 nginx 手里抢过来，
+   现有站点全有风险；
+2. 中继直接监听 8444，RelayUrl 带端口。
+
+选 2。iroh 的 `RelayUrl` 允许带端口，客户端完全支持。代价是 URL 不干净，
+但改动面为零、不影响任何现有站点。
+
+**端口被占的坑**：第一次启动失败 `Address already in use`。查下来 sing-box
+占了 8080 和 8443 —— 这两个恰好是我先选的端口。中继最终用：
+- 8444/TCP → HTTPS/WSS
+- 7842/UDP → QUIC 地址发现（QAD）
+- 8081/本地回环 → captive portal 的 `/generate_204`（绑回环即可，不对外）
+
+**为什么从官方中继切到自建**：官方中继是 n0.computer 给开发测试用的共享设施，
+没有可用性承诺。两个人在不同 NAT 后配对时，中继是最后的兜底路径，
+自建至少不会因为别人滥用而排队。
+
+**TLS 用 Reloading 而不是 Manual**：`cert_mode = "Reloading"` 会定期重读证书文件，
+certbot 续期后不用重启服务。如果只在启动时读一次（Manual），90 天后证书过期，
+中继静默失效 —— 这种故障很难发现。证书由 certbot 签发到
+`/etc/letsencrypt/live/sync.ashu180.top/`，任务钩子复制到
+`/var/lib/iroh-relay/certs/`（iroh-relay 是独立系统用户，读不到 letsencrypt 的 700 目录）。
+
+**默认中继写进代码**：`fs_sync_net::DEFAULT_RELAY_URL`，桌面端 `SettingsDto::default()`
+和 CLI 都用它。理由：用户装完就该能用，不该先去设置页手填 URL。
+代价是别人从这个仓库构建也会走我的中继 —— 对个人项目可接受，公共项目应该反过来
+（默认官方、自建作为选项）。
+
+**验证**：`cargo test -p fs-sync-net --test relay -- --ignored` 实测 1.93 秒连上，
+中继进程 RSS 9.9MB，healthz 返回 `{"status":"ok","version":"1.4.1"}`。

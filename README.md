@@ -64,8 +64,8 @@ cd apps/desktop && pnpm install && pnpm tauri dev
 - [x] M3 单向同步（真实跨机传输 3 个文件含嵌套目录，内容一致，失败 0）
 - [x] M4 双向实时同步（实测：新增 1.0~1.1s、删除 1.0s 双向传播；冲突保留副本不丢数据且不重复）
 - [x] M5 桌面应用（6 个页面、托盘、开机自启、关闭到托盘、6 个事件推送、ts-rs 类型自动生成、中英双语、ESLint+Prettier）
-- [x] M6 打磨发布（带宽限速、自建中继**配置**、固定端口、日志落盘、诊断包导出、规模测试、NSIS 安装包）
-  - 注：只是支持填中继 URL，**没有实际部署中继服务器**。默认走 iroh 官方中继 `https://*.relay.n0.iroh.link`。
+- [x] M6 打磨发布（带宽限速、自建中继、固定端口、日志落盘、诊断包导出、规模测试、NSIS 安装包）
+  - 自建中继已实际部署：`https://sync.ashu180.top:8444`（见下节）。
 
 ## 同步实测数据（家 ↔ 公司，经 Tailscale/打洞）
 
@@ -180,6 +180,36 @@ git push origin main --tags
 
 私钥没有密码（`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 为空），因为 CI 里无人值守。
 若日后要加密码，改 secret 并给 workflow 传该变量即可。
+
+## 自建中继
+
+公网中继部署在 `66.42.99.110`（Vultr 新加坡），域名为 `sync.ashu180.top`。
+
+| 项 | 值 |
+|----|-----|
+| RelayUrl | `https://sync.ashu180.top:8444` |
+| HTTPS / WSS | TCP 8444（**必须带端口**：443/80 被同机 nginx 占用） |
+| QUIC 地址发现（QAD） | UDP 7842，用于探测公网地址、提高打洞成功率 |
+| 服务 | systemd `iroh-relay.service`，二进制 `/usr/local/bin/iroh-relay` |
+| 配置 | `/etc/iroh-relay/config.toml` |
+| 证书 | certbot 签发到 `/etc/letsencrypt/live/sync.ashu180.top/`，复制到 `/var/lib/iroh-relay/certs/`，`cert_mode = "Reloading"` 自动热加载 |
+| 版本 | 与客户端同版本 `iroh-relay 1.4.1`（中继协议必须对齐） |
+
+应用默认就用这个中继（`SettingsDto::default()`），设置页里清空「中继服务器」即可退回 iroh 官方中继。
+
+运维命令：
+
+```bash
+systemctl status iroh-relay
+journalctl -u iroh-relay -n 50 --no-pager
+curl --fail https://sync.ashu180.top:8444/healthz
+```
+
+连通性自查（需要外网）：
+
+```bash
+cargo test -p fs-sync-net --test relay -- --ignored --nocapture
+```
 
 ## 已知限制
 

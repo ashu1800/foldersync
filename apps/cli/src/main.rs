@@ -344,9 +344,8 @@ async fn main() -> Result<()> {
 async fn serve(data_dir: &std::path::Path, auto_confirm: bool, folders: &[String]) -> Result<()> {
     let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
     let secret = fs_sync_net::identity::load_or_create_secret(data_dir)?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .bind()
+    // 用和桌面端相同的中继，否则 CLI 与 GUI 会各在各的中继上找不到对方
+    let endpoint = fs_sync_net::bind_endpoint_with(&fs_sync_net::NetConfig::default(), secret)
         .await
         .context("iroh Endpoint 绑定失败")?;
 
@@ -508,9 +507,7 @@ async fn pair(data_dir: &std::path::Path) -> Result<()> {
 async fn join(data_dir: &std::path::Path, text: &str) -> Result<()> {
     let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
     let secret = fs_sync_net::identity::load_or_create_secret(data_dir)?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .bind()
+    let endpoint = fs_sync_net::bind_endpoint_with(&fs_sync_net::NetConfig::default(), secret)
         .await
         .context("iroh Endpoint 绑定失败")?;
 
@@ -605,9 +602,7 @@ async fn sync_folder(data_dir: &std::path::Path, local_path: &str, peer: &str) -
     let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
     let secret = fs_sync_net::identity::load_or_create_secret(data_dir)?;
     let my_id = secret.public();
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .bind()
+    let endpoint = fs_sync_net::bind_endpoint_with(&fs_sync_net::NetConfig::default(), secret)
         .await
         .context("iroh Endpoint 绑定失败")?;
 

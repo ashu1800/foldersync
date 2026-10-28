@@ -384,7 +384,8 @@ impl Default for SettingsDto {
             close_to_tray: true,
             upload_limit_kbps: 0,
             download_limit_kbps: 0,
-            relay_url: None,
+            // 自建中继（66.42.99.110）。改成 None 会退回 iroh 官方中继。
+            relay_url: Some(fs_sync_net::DEFAULT_RELAY_URL.to_string()),
             network_mode: NetworkMode::Auto,
             listen_port: None,
             default_ignore: Vec::new(),

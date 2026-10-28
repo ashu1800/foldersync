@@ -221,7 +221,10 @@ export default function Settings() {
             onChange={(e) => setS({ ...s, relay_url: e.target.value || null })}
             onBlur={() => void save({ relay_url: s.relay_url })}
           />
-          <p className="hint">留空使用默认中继（自动选择最近的节点）。</p>
+          <p className="hint">
+            默认是自建中继 <code>https://sync.ashu180.top:8444</code>。留空则退回 iroh
+            官方中继（公共设施，不保证可用性）。
+          </p>
         </div>
 
         <div className="field">

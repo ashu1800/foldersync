@@ -45,13 +45,28 @@ pub async fn bind_endpoint() -> Result<Endpoint> {
         .context("iroh Endpoint 绑定失败")
 }
 
+/// 默认中继：自建（66.42.99.110 / sync.ashu180.top）。
+///
+/// 443 和 80 被同机的 nginx 占用，所以中继监听 8444，**RelayUrl 必须带端口**。
+/// 想改回 iroh 官方中继就把 `NetConfig::relay_url` 设为 `None`。
+pub const DEFAULT_RELAY_URL: &str = "https://sync.ashu180.top:8444";
+
 /// 网络配置（提示词 4.x / 设置页）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NetConfig {
     /// 自建中继 URL；None 用 iroh 官方中继。
     pub relay_url: Option<String>,
     /// 固定监听端口；None 随机端口。
     pub listen_port: Option<u16>,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: Some(DEFAULT_RELAY_URL.to_string()),
+            listen_port: None,
+        }
+    }
 }
 
 /// 按配置绑定 Endpoint。
