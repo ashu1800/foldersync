@@ -1639,7 +1639,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldersync-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "foldersync-desktop"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1692,7 +1692,7 @@ dependencies = [
 
 [[package]]
 name = "foldersync-relay"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "fs-sync-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "blake3",
  "chrono",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "fs-sync-daemon"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "fs-sync-net"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "fs-sync-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "fs-sync-core",
  "rusqlite",
