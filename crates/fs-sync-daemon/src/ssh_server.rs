@@ -41,7 +41,7 @@ pub struct SshServerShared {
     pub pairing: PairingManager,
     pub runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
     /// 在线设备（服务端视角只可能是 Tailscale 直连）
-    pub online: Arc<tokio::sync::Mutex<HashMap<String, ConnType>>>,
+    pub online: Arc<tokio::sync::Mutex<fs_sync_net::conn::Presence>>,
 }
 
 impl SshServerShared {
@@ -53,13 +53,6 @@ impl SshServerShared {
             ssh_port: self.ssh_port,
             mode: fs_sync_net::conn::NetworkMode::Tailscale,
             relay_url: None,
-            folder_ids: self
-                .runtimes
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.session.folder_id.clone())
-                .collect(),
         }
     }
 }
@@ -266,7 +259,7 @@ async fn control_loop(
         .online
         .lock()
         .await
-        .insert(peer_id.clone(), ConnType::Tailscale);
+        .enter(&peer_id, ConnType::Tailscale);
     info!(peer = %peer.name, "对端 SSH 控制通道已建立");
 
     let (mut reader, mut writer) = tokio::io::split(channel.into_stream());
@@ -297,7 +290,12 @@ async fn control_loop(
         }
     }
     .await;
-    shared.online.lock().await.remove(&peer_id);
+    // 只注销自己这一条：同一对端可能还有别的连接（同步会话、拉文件的短连接）
+    shared
+        .online
+        .lock()
+        .await
+        .leave(&peer_id, ConnType::Tailscale);
     info!(peer = %peer.name, "对端 SSH 控制通道已断开");
     result
 }
@@ -391,7 +389,7 @@ mod tests {
             trust,
             pairing,
             runtimes: Arc::new(std::sync::Mutex::new(Vec::new())),
-            online: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            online: Arc::new(tokio::sync::Mutex::new(Default::default())),
         });
         let server = run_ssh_server(shared.clone()).await.unwrap();
         Fixture {

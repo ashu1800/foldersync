@@ -25,6 +25,44 @@ pub enum ConnType {
     Relay,
 }
 
+/// 设备在线状态：按连接计数。
+///
+/// 同一对端可能同时有好几条连接（本机连出的同步会话、对端连入的控制通道、
+/// 拉文件时临时开的连接）。以前用 `HashMap<id, ConnType>`，任何一条断开都会
+/// `remove`，短连接一关就把仍在线的设备显示成"未连接"。
+#[derive(Debug, Default)]
+pub struct Presence {
+    conns: std::collections::HashMap<String, Vec<ConnType>>,
+}
+
+impl Presence {
+    /// 登记一条连接。
+    pub fn enter(&mut self, id: &str, ty: ConnType) {
+        self.conns.entry(id.to_string()).or_default().push(ty);
+    }
+
+    /// 注销一条同类型的连接；最后一条注销后设备离线。
+    pub fn leave(&mut self, id: &str, ty: ConnType) {
+        if let Some(v) = self.conns.get_mut(id) {
+            if let Some(i) = v.iter().position(|t| *t == ty) {
+                v.swap_remove(i);
+            }
+            if v.is_empty() {
+                self.conns.remove(id);
+            }
+        }
+    }
+
+    /// 当前连接方式；同时有直连和中继时报直连。
+    pub fn get(&self, id: &str) -> Option<ConnType> {
+        let v = self.conns.get(id)?;
+        v.iter()
+            .copied()
+            .find(|t| *t == ConnType::Tailscale)
+            .or_else(|| v.first().copied())
+    }
+}
+
 impl std::fmt::Display for ConnType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -37,6 +75,27 @@ impl std::fmt::Display for ConnType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_counts_connections() {
+        let mut p = Presence::default();
+        p.enter("a", ConnType::Tailscale); // 长连接
+        p.enter("a", ConnType::Tailscale); // 拉文件的短连接
+        p.leave("a", ConnType::Tailscale); // 短连接关闭
+        assert_eq!(
+            p.get("a"),
+            Some(ConnType::Tailscale),
+            "长连接还在，仍应在线"
+        );
+        p.enter("a", ConnType::Relay);
+        assert_eq!(p.get("a"), Some(ConnType::Tailscale), "直连优先");
+        p.leave("a", ConnType::Tailscale);
+        assert_eq!(p.get("a"), Some(ConnType::Relay));
+        p.leave("a", ConnType::Relay);
+        assert_eq!(p.get("a"), None);
+        p.leave("a", ConnType::Relay); // 多余的 leave 不出错
+        assert_eq!(p.get("b"), None);
+    }
 
     #[test]
     fn display_chinese() {

@@ -54,7 +54,7 @@ pub struct AppState {
     /// 连接状态：设备 id → (连接方式, rtt)
     pub conns: ConnMap,
     /// SSH 服务端观察到的在线设备
-    pub online: Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>>,
+    pub online: Arc<Mutex<fs_sync_net::conn::Presence>>,
     /// 待确认的配对请求：request_id → (设备名, 指纹, 过期时间)
     pub pending_pairings: PendingPairings,
     /// 设置
@@ -108,8 +108,8 @@ impl AppState {
         let runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let online: Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let online: Arc<Mutex<fs_sync_net::conn::Presence>> =
+            Arc::new(Mutex::new(Default::default()));
         let shared = Arc::new(SshServerShared {
             identity: identity.clone(),
             host_key,
@@ -136,7 +136,6 @@ impl AppState {
             ssh_port: actual_port,
             mode: snapshot.network_mode.into(),
             relay_url: snapshot.relay_url.clone(),
-            folder_ids: Vec::new(),
         }));
 
         let state = Arc::new(Self {
@@ -197,7 +196,6 @@ impl AppState {
             guard.retain(|r| r.session.folder_id != folder_id);
             guard.push(rt.clone());
         }
-        self.refresh_peer_folders();
         Ok(rt)
     }
 
@@ -207,19 +205,6 @@ impl AppState {
             .lock()
             .unwrap()
             .retain(|r| r.session.folder_id != folder_id);
-        self.refresh_peer_folders();
-    }
-
-    fn refresh_peer_folders(&self) {
-        if let Ok(mut cfg) = self.peer_cfg.write() {
-            cfg.folder_ids = self
-                .runtimes
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.session.folder_id.clone())
-                .collect();
-        }
     }
 
     /// 已配对设备列表（含在线状态）。
@@ -291,7 +276,8 @@ impl AppState {
         self.store
             .list_activity(Some(folder_id), 1)
             .ok()
-            .and_then(|v| v.first().map(|a| a.at))
+            // store 里是毫秒，DTO 约定 Unix 秒；以前直接透传，界面显示成 58798 年
+            .and_then(|v| v.first().map(|a| a.at / 1000))
     }
 
     /// 记录一条活动。
@@ -314,13 +300,6 @@ impl AppState {
             cfg.mode = next.network_mode.into();
             cfg.relay_url = next.relay_url.clone();
             cfg.ssh_port = next.ssh_port;
-            cfg.folder_ids = self
-                .runtimes
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.session.folder_id.clone())
-                .collect();
         }
         self.replace_limits(next.upload_limit_kbps, next.download_limit_kbps);
         Ok(next)

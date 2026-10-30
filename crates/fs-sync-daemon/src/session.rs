@@ -99,26 +99,17 @@ impl SyncSession {
     pub async fn on_local_event(&self, ev: FileEvent) -> Result<Option<FileEntry>> {
         let abs = self.root.join(&ev.path);
         match ev.kind {
-            EventKind::Removed => {
-                // 墓碑
-                let mut idx = self.index.lock().await;
-                if let Some(old) = idx.get(&ev.path) {
-                    let mut tomb = old.clone();
-                    tomb.deleted = true;
-                    tomb.version.increment(&self.device_id);
-                    tomb.modified_by = self.device_id.clone();
-                    self.engine.store.upsert_entry(&self.folder_id, &tomb)?;
-                    idx.insert(ev.path.clone(), tomb.clone());
-                    self.pending.lock().await.push(tomb.clone());
-                    debug!(path = %ev.path, "入队墓碑");
-                    return Ok(Some(tomb));
-                }
-                Ok(None)
-            }
+            EventKind::Removed => self.tombstone_local(&ev.path).await,
             EventKind::Changed => {
                 let meta = match std::fs::metadata(&abs) {
                     Ok(m) => m,
-                    Err(_) => return Ok(None), // 已被删除，交给 Removed 事件
+                    // 改名的源路径：notify 报的是 Modify(Name)，不会再来 Removed 事件。
+                    // 以前这里直接忽略，旧名要等 10 分钟兜底扫描才变墓碑，对端两份都在。
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return self.tombstone_local(&ev.path).await;
+                    }
+                    // 读不了（权限、占用）≠ 已删除
+                    Err(_) => return Ok(None),
                 };
                 let mtime = meta
                     .modified()
@@ -132,6 +123,11 @@ impl SyncSession {
 
                 // 目录：只记录，不需要 hash
                 if meta.is_dir() {
+                    // 目录里每增删一个文件都会给目录本身报一次 Modify。目录没有内容，
+                    // 已经是活目录就不算新版本，否则每次改动都多推一条、版本号一路涨
+                    if old.as_ref().is_some_and(|o| o.is_dir && !o.deleted) {
+                        return Ok(None);
+                    }
                     let mut e = old.unwrap_or_else(|| {
                         FileEntry::new(&ev.path, 0, 0, "", true, &self.device_id)
                     });
@@ -198,6 +194,23 @@ impl SyncSession {
                 Ok(Some(entry))
             }
         }
+    }
+
+    /// 本地路径已消失：把活条目变成墓碑并入队。已经是墓碑或从未记录过的路径不动。
+    async fn tombstone_local(&self, path: &str) -> Result<Option<FileEntry>> {
+        let mut idx = self.index.lock().await;
+        let Some(old) = idx.get(path).filter(|o| !o.deleted) else {
+            return Ok(None);
+        };
+        let mut tomb = old.clone();
+        tomb.deleted = true;
+        tomb.version.increment(&self.device_id);
+        tomb.modified_by = self.device_id.clone();
+        self.engine.store.upsert_entry(&self.folder_id, &tomb)?;
+        idx.insert(path.to_string(), tomb.clone());
+        self.pending.lock().await.push(tomb.clone());
+        debug!(path = %path, "入队墓碑");
+        Ok(Some(tomb))
     }
 
     /// 取出并清空待发增量。
@@ -783,6 +796,52 @@ mod tests {
         let snap: HashMap<String, FileEntry> = s.snapshot().await.into_iter().collect();
         assert_eq!(snap["p.txt"].version, remote.version, "版本不应被本端递增");
         assert!(s.take_pending().await.is_empty());
+    }
+
+    /// 回归：改名时 notify 对源路径报 Modify(Name) 而不是 Remove，
+    /// 源路径必须当场变墓碑，否则对端要等兜底扫描才删旧名。
+    #[tokio::test]
+    async fn rename_source_becomes_tombstone() {
+        let (s, _t) = session().await;
+        std::fs::write(s.root.join("old.txt"), b"x").unwrap();
+        s.initial_scan().await.unwrap();
+        std::fs::rename(s.root.join("old.txt"), s.root.join("new.txt")).unwrap();
+
+        let ev = s
+            .on_local_event(FileEvent {
+                path: "old.txt".into(),
+                kind: EventKind::Changed,
+            })
+            .await
+            .unwrap();
+        assert!(ev.is_some_and(|e| e.deleted), "源路径应变墓碑");
+        // 重复事件不应再递增
+        let again = s
+            .on_local_event(FileEvent {
+                path: "old.txt".into(),
+                kind: EventKind::Removed,
+            })
+            .await
+            .unwrap();
+        assert!(again.is_none(), "已是墓碑不应重复入队");
+    }
+
+    /// 回归：目录里增删文件会给目录报 Modify，已存在的活目录不应每次都递增版本。
+    #[tokio::test]
+    async fn existing_dir_change_does_not_bump_version() {
+        let (s, _t) = session().await;
+        std::fs::create_dir(s.root.join("d")).unwrap();
+        s.initial_scan().await.unwrap();
+        let before = s.snapshot().await["d"].version.clone();
+        let ev = s
+            .on_local_event(FileEvent {
+                path: "d".into(),
+                kind: EventKind::Changed,
+            })
+            .await
+            .unwrap();
+        assert!(ev.is_none());
+        assert_eq!(s.snapshot().await["d"].version, before);
     }
 
     /// 大小写不敏感平台：对端的 `Readme.md` 不能覆盖本地的 `README.md`。

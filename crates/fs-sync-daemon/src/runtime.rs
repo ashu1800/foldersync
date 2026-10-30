@@ -258,7 +258,6 @@ pub struct PeerLoopConfig {
     pub ssh_port: u16,
     pub mode: NetworkMode,
     pub relay_url: Option<String>,
-    pub folder_ids: Vec<String>,
 }
 
 /// 对等连接循环：周期检查信任列表，为每个设备起一个独立监督任务。
@@ -268,7 +267,7 @@ pub async fn run_peer_loop(
     cfg: Arc<std::sync::RwLock<PeerLoopConfig>>,
     runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
     trust: crate::trust::Trust,
-    online: Option<Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>>>,
+    online: Option<Arc<Mutex<fs_sync_net::conn::Presence>>>,
 ) {
     let mut spawned: HashSet<String> = HashSet::new();
     loop {
@@ -298,7 +297,7 @@ async fn peer_supervisor(
     cfg: Arc<std::sync::RwLock<PeerLoopConfig>>,
     peer: Device,
     runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
-    online: Option<Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>>>,
+    online: Option<Arc<Mutex<fs_sync_net::conn::Presence>>>,
     trust: crate::trust::Trust,
 ) {
     let mut backoff = std::time::Duration::from_secs(2);
@@ -326,25 +325,21 @@ async fn peer_supervisor(
                 auto_fallback_relay || peer.addresses.is_empty() || !ts.running
             }
         };
-        if let Some(map) = &online {
-            map.lock().await.insert(
-                peer.id.clone(),
-                if use_relay {
-                    fs_sync_net::ConnType::Relay
-                } else {
-                    fs_sync_net::ConnType::Tailscale
-                },
-            );
+        let conn_ty = if use_relay {
+            fs_sync_net::ConnType::Relay
+        } else {
+            fs_sync_net::ConnType::Tailscale
+        };
+        if use_relay && (peer.relay_room.is_none() || peer.relay_secret.is_none()) {
+            warn!(peer = %peer.name, "没有中继房间信息，请重新配对或改用 Tailscale");
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            continue;
+        }
+        // 在线计数：本轮会话期间算一条连接，结束时只注销这一条
+        if let Some(p) = &online {
+            p.lock().await.enter(&peer.id, conn_ty);
         }
         let result = if use_relay {
-            if peer.relay_room.is_none() || peer.relay_secret.is_none() {
-                warn!(peer = %peer.name, "没有中继房间信息，请重新配对或改用 Tailscale");
-                if let Some(map) = &online {
-                    map.lock().await.remove(&peer.id);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                continue;
-            }
             if cfg.mode == NetworkMode::Auto && !auto_fallback_relay {
                 // 对端刚获得 Tailscale 地址时，主动结束中继会话并改走直连，
                 // 避免出现「一端 Tailscale、一端中继」的分裂状态。
@@ -374,8 +369,8 @@ async fn peer_supervisor(
         } else {
             sync_round_ssh(&cfg, &peer, &runtimes).await
         };
-        if let Some(map) = &online {
-            map.lock().await.remove(&peer.id);
+        if let Some(p) = &online {
+            p.lock().await.leave(&peer.id, conn_ty);
         }
         match result {
             Ok(()) => {
@@ -474,27 +469,20 @@ async fn sync_round_ssh(
         })
         .await?;
 
-    // 交换全量索引（每个文件夹一条）
-    for fid in &cfg.folder_ids {
-        let rt_opt = find_runtime(runtimes, fid);
-        if let Some(rt) = rt_opt {
-            // 全量索引已经包含全部条目，对端据此 diff 拉取即可。
-            // 以前还把每个条目再排进 outbox 逐条推一遍：10 万文件就是 10 万条重复消息，
-            // 而且（LIFO 时）会压在真实的新变更前面。
-            let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
-            client
-                .send(&Message::Index {
-                    folder_id: fid.clone(),
-                    entries,
-                })
-                .await?;
-        }
-    }
+    // 交换全量索引（每个文件夹一条）。文件夹列表直接读 runtimes，不用配置里的快照：
+    // 应用启动时对等循环比"恢复文件夹"先跑，快照是空的，整个会话就一条都不推。
+    let mut announced: HashSet<String> = HashSet::new();
+    announce_new_folders(&mut client, runtimes, &mut announced).await?;
 
     let sftp = client.sftp();
     // 读帧放到独立任务：read_frame 不是取消安全的，直接放进 select! 时
     // 只要别的分支（本地变更、心跳）先就绪，读了一半的帧就丢了，之后整条流错位。
     let mut incoming = client.spawn_reader();
+    // 用 interval 而不是每轮新建 sleep：后者在消息频繁时会被不断重置，永远不触发
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(20));
+    ping.tick().await;
+    let mut rescan = tokio::time::interval(std::time::Duration::from_secs(3));
+    rescan.tick().await;
     loop {
         tokio::select! {
             msg = incoming.recv() => {
@@ -507,7 +495,7 @@ async fn sync_round_ssh(
                     None => anyhow::bail!("对端控制通道已关闭"),
                 }
             }
-            (folder_id, entry) = recv_local_change(runtimes, &cfg.folder_ids) => {
+            (folder_id, entry) = recv_local_change(runtimes, &announced) => {
                 let msg = Message::IndexUpdate {
                     folder_id,
                     entries: vec![entry],
@@ -515,11 +503,50 @@ async fn sync_round_ssh(
                 client.send(&msg).await.context("推送本地变更失败")?;
                 debug!(path = %msg_path(&msg), "已推送本地变更");
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+            // 会话期间新加入的文件夹：补发全量索引
+            _ = rescan.tick() => {
+                announce_new_folders(&mut client, runtimes, &mut announced).await?;
+            }
+            _ = ping.tick() => {
                 client.send(&Message::Ping).await?;
             }
         }
     }
+}
+
+/// 给还没发过全量索引的文件夹发一次 Index，记入 `announced`；已移除的文件夹从中删掉。
+async fn announce_new_folders(
+    client: &mut fs_sync_net::ssh_client::SshClient,
+    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    announced: &mut HashSet<String>,
+) -> Result<()> {
+    let rts = all_runtimes(runtimes);
+    announced.retain(|id| rts.iter().any(|r| &r.session.folder_id == id));
+    for rt in rts {
+        let fid = rt.session.folder_id.clone();
+        if announced.contains(&fid) {
+            continue;
+        }
+        // 全量索引已经包含全部条目，对端据此 diff 拉取即可。
+        // 以前还把每个条目再排进 outbox 逐条推一遍：10 万文件就是 10 万条重复消息。
+        let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
+        info!(folder = %fid, count = entries.len(), "发送全量索引");
+        client
+            .send(&Message::Index {
+                folder_id: fid.clone(),
+                entries,
+            })
+            .await?;
+        announced.insert(fid);
+    }
+    Ok(())
+}
+
+/// 当前所有文件夹运行时（实时读取，不缓存）。
+pub(crate) fn all_runtimes(
+    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+) -> Vec<Arc<FolderRuntime>> {
+    runtimes.lock().unwrap().iter().cloned().collect()
 }
 
 /// 处理收到的控制消息。
@@ -605,20 +632,17 @@ fn msg_path(msg: &Message) -> &str {
     }
 }
 
-/// 等待任一运行时的本地变更。
+/// 等待任一运行时的本地变更。只取已发过全量索引的文件夹：
+/// 新文件夹的变更等全量索引发出后再推，顺序不会乱。
 async fn recv_local_change(
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
-    folder_ids: &[String],
+    announced: &HashSet<String>,
 ) -> (String, FileEntry) {
     loop {
-        let rts: Vec<Arc<FolderRuntime>> = {
-            let guard = runtimes.lock().unwrap();
-            guard
-                .iter()
-                .filter(|r| folder_ids.contains(&r.session.folder_id))
-                .cloned()
-                .collect()
-        };
+        let rts: Vec<Arc<FolderRuntime>> = all_runtimes(runtimes)
+            .into_iter()
+            .filter(|r| announced.contains(&r.session.folder_id))
+            .collect();
         for rt in rts {
             let entry = rt.outbox.lock().await.pop();
             if let Some(e) = entry {

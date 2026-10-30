@@ -604,7 +604,8 @@ pub async fn list_activity(
         .into_iter()
         .map(|a| ActivityDto {
             id: a.id,
-            at: a.at,
+            // store 里是毫秒，DTO 约定 Unix 秒（前端 formatTime 会再 ×1000）
+            at: a.at / 1000,
             kind: match a.kind.as_str() {
                 "upload" => ActivityKind::Upload,
                 "download" => ActivityKind::Download,

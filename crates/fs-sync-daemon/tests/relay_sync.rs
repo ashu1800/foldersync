@@ -104,7 +104,6 @@ async fn two_nodes_sync_through_relay() {
             ssh_port: 2222,
             mode: NetworkMode::Relay,
             relay_url: Some(url.clone()),
-            folder_ids: vec!["f1".into()],
         }))
     };
     let cfg_a = cfg(&a);

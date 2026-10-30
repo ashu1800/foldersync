@@ -156,14 +156,8 @@ async fn build_index(
     cfg: &PeerLoopConfig,
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
 ) -> RelayIndex {
-    let rts: Vec<Arc<FolderRuntime>> = {
-        let guard = runtimes.lock().unwrap();
-        guard
-            .iter()
-            .filter(|r| cfg.folder_ids.contains(&r.session.folder_id))
-            .cloned()
-            .collect()
-    };
+    // 实时读取：会话期间新增的文件夹下一轮就会出现在索引里
+    let rts = crate::runtime::all_runtimes(runtimes);
     let mut folders = Vec::new();
     for rt in rts {
         let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();

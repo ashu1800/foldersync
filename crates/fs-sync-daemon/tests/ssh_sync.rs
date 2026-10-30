@@ -129,7 +129,6 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_a.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
-        folder_ids: vec!["f1".into()],
     }));
     let cfg_b = Arc::new(RwLock::new(PeerLoopConfig {
         identity: b.identity.clone(),
@@ -138,7 +137,6 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_b.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
-        folder_ids: vec!["f1".into()],
     }));
 
     let rt_a = a.shared.runtimes.clone();

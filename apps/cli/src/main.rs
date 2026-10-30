@@ -208,12 +208,6 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
         ssh_port: actual_port,
         mode: NetworkMode::Auto,
         relay_url: ctx.relay.clone(),
-        folder_ids: runtimes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|r| r.session.folder_id.clone())
-            .collect(),
     }));
     let rt2 = runtimes.clone();
     let trust2 = ctx.trust.clone();
