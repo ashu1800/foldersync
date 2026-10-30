@@ -29,3 +29,6 @@ apps/desktop/src-tauri/gen/
 # 本机调试用的批处理（含硬编码路径）
 *-office.bat
 serve-*.bat
+
+# 本机发布时下载/存放的安装包
+dist-local/

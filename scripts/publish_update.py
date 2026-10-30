@@ -73,6 +73,28 @@ def sign(payload: bytes) -> str:
     return key.sign(payload).hex()
 
 
+def put_to_cos(url: str, payload: bytes, attempts: int = 3):
+    """PUT 文件字节到 COS 预签名地址（地址自带签名，不要再带 Token）。
+
+    失败时把 COS 返回的 XML 错误原文打出来（之前只有 "HTTP 400"，看不出原因），
+    并重试几次：跨境上传慢，偶尔会被 COS 以 RequestTimeout（400）断开。
+    """
+    for i in range(1, attempts + 1):
+        put = urllib.request.Request(url, data=payload, method="PUT")
+        put.add_header("Content-Type", "application/octet-stream")
+        try:
+            with urllib.request.urlopen(put, timeout=600) as r:
+                if r.status in (200, 204):
+                    return
+                detail = f"HTTP {r.status}"
+        except urllib.error.HTTPError as e:
+            detail = f"HTTP {e.code}: {e.read()[:500].decode('utf-8', 'replace')}"
+        except (urllib.error.URLError, TimeoutError) as e:
+            detail = f"网络错误: {e}"
+        print(f"PUT 上传失败（第 {i}/{attempts} 次）: {detail}", flush=True)
+    raise SystemExit("PUT 上传到 COS 失败，已放弃")
+
+
 def changelog_section(path: str, semver: str) -> str:
     """取 CHANGELOG.md 里 `## x.y.z` 到下一个 `## ` 之间的内容；找不到时报错，避免发出空说明。"""
     out, inside = [], False
@@ -117,7 +139,10 @@ def main():
         notes = changelog_section(args.changelog, args.version)
     else:
         notes = ""
-    print(f"发布 {file_name}  version={args.version}（{code}） size={len(payload)} md5={md5}")
+    print(
+        f"发布 {file_name}  version={args.version}（{code}） size={len(payload)} md5={md5}",
+        flush=True,
+    )
 
     token = call("POST", "/api/user/login", {"email": email, "password": password})["access_token"]
 
@@ -127,13 +152,8 @@ def main():
         {"uuid": UUID, "version": code, "file_name": file_name},
         token,
     )
-    # 直传地址自带签名，不要再带 Token
-    put = urllib.request.Request(pre["upload_url"], data=payload, method="PUT")
-    put.add_header("Content-Type", "application/octet-stream")
-    with urllib.request.urlopen(put, timeout=600) as r:
-        if r.status not in (200, 204):
-            raise SystemExit(f"PUT 上传失败：HTTP {r.status}")
-    print("已上传到 COS:", pre.get("cos_key"))
+    put_to_cos(pre["upload_url"], payload)
+    print("已上传到 COS:", pre.get("cos_key"), flush=True)
 
     call(
         "POST",

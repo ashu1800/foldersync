@@ -164,13 +164,21 @@ git push origin main v0.2.5
    登录 → presign → PUT → confirm 发到更新服务，再写入更新说明并回读校验
 
 需要强制更新时，在 Basic 管理后台把该版本的「强制更新」打开即可，不用重新发版。
-手动发布（例如 CI 不可用）：
+
+### 本机发布（不经过 GitHub）
+
+先在 CHANGELOG.md 写好该版本的段落，然后在仓库根目录：
 
 ```bash
-export BASIC_ADMIN_EMAIL=... BASIC_ADMIN_PASSWORD=...
-export FOLDERSYNC_UPDATE_SIGNING_KEY="$(cat ~/.foldersync-release/update_signing_key.hex)"
-python scripts/publish_update.py FolderSync_0.2.5_x64-setup.exe 0.2.5 --changelog CHANGELOG.md
+# 改版本号 → 打包 → 签名 → 上传，一条命令。管理员邮箱和密码会在命令行里提示输入
+python scripts/release_local.py 0.2.6
+
+# 只上传一个现成的安装包（不重新打包）
+python scripts/release_local.py 0.2.5 --file dist-local/FolderSync_0.2.5_x64-setup.exe
 ```
+
+签名私钥从 `~/.foldersync-release/update_signing_key.hex` 读取；
+密码只在内存里用，不写入任何文件。
 
 ### 密钥与凭据
 
