@@ -1,18 +1,18 @@
 // 设置页（提示词 5.2.6）。
 
 import { useCallback, useEffect, useState } from "react";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { useTranslation } from "react-i18next";
 import type {
   EnvStatusDto,
   NetworkMode,
   SettingsDto,
   SettingsPatch,
+  UpdateDto,
 } from "../lib/bindings";
 import * as api from "../lib/tauri";
 import { setLanguage } from "../i18n";
 import { ErrorBanner, Loading, RelayGuideModal } from "../components/ui";
+import { UpdateDetails, useUpdateInstall } from "../components/UpdatePrompt";
 
 const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"];
 
@@ -29,19 +29,13 @@ export default function Settings() {
   const [envBusy, setEnvBusy] = useState(false);
   const [envError, setEnvError] = useState<string | null>(null);
   const [showRelayGuide, setShowRelayGuide] = useState(false);
-  // 更新检查（基于 GitHub Releases）
+  // 手动检查更新（Basic 版本更新服务）；下载安装与弹窗共用 useUpdateInstall
   const [updateState, setUpdateState] = useState<
-    "idle" | "checking" | "found" | "downloading" | "latest" | "error"
+    "idle" | "checking" | "found" | "latest" | "error"
   >("idle");
-  const [updateInfo, setUpdateInfo] = useState<{
-    version: string;
-    body: string;
-  } | null>(null);
-  const [updateProgress, setUpdateProgress] = useState(0);
-  const [updateError, setUpdateError] = useState<string | null>(null);
-  // 用 state 而不是 ref：渲染时要根据"有没有待安装的更新"决定显示哪个按钮，
-  // ref 变化不会触发重渲染，读它得到的可能是过期值。
-  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [update, setUpdate] = useState<UpdateDto | null>(null);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const installer = useUpdateInstall();
 
   const refreshEnv = useCallback(async () => {
     try {
@@ -492,104 +486,60 @@ export default function Settings() {
             导出诊断包
           </button>
         </div>
-        {/* 检查更新（GitHub Releases） */}
+        {/* 检查更新（Basic 版本更新服务；后台每 6 小时也会自动检测） */}
         <div className="field" style={{ marginTop: 18 }}>
           <label className="label">检查更新</label>
           <div className="btn-row">
             <button
               className="btn"
-              disabled={updateState === "checking" || updateState === "downloading"}
+              disabled={updateState === "checking" || installer.installing}
               onClick={async () => {
                 setUpdateState("checking");
-                setUpdateError(null);
-                setUpdateInfo(null);
+                setCheckError(null);
+                setUpdate(null);
                 try {
-                  const u = await check();
-                  if (!u) {
-                    setUpdateState("latest");
-                    return;
-                  }
-                  setPendingUpdate(u);
-                  setUpdateInfo({
-                    version: u.version,
-                    body: u.body ?? "(无更新说明)",
-                  });
-                  setUpdateState("found");
+                  const u = await api.checkUpdate();
+                  setUpdate(u);
+                  setUpdateState(u.available ? "found" : "latest");
                 } catch (e) {
-                  setUpdateError(String(e));
+                  setCheckError(api.asCmdError(e).message);
                   setUpdateState("error");
                 }
               }}
             >
               {updateState === "checking" ? "检查中…" : "检查更新"}
             </button>
-            {updateState === "found" && pendingUpdate && (
+            {updateState === "found" && (
               <button
                 className="btn btn-primary"
-                onClick={async () => {
-                  const u = pendingUpdate;
-                  if (!u) return;
-                  setUpdateState("downloading");
-                  setUpdateProgress(0);
-                  try {
-                    let total = 0;
-                    let got = 0;
-                    await u.downloadAndInstall((ev) => {
-                      if (ev.event === "Started") {
-                        total = ev.data.contentLength ?? 0;
-                      } else if (ev.event === "Progress") {
-                        got += ev.data.chunkLength;
-                        if (total > 0) {
-                          setUpdateProgress(Math.round((got / total) * 100));
-                        }
-                      }
-                    });
-                    // 安装完成，重启进新版
-                    await relaunch();
-                  } catch (e) {
-                    setUpdateError(String(e));
-                    setUpdateState("error");
-                  }
-                }}
+                disabled={installer.installing}
+                onClick={installer.install}
               >
-                下载并安装
+                {installer.installing ? "更新中…" : "下载并安装"}
               </button>
             )}
           </div>
           {updateState === "latest" && (
             <p className="hint" style={{ marginTop: 8 }}>
-              已是最新版本（当前 {version}）。
+              {update?.disabled
+                ? `最新版本 ${update.latest_version ?? ""} 已被发布方停用，暂无可用更新。`
+                : `已是最新版本（当前 ${version}）。`}
             </p>
           )}
-          {updateState === "found" && updateInfo && (
-            <div className="hint" style={{ marginTop: 8 }}>
-              <p>
-                发现新版本 <b>{updateInfo.version}</b>（当前 {version}）
-              </p>
-              <pre
-                style={{
-                  whiteSpace: "pre-wrap",
-                  maxHeight: 160,
-                  overflow: "auto",
-                  fontSize: 12,
-                  marginTop: 6,
-                }}
-              >
-                {updateInfo.body}
-              </pre>
-            </div>
-          )}
-          {updateState === "downloading" && (
-            <p className="hint" style={{ marginTop: 8 }}>
-              正在下载并安装… {updateProgress}%
-            </p>
+          {updateState === "found" && update && (
+            <UpdateDetails
+              update={update}
+              installing={installer.installing}
+              progress={installer.progress}
+              error={installer.error}
+            />
           )}
           {updateState === "error" && (
             <p
               className="hint"
               style={{ marginTop: 8, color: "var(--danger, #e5484d)" }}
             >
-              更新失败：{updateError}
+              检查更新失败：{checkError}
             </p>
           )}
         </div>

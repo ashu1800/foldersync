@@ -25,3 +25,5 @@ export type { ProgressDto } from "./ProgressDto";
 export type { Direction } from "./Direction";
 export type { DeviceStatusEvent } from "./DeviceStatusEvent";
 export type { FolderStatusEvent } from "./FolderStatusEvent";
+export type { UpdateDto } from "./UpdateDto";
+export type { UpdateProgressDto } from "./UpdateProgressDto";

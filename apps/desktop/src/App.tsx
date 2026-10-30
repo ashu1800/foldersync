@@ -6,6 +6,7 @@ import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom"
 import * as api from "./lib/tauri";
 import { useStore } from "./stores/app";
 import { OverallBadge } from "./components/ui";
+import UpdatePrompt from "./components/UpdatePrompt";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
 import Folders from "./pages/Folders";
@@ -134,6 +135,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
+      <UpdatePrompt />
     </div>
   );
 }

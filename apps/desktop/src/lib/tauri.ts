@@ -22,6 +22,8 @@ import type {
   SettingsDto,
   SettingsPatch,
   TreeNodeDto,
+  UpdateDto,
+  UpdateProgressDto,
 } from "./bindings";
 
 /** 后端错误统一形状（命令返回的 reject 值）。 */
@@ -112,6 +114,12 @@ export const exportDiagnostics = (outDir?: string) =>
   call<string>("export_diagnostics", { outDir: outDir ?? null });
 export const getLocalInfo = () => call<Record<string, unknown>>("get_local_info");
 
+// ---------- 自动更新（Basic 版本更新服务） ----------
+
+export const checkUpdate = () => call<UpdateDto>("check_update");
+/** 下载、校验并安装；成功时应用退出、由安装器接管，所以正常情况下不会 resolve。 */
+export const installUpdate = () => call<void>("install_update");
+
 // ---------- 环境引导 ----------
 
 export const getEnvironmentStatus = () => call<EnvStatusDto>("get_environment_status");
@@ -128,6 +136,8 @@ export interface EventMap {
   "sync://activity": ActivityDto;
   "pairing://request": PendingPairingDto;
   "conflict://new": ConflictDto;
+  "update://available": UpdateDto;
+  "update://progress": UpdateProgressDto;
   "sync://progress": {
     folder_id: string;
     path: string;

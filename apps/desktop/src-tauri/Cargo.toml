@@ -32,8 +32,14 @@ blake3.workspace = true
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
-tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# 自动更新（对接自建 Basic 版本更新服务，见 src/updater.rs）。
+# rustls 用 ring：默认的 aws-lc 需要 C 编译器/NASM，CI 和本地都容易出问题
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "system-proxy", "http2", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ed25519-dalek = "3"
+md-5 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

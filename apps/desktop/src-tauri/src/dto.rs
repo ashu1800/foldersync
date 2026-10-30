@@ -538,6 +538,37 @@ pub struct FolderStatusEvent {
     pub folder: FolderDto,
 }
 
+/// 检测更新结果（`check_update` 返回值，也是 `update://available` 事件载荷）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "../../src/lib/bindings/")]
+pub struct UpdateDto {
+    /// 当前程序版本（x.y.z）
+    pub current_version: String,
+    /// 服务端最新版本（x.y.z）；服务端还没发布过版本时为 None
+    pub latest_version: Option<String>,
+    /// 有可安装的新版本
+    pub available: bool,
+    /// 强制更新：必须升级才能继续使用
+    pub force: bool,
+    /// 服务端把该版本标记为禁用（不提供下载）
+    pub disabled: bool,
+    /// 更新说明（必须展示给用户）
+    pub notice: String,
+    /// 安装包字节数
+    #[ts(type = "number")]
+    pub file_size: u64,
+}
+
+/// 更新下载进度（`update://progress`）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "../../src/lib/bindings/")]
+pub struct UpdateProgressDto {
+    #[ts(type = "number")]
+    pub downloaded: u64,
+    #[ts(type = "number")]
+    pub total: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

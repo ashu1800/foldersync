@@ -128,45 +128,58 @@ pnpm exec tauri build          # 产出 NSIS 安装包
 
 ### 客户端行为
 
-应用通过 [Tauri updater](https://v2.tauri.app/plugin/updater/) 检查 GitHub Releases：
+从 0.2.5 起，应用对接自建的 Basic 版本更新服务（实现见 `apps/desktop/src-tauri/src/updater.rs`）：
 
-- **检查地址**：`https://github.com/ashu1800/foldersync/releases/latest/download/latest.json`
-- **触发方式**：设置页 →「检查更新」（手动，不在后台偷偷检查）
-- **签名校验**：每个更新包都带 minisign 签名，公钥内置在 `tauri.conf.json`
-  的 `plugins.updater.pubkey`。签名不匹配会拒绝安装，不会装到篡改的包。
-- **安装后自动重启**：`relaunch()`，数据目录 `~/.foldersync/` 原样保留。
+- **检测地址**：`GET https://ashu180.cn/api/version/info?uuid=af61462d-d513-4ef5-9064-f7619550f615`
+- **版本号**：服务端用单调递增的整数，由 semver 换算：`major*10000 + minor*100 + patch`（0.2.5 → 205）
+- **触发方式**：启动 15 秒后检测一次，之后每 6 小时一次；设置页也能手动「检查更新」。检测失败只记日志，不影响同步
+- **强制更新**（`update=true`）：弹窗不能关闭，只能升级；普通更新可以「稍后」
+- **禁用版本**（`status=1`）：不提供下载
+- **校验**：下载支持断点续传、最多重试 3 次；装之前必须同时通过 **MD5** 与 **Ed25519 签名**校验。
+  没有签名或验签失败一律拒绝安装
+- **安装**：以被动模式运行 NSIS 安装器（`/P /R /UPDATE`），装完自动重启，`~/.foldersync/` 原样保留
+
+0.2.4 及更早的版本仍用 Tauri updater 检查 GitHub Releases 的 `latest.json`。
+所以发布流程同时保留 GitHub Release，旧版本靠它升到 0.2.5，之后改用新服务。
 
 ### 发版流程
 
 ```bash
 # 1. 改版本号（三处一起改，脚本会校验一致性）
-./scripts/check-version.sh 0.2.0
+./scripts/check-version.sh 0.2.5
 
-# 2. 提交
-git add -A && git commit -m "release: v0.2.0"
+# 2. 在 CHANGELOG.md 写好 `## 0.2.5` 段落（会作为更新说明展示给用户），提交
+git add -A && git commit -m "release: v0.2.5"
 
 # 3. 打 tag 并推送 —— 这一步触发 GitHub Actions 自动构建与发布
-git tag v0.2.0
-git push origin main --tags
+git tag v0.2.5
+git push origin main v0.2.5
 ```
 
 推 tag 后 `.github/workflows/release.yml` 会：
 
 1. 先复用 `ci.yml` 跑 fmt/clippy/test/tsc/eslint（不通过就不发版）
-2. 在 Windows / macOS(arm64+x64) / Ubuntu 四平台并行构建
-3. 用 `TAURI_SIGNING_PRIVATE_KEY` 签名更新包
-4. 创建 GitHub Release，上传安装包 + `.sig` + `latest.json`
-5. 已装旧版的用户点「检查更新」就能看到新版本
+2. 构建 Windows 安装包，创建 GitHub Release 并上传安装包、`.sig`、`latest.json`（给旧版本用）
+3. `publish-basic`：用 `scripts/publish_update.py` 计算 MD5、Ed25519 签名，
+   登录 → presign → PUT → confirm 发到更新服务，再写入更新说明并回读校验
 
-### 密钥管理
+需要强制更新时，在 Basic 管理后台把该版本的「强制更新」打开即可，不用重新发版。
+手动发布（例如 CI 不可用）：
+
+```bash
+export BASIC_ADMIN_EMAIL=... BASIC_ADMIN_PASSWORD=...
+export FOLDERSYNC_UPDATE_SIGNING_KEY="$(cat ~/.foldersync-release/update_signing_key.hex)"
+python scripts/publish_update.py FolderSync_0.2.5_x64-setup.exe 0.2.5 --changelog CHANGELOG.md
+```
+
+### 密钥与凭据
 
 | 项 | 位置 | 说明 |
 |----|------|------|
-| 私钥 | `~/.tauri/foldersync.key`（本机）+ GitHub Secret `TAURI_SIGNING_PRIVATE_KEY` | **丢失后无法再给老用户发更新**，务必备份 |
-| 公钥 | `tauri.conf.json` 的 `plugins.updater.pubkey` | 随代码提交，公开无害 |
-
-私钥没有密码（`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 为空），因为 CI 里无人值守。
-若日后要加密码，改 secret 并给 workflow 传该变量即可。
+| 更新包签名私钥（Ed25519） | `~/.foldersync-release/update_signing_key.hex`（本机）+ GitHub Secret `FOLDERSYNC_UPDATE_SIGNING_KEY` | **丢失后客户端无法再验过任何更新**，务必另外备份 |
+| 更新包签名公钥 | `updater.rs` 的 `SIGNING_PUBKEY` | 随代码提交，公开无害 |
+| 更新服务管理员账号 | GitHub Secrets `BASIC_ADMIN_EMAIL` / `BASIC_ADMIN_PASSWORD` | 只用于 CI 上传 |
+| Tauri updater 私钥（旧） | `~/.tauri/foldersync.key` + GitHub Secret `TAURI_SIGNING_PRIVATE_KEY` | 只给 0.2.4 及更早的客户端签 `latest.json`；旧客户端都升级后可删 |
 
 ## 自建中继
 

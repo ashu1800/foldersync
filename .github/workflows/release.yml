@@ -289,3 +289,37 @@ jobs:
           gh release upload "$TAG" latest.json --clobber
           COUNT=$("$PY" -c "import json;print(len(json.load(open('latest.json'))['platforms']))")
           echo "latest.json uploaded, platforms: $COUNT"
+
+  # 发布到自建 Basic 版本更新服务（0.2.5 起客户端从这里检测更新）。
+  #
+  # 上面的 GitHub Release + latest.json 只为 0.2.4 及更早的客户端保留：
+  # 它们只认 GitHub，靠它升到 0.2.5 后就换成这里。所有旧客户端都升级后可删掉那两步。
+  #
+  # 只在推 tag 时运行：手动 Run workflow 的版本号是 run_number 拼的，不能发到正式更新通道。
+  publish-basic:
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" --pattern "FolderSync_${VERSION}_x64-setup.exe" --dir dist
+          ls -l dist
+
+      - name: 签名并上传到更新服务
+        env:
+          BASIC_ADMIN_EMAIL: ${{ secrets.BASIC_ADMIN_EMAIL }}
+          BASIC_ADMIN_PASSWORD: ${{ secrets.BASIC_ADMIN_PASSWORD }}
+          FOLDERSYNC_UPDATE_SIGNING_KEY: ${{ secrets.FOLDERSYNC_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          pip install --quiet cryptography
+          python3 scripts/publish_update.py "dist/FolderSync_${VERSION}_x64-setup.exe" "$VERSION" \
+            --changelog CHANGELOG.md

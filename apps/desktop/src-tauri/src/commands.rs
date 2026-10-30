@@ -633,10 +633,11 @@ pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<Con
             continue;
         }
         let entries = state.store.list_entries(&f.id).unwrap_or_default();
-        for e in entries
-            .iter()
-            .filter(|e| e.path.contains(".sync-conflict-"))
-        {
+        // 已处理（删掉/改名）的副本在索引里是墓碑，以前没过滤，界面上永远消不掉；
+        // 再看一眼磁盘，防止索引还没跟上
+        for e in entries.iter().filter(|e| {
+            !e.deleted && e.path.contains(".sync-conflict-") && f.local_path.join(&e.path).is_file()
+        }) {
             let name = e.path.rsplit('/').next().unwrap_or(&e.path);
             let (original_name, device) = parse_conflict_name(name);
             let original_path = match e.path.rsplit_once('/') {
@@ -695,6 +696,9 @@ pub async fn resolve_conflict(
     conflict_id: String,
     resolution: ConflictResolution,
 ) -> CmdResult<()> {
+    if !conflict_id.contains(".sync-conflict-") {
+        return Err(ErrorDto::new("invalid", "不是冲突副本"));
+    }
     let mut found = None;
     for f in state.store.list_folders().unwrap_or_default() {
         let entries = state.store.list_entries(&f.id).unwrap_or_default();
@@ -705,32 +709,45 @@ pub async fn resolve_conflict(
     }
     let folder = found.ok_or_else(|| ErrorDto::new("not_found", "冲突文件不存在"))?;
 
-    let name = conflict_id.rsplit('/').next().unwrap_or(&conflict_id);
-    let (original_name, _) = parse_conflict_name(name);
-    let original_rel = match conflict_id.rsplit_once('/') {
-        Some((dir, _)) => format!("{dir}/{original_name}"),
-        None => original_name,
+    let (dir, name) = match conflict_id.rsplit_once('/') {
+        Some((d, n)) => (Some(d), n),
+        None => (None, conflict_id.as_str()),
     };
+    let join = |n: &str| dir.map_or_else(|| n.to_string(), |d| format!("{d}/{n}"));
+    let (original_name, _) = parse_conflict_name(name);
+    let original_rel = join(&original_name);
     let conflict_abs = folder.local_path.join(&conflict_id);
     let original_abs = folder.local_path.join(&original_rel);
+    // 这次操作后新出现/变化的路径，需要通知同步层
+    let mut touched = vec![conflict_id.clone()];
 
-    match resolution {
-        ConflictResolution::KeepConflict => {
-            std::fs::rename(&conflict_abs, &original_abs)
-                .map_err(|e| ErrorDto::new("io", format!("替换失败: {e}")))?;
-        }
-        ConflictResolution::KeepOriginal => {
-            std::fs::remove_file(&conflict_abs)
-                .map_err(|e| ErrorDto::new("io", format!("删除副本失败: {e}")))?;
-        }
-        ConflictResolution::KeepBoth => {
-            let archived = conflict_abs.with_extension("resolved.bak");
-            std::fs::rename(&conflict_abs, &archived)
-                .map_err(|e| ErrorDto::new("io", format!("存档失败: {e}")))?;
+    if conflict_abs.is_file() {
+        match resolution {
+            ConflictResolution::KeepConflict => {
+                std::fs::rename(&conflict_abs, &original_abs)
+                    .map_err(|e| ErrorDto::new("io", format!("替换失败: {e}")))?;
+                touched.push(original_rel);
+            }
+            ConflictResolution::KeepOriginal => {
+                std::fs::remove_file(&conflict_abs)
+                    .map_err(|e| ErrorDto::new("io", format!("删除副本失败: {e}")))?;
+            }
+            ConflictResolution::KeepBoth => {
+                // 改成不带冲突标记的名字，否则它仍会被当成冲突列出来
+                let kept_rel = join(&kept_copy_name(name));
+                let kept_abs = folder.local_path.join(&kept_rel);
+                if kept_abs.exists() {
+                    return Err(ErrorDto::new("exists", format!("{kept_rel} 已存在")));
+                }
+                std::fs::rename(&conflict_abs, &kept_abs)
+                    .map_err(|e| ErrorDto::new("io", format!("改名失败: {e}")))?;
+                touched.push(kept_rel);
+            }
         }
     }
+    // 副本已经不在磁盘上（之前手动删了，或另一台设备已处理）：
+    // 视为已处理，只把索引里的记录变成墓碑，让列表里这一项消失
 
-    // 触发重新扫描，让索引跟上磁盘现实
     let rt = {
         let guard = state.runtimes.lock().unwrap();
         guard
@@ -739,15 +756,25 @@ pub async fn resolve_conflict(
             .cloned()
     };
     if let Some(rt) = rt {
-        let _ = rt
-            .session
-            .on_local_event(FileEvent {
-                path: original_rel,
-                kind: EventKind::Changed,
-            })
-            .await;
+        // 不等监听器：立即更新索引（副本路径不存在 → 墓碑），并推给对端
+        for path in touched {
+            let _ = rt
+                .session
+                .on_local_event(FileEvent {
+                    path,
+                    kind: EventKind::Changed,
+                })
+                .await;
+        }
+        rt.flush_pending().await;
     }
     Ok(())
+}
+
+/// "两者都保留"时副本的新名字：去掉冲突标记，保留时间与设备信息。
+/// `a.sync-conflict-20260101-120000-PC.txt` → `a.kept-20260101-120000-PC.txt`
+fn kept_copy_name(conflict_name: &str) -> String {
+    conflict_name.replacen(".sync-conflict-", ".kept-", 1)
 }
 
 // ---------- 设置 ----------
@@ -780,6 +807,38 @@ pub async fn open_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> 
     tauri_plugin_opener::open_path(&path, None::<&str>)
         .map_err(|e| ErrorDto::new("open_failed", format!("打开日志目录失败: {e}")))?;
     Ok(path)
+}
+
+/// 检测更新（Basic 版本更新服务）。失败时 message 是服务端原文。
+#[tauri::command]
+pub async fn check_update() -> CmdResult<UpdateDto> {
+    crate::updater::check()
+        .await
+        .map_err(|e| ErrorDto::new("update_check_failed", format!("{e:#}")))
+}
+
+/// 下载、校验并安装最新版本。成功时安装器接管，本进程退出，不会返回。
+/// 下载进度通过 `update://progress` 事件推送。
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri::Emitter;
+    let fail = |e: anyhow::Error| ErrorDto::new("update_install_failed", format!("{e:#}"));
+    // 每次都重新取：download_url 只有 1 小时有效
+    let remote = crate::updater::fetch_info().await.map_err(fail)?;
+    let dto = crate::updater::evaluate(&remote, crate::updater::current_version());
+    if !dto.available {
+        return Err(ErrorDto::new("update_not_available", "没有可安装的新版本"));
+    }
+    let progress_app = app.clone();
+    let path = crate::updater::download_verified(&remote, &move |downloaded, total| {
+        let _ = progress_app.emit("update://progress", UpdateProgressDto { downloaded, total });
+    })
+    .await
+    .map_err(fail)?;
+    crate::updater::launch_installer(&path).map_err(fail)?;
+    info!("安装器已启动，退出旧版本");
+    app.exit(0);
+    Ok(())
 }
 
 /// 本机信息（调试/诊断用）。
@@ -847,6 +906,13 @@ mod tests {
         let (orig, dev) = parse_conflict_name("Makefile.sync-conflict-20261027-103005-ASHU");
         assert_eq!(orig, "Makefile");
         assert_eq!(dev, "ASHU");
+    }
+
+    #[test]
+    fn kept_copy_name_drops_conflict_marker() {
+        let kept = kept_copy_name("k1.sync-conflict-20261030-083719-DESKTOP-T7CO944.txt");
+        assert_eq!(kept, "k1.kept-20261030-083719-DESKTOP-T7CO944.txt");
+        assert!(!kept.contains(".sync-conflict-"), "否则仍会被列为冲突");
     }
 
     #[test]

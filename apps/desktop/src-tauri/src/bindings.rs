@@ -78,6 +78,8 @@ mod tests {
             crate::dto::Direction,
             crate::dto::DeviceStatusEvent,
             crate::dto::FolderStatusEvent,
+            crate::dto::UpdateDto,
+            crate::dto::UpdateProgressDto,
         );
 
         // index.ts 汇总，前端可以 `import { DeviceDto } from "../lib/bindings"`
@@ -110,6 +112,8 @@ mod tests {
             "Direction",
             "DeviceStatusEvent",
             "FolderStatusEvent",
+            "UpdateDto",
+            "UpdateProgressDto",
         ] {
             index.push_str(&format!("export type {{ {t} }} from \"./{t}\";\n"));
         }

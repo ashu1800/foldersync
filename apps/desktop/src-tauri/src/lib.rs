@@ -10,6 +10,7 @@ pub mod dto;
 pub mod limits;
 pub mod settings;
 pub mod state;
+pub mod updater;
 
 use std::sync::Arc;
 
@@ -41,7 +42,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
@@ -68,6 +68,7 @@ pub fn run() {
             }
 
             build_tray(app)?;
+            spawn_update_checker(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -117,9 +118,32 @@ pub fn run() {
             commands::export_diagnostics,
             commands::get_log_dir,
             commands::get_local_info,
+            commands::check_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 启动失败");
+}
+
+/// 后台定时检测更新：启动后稍等一会儿查一次，之后每 6 小时一次。
+/// 有新版本（或强制更新）时推 `update://available` 给前端弹提示。
+/// 检测失败只记日志，绝不影响同步主流程。
+fn spawn_update_checker(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(updater::FIRST_CHECK_DELAY).await;
+        loop {
+            match updater::check().await {
+                Ok(u) if u.available => {
+                    info!(latest = ?u.latest_version, force = u.force, "发现新版本");
+                    let _ = app.emit("update://available", u);
+                }
+                Ok(_) => {}
+                Err(e) => warn!("检测更新失败: {e:#}"),
+            }
+            tokio::time::sleep(updater::CHECK_INTERVAL).await;
+        }
+    });
 }
 
 /// 按设置启用/关闭开机自启（必须在 AppState 就绪后调用）。

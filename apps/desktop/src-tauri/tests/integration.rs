@@ -52,6 +52,45 @@ async fn start_folder_indexes_existing_files() {
     assert!(snap.contains_key("b.txt"));
 }
 
+/// 回归：冲突副本删掉后变成墓碑，以前仍出现在冲突列表里，界面上永远消不掉。
+#[tokio::test]
+async fn deleted_conflict_copy_leaves_conflict_list() {
+    use foldersync_desktop_lib::commands::conflict_dtos_for;
+    use fs_sync_daemon::{EventKind, FileEvent};
+
+    let (st, tmp) = state().await;
+    let dir = tmp.path().join("c");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("k.txt"), b"win").unwrap();
+    let copy = "k.sync-conflict-20261030-083719-PC.txt";
+    std::fs::write(dir.join(copy), b"lose").unwrap();
+    st.store
+        .add_folder(&Folder {
+            id: "f-c".into(),
+            name: "c".into(),
+            local_path: dir.clone(),
+            paused: false,
+            tombstone_days: 30,
+            created_at: 0,
+        })
+        .unwrap();
+    let rt = st.start_folder("f-c".into(), dir.clone()).await.unwrap();
+    assert_eq!(conflict_dtos_for(&st, None).len(), 1);
+
+    std::fs::remove_file(dir.join(copy)).unwrap();
+    // 磁盘上没了：即使索引还没更新也不该再列出
+    assert!(conflict_dtos_for(&st, None).is_empty());
+    // 索引变成墓碑后同样不列出
+    rt.session
+        .on_local_event(FileEvent {
+            path: copy.into(),
+            kind: EventKind::Removed,
+        })
+        .await
+        .unwrap();
+    assert!(conflict_dtos_for(&st, None).is_empty());
+}
+
 #[tokio::test]
 async fn devices_empty_on_fresh_state() {
     let (st, _t) = state().await;
