@@ -12,6 +12,7 @@ import type {
   ConflictDto,
   ConflictResolution,
   DeviceDto,
+  EnvStatusDto,
   ErrorDto,
   FolderDto,
   IgnoreRulesDto,
@@ -100,6 +101,13 @@ export const getLogDir = () => call<string>("get_log_dir");
 export const exportDiagnostics = (outDir?: string) =>
   call<string>("export_diagnostics", { outDir: outDir ?? null });
 export const getLocalInfo = () => call<Record<string, unknown>>("get_local_info");
+
+// ---------- 环境引导 ----------
+
+export const getEnvironmentStatus = () => call<EnvStatusDto>("get_environment_status");
+export const repairSshEnvironment = () => call<EnvStatusDto>("repair_ssh_environment");
+export const openTailscaleDownload = () => call<void>("open_tailscale_download");
+export const getRelayGuide = () => call<string>("get_relay_guide");
 
 // ---------- 事件 ----------
 

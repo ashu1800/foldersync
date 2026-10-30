@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use fs_sync_core::{FileEntry, SyncAction, conflict_name, validate_path};
+use fs_sync_net::blobstore::BlobStore;
 use fs_sync_store::Store;
-use iroh_blobs::store::fs::FsStore;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -88,13 +88,13 @@ pub struct SyncEngine {
     pub folder_id: String,
     pub root: PathBuf,
     pub store: Arc<Store>,
-    /// blob 存储实例（**必须共享**：FsStore 每个实例会启动后台 actor 争抢同一 redb 文件）
-    pub blobs: Arc<FsStore>,
+    /// blob 存储实例（按 blake3 寻址，进程内共享同一目录）
+    pub blobs: Arc<BlobStore>,
     pub suppression: Arc<WriteSuppression>,
 }
 
 impl SyncEngine {
-    pub fn new(folder_id: String, root: PathBuf, store: Arc<Store>, blobs: Arc<FsStore>) -> Self {
+    pub fn new(folder_id: String, root: PathBuf, store: Arc<Store>, blobs: Arc<BlobStore>) -> Self {
         Self {
             folder_id,
             root,
@@ -125,7 +125,7 @@ impl SyncEngine {
         }
 
         // 从共享 blob 存储导出（原子写）
-        fs_sync_net::blobs::export_to(&self.blobs, blob_hash, &dest).await?;
+        self.blobs.export_to(blob_hash, &dest).await?;
 
         // 自写抑制：避免监听循环
         self.suppression.insert(&rel, blob_hash).await;
@@ -227,10 +227,10 @@ impl SyncEngine {
     pub async fn ensure_blob(&self, entry: &FileEntry) -> Result<String> {
         let rel = validate_path(&entry.path)?;
         let abs = self.root.join(&rel);
-        if fs_sync_net::blobs::has_blob(&self.blobs, &entry.hash).await {
+        if self.blobs.has(&entry.hash).await {
             return Ok(entry.hash.clone());
         }
-        fs_sync_net::blobs::add_file(&self.blobs, &abs).await
+        self.blobs.add_file(&abs).await
     }
 
     /// 执行一批 diff 动作中「需要本地落盘」的部分，返回需推送的路径列表。
@@ -309,11 +309,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("sync");
         std::fs::create_dir_all(&root).unwrap();
-        let blobs = Arc::new(
-            fs_sync_net::blobs::open_store(&tmp.path().join("blobs"))
-                .await
-                .unwrap(),
-        );
+        let blobs = Arc::new(BlobStore::open(tmp.path().join("share")).unwrap());
         let store = Arc::new(Store::open_in_memory().unwrap());
         (SyncEngine::new("f1".into(), root, store, blobs), tmp)
     }
@@ -321,9 +317,7 @@ mod tests {
     #[tokio::test]
     async fn pulled_file_lands_and_is_suppressed() {
         let (eng, _tmp) = engine().await;
-        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"abc".to_vec())
-            .await
-            .unwrap();
+        let hash = eng.blobs.add_bytes(b"abc".to_vec()).await.unwrap();
 
         let e = entry("dir/a.txt", &hash);
         eng.apply_pulled(&e, &hash).await.unwrap();
@@ -381,15 +375,13 @@ mod tests {
         e.hash = blake3::hash(b"hello").to_hex().to_string();
         let hash = eng.ensure_blob(&e).await.unwrap();
         assert_eq!(hash, e.hash);
-        assert!(fs_sync_net::blobs::has_blob(&eng.blobs, &hash).await);
+        assert!(eng.blobs.has(&hash).await);
     }
 
     #[tokio::test]
     async fn conflict_keeps_both_versions() {
         let (eng, _tmp) = engine().await;
-        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"winner".to_vec())
-            .await
-            .unwrap();
+        let hash = eng.blobs.add_bytes(b"winner".to_vec()).await.unwrap();
         let winner = entry("doc.txt", &hash);
         let copy = eng
             .apply_conflict(&winner, Some(b"loser".to_vec()), &hash, "home-pc")
@@ -416,7 +408,9 @@ mod tests {
         // 本地已有被修改过的文件（这就是落败版本，唯一的副本在磁盘上）
         std::fs::write(eng.root.join("doc.txt"), b"local edit").unwrap();
 
-        let hash = fs_sync_net::blobs::add_bytes(&eng.blobs, b"remote winner".to_vec())
+        let hash = eng
+            .blobs
+            .add_bytes(b"remote winner".to_vec())
             .await
             .unwrap();
         let winner = entry("doc.txt", &hash);

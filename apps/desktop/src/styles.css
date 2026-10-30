@@ -612,6 +612,21 @@ body {
   user-select: all;
 }
 
+/* 中继搭建说明：等宽文本 */
+.guide-pre {
+  margin: 0;
+  padding: 14px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow: auto;
+  max-height: 55vh;
+}
+
 .tabs {
   display: flex;
   gap: 4px;

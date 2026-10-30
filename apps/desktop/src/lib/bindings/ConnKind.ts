@@ -3,4 +3,4 @@
 /**
  * 连接方式。
  */
-export type ConnKind = "direct" | "relay" | "tailscale" | "unknown";
+export type ConnKind = "relay" | "tailscale" | "unknown";

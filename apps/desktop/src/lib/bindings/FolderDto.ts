@@ -4,27 +4,27 @@ import type { FolderStatus } from "./FolderStatus";
 /**
  * 文件夹信息。
  */
-export type FolderDto = { id: string, name: string, 
+export type FolderDto = { id: string, name: string,
 /**
  * 本地路径
  */
-path: string, status: FolderStatus, 
+path: string, status: FolderStatus,
 /**
  * 是否暂停
  */
-paused: boolean, 
+paused: boolean,
 /**
  * 最近同步时间（Unix 秒），从未同步为 None
  */
-last_sync_at: number | null, 
+last_sync_at: number | null,
 /**
  * 待处理文件数
  */
-pending: number, 
+pending: number,
 /**
  * 已同步文件数
  */
-file_count: number, 
+file_count: number,
 /**
  * 分享给的设备 id 列表
  */

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder, validate_path};
+use fs_sync_net::blobstore::BlobStore;
 use fs_sync_store::Store;
 use tracing::{info, warn};
 
@@ -188,28 +189,67 @@ where
     Ok((stats, actions))
 }
 
-/// 在已建立的连接上，通过 iroh-blobs 从对端拉取 blob。
+/// 按设备记录构造 SSH 连接目标（依次尝试 Tailscale 地址）。
+pub fn ssh_target_from_device(
+    device: &fs_sync_store::Device,
+) -> Result<fs_sync_net::ssh_client::SshTarget> {
+    let host = device
+        .addresses
+        .first()
+        .context("设备没有 Tailscale 地址（请先安装并登录 Tailscale）")?
+        .clone();
+    Ok(fs_sync_net::ssh_client::SshTarget {
+        host,
+        port: device.port,
+        username: device.username.clone(),
+        host_key: device.host_key.clone(),
+    })
+}
+
+/// 创建一个“按需连接、连接复用”的 SSH blob 拉取器。
 ///
-/// 采用 iroh-blobs 官方高层 API：`Store::downloader(&endpoint)` +
-/// `Downloader::download(hash, providers)`，其中 providers 传对端 EndpointId。
-/// 这样无需手工管理 rpc 连接，iroh-blobs 会在自己的 ALPN 上直接与对端通信。
-pub fn make_puller(
-    endpoint: iroh::Endpoint,
-    peer_id: iroh::EndpointId,
-    local_store: Arc<iroh_blobs::store::fs::FsStore>,
+/// 一次同步批量的多个文件共用同一条 SSH 连接；连接失败会丢弃，下次重连。
+pub fn make_ssh_puller(
+    device: fs_sync_store::Device,
+    identity: fs_sync_net::identity::SshIdentity,
+    local_store: Arc<BlobStore>,
 ) -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
-    let downloader = local_store.downloader(&endpoint);
+    let client: Arc<tokio::sync::Mutex<Option<fs_sync_net::ssh_client::SshClient>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
     move |hash_hex: String| {
-        let downloader = downloader.clone();
+        let device = device.clone();
+        let identity = identity.clone();
         let store = local_store.clone();
+        let client = client.clone();
         Box::pin(async move {
-            let hash = fs_sync_net::blobs::parse_hash(&hash_hex).context("hash 无效")?;
-            if store.blobs().has(hash).await.unwrap_or(false) {
+            if store.has(&hash_hex).await {
                 return Ok(());
             }
-            // DownloadProgress 实现了 IntoFuture<Output = Result<()>>，直接 await 到底
-            downloader.download(hash, vec![peer_id]).await?;
-            Ok(())
+            let mut guard = client.lock().await;
+            if guard.is_none() {
+                let mut last_err = None;
+                for addr in &device.addresses {
+                    let target = fs_sync_net::ssh_client::SshTarget {
+                        host: addr.clone(),
+                        port: device.port,
+                        username: device.username.clone(),
+                        host_key: device.host_key.clone(),
+                    };
+                    match fs_sync_net::ssh_client::SshClient::connect(&target, &identity).await {
+                        Ok(c) => {
+                            *guard = Some(c);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if guard.is_none() {
+                    return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("没有可用地址")));
+                }
+            }
+            let client = guard.as_ref().unwrap();
+            let sftp = client.sftp();
+            fs_sync_net::ssh_client::SshClient::download_blob(&sftp, &hash_hex, &store).await
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
     }
 }
@@ -241,17 +281,8 @@ where
 }
 
 /// 从 blob 存储读出内容（冲突副本落盘用）。
-pub async fn read_blob_bytes(
-    store: &iroh_blobs::store::fs::FsStore,
-    hash_hex: &str,
-) -> Result<Vec<u8>> {
-    let hash = fs_sync_net::blobs::parse_hash(hash_hex).context("hash 无效")?;
-    let bytes = store
-        .blobs()
-        .get_bytes(hash)
-        .await
-        .context("读取 blob 失败")?;
-    Ok(bytes.to_vec())
+pub async fn read_blob_bytes(store: &BlobStore, hash_hex: &str) -> Result<Vec<u8>> {
+    store.get_bytes(hash_hex).await.context("读取 blob 失败")
 }
 
 /// 从文件夹根解析绝对路径并确保不逃逸。

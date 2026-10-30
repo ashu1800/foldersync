@@ -6,11 +6,12 @@ members = [
     "crates/fs-sync-store",
     "crates/fs-sync-daemon",
     "apps/cli",
+    "apps/relay",
     "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -22,9 +23,9 @@ fs-sync-net = { path = "crates/fs-sync-net" }
 fs-sync-store = { path = "crates/fs-sync-store" }
 fs-sync-daemon = { path = "crates/fs-sync-daemon" }
 
-# 网络（版本已锁定，见 README）
-iroh = "1.4.1"
-iroh-blobs = "0.103.1"
+# 网络（SSH + SFTP，版本已锁定，见 README）
+russh = { version = "0.65.0", default-features = false, features = ["ring"] }
+russh-sftp = "3.0.1"
 
 # 异步与工具
 tokio = { version = "1", features = ["full"] }
@@ -41,6 +42,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 blake3 = "1"
 rand = "0.9"
+# russh 0.65 的 ssh-key 基于 rand 0.10，密钥生成必须用同版本
+rand010 = { package = "rand", version = "0.10" }
 hex = "0.4"
 base64 = "0.22"
 tracing = "0.1"

@@ -4,28 +4,40 @@ import type { ConnKind } from "./ConnKind";
 /**
  * 设备信息。
  */
-export type DeviceDto = { 
+export type DeviceDto = {
 /**
- * EndpointId（hex）
+ * SSH 公钥指纹（设备 ID）
  */
-id: string, 
+id: string,
 /**
  * 设备显示名
  */
-name: string, 
+name: string,
 /**
  * 公钥指纹（分组便于人工核对，如 `abcd-ef01-...`）
  */
-fingerprint: string, 
+fingerprint: string,
 /**
  * 是否在线
  */
-online: boolean, 
+online: boolean,
 /**
  * 连接方式
  */
-conn: ConnKind, 
+conn: ConnKind,
 /**
  * 往返延迟（毫秒），未知为 None
  */
-rtt_ms: number | null, };
+rtt_ms: number | null,
+/**
+ * Tailscale 地址（第一个）
+ */
+address: string | null,
+/**
+ * SSH 端口
+ */
+port: number,
+/**
+ * 是否已配置中继房间
+ */
+relay_ready: boolean, };

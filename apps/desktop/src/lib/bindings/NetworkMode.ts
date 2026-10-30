@@ -3,4 +3,4 @@
 /**
  * 网络模式。
  */
-export type NetworkMode = "auto" | "prefer_tailscale" | "tailscale_only";
+export type NetworkMode = "auto" | "tailscale" | "relay";

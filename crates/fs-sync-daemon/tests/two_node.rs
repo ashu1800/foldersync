@@ -5,10 +5,9 @@
 //!
 //! 本地事件 → 索引 + blob → 对端取索引 → diff → 拉 blob → 落盘 → 墓碑
 //!
-//! **为什么不经 QUIC**：真实 iroh 传输已在 M3/M4 用手工跨机测试验证
-//! （家 ↔ 公司，含直连/中继/Tailscale 三种路径）。把它塞进自动化测试会依赖
-//! 公网发现服务与端口可用性，产生随机超时。这里用「两节点直连」把同步语义
-//! （版本向量、冲突判定、墓碑收敛）测透，网络层验证留在真机。
+//! **为什么不经真实网络**：SSH/SFTP 传输另有 `ssh_server.rs` 的 loopback 测试
+//! 与 `relay_server.rs` 的房间测试；这里用「两节点直连」把同步语义
+//! （版本向量、冲突判定、墓碑收敛）测透，网络层验证留在专门测试。
 //!
 //! 覆盖提示词 7 节要求的：新增 / 修改 / 删除 / 双端同时修改 /
 //! 一端删除另一端修改 / 离线期间变更 / 收敛性。
@@ -19,14 +18,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use fs_sync_core::FileEntry;
 use fs_sync_daemon::FolderRuntime;
+use fs_sync_net::blobstore::BlobStore;
 use fs_sync_store::Store;
-use iroh_blobs::store::fs::FsStore;
 
 struct Node {
     #[allow(dead_code)]
     name: String,
     runtime: Arc<FolderRuntime>,
-    blobs: Arc<FsStore>,
+    blobs: Arc<BlobStore>,
     _store: Arc<Store>,
     _tmp: tempfile::TempDir,
 }
@@ -69,11 +68,7 @@ async fn node(name: &str) -> Node {
     std::fs::create_dir_all(&root).unwrap();
 
     let store = Arc::new(Store::open(&tmp.path().join("state.sqlite3")).unwrap());
-    let blobs = Arc::new(
-        fs_sync_net::blobs::open_store(&tmp.path().join("blobs"))
-            .await
-            .unwrap(),
-    );
+    let blobs = Arc::new(BlobStore::open(tmp.path().join("share")).unwrap());
 
     let runtime = Arc::new(
         FolderRuntime::start(
@@ -185,7 +180,7 @@ async fn sync(from: &Node, to: &Node) -> Result<()> {
         let to_blobs = to_blobs.clone();
         async move {
             let bytes = fs_sync_daemon::read_blob_bytes(&from_blobs, &hash).await?;
-            fs_sync_net::blobs::add_bytes(&to_blobs, bytes).await?;
+            to_blobs.add_bytes(bytes).await?;
             Ok(())
         }
     };
@@ -295,7 +290,7 @@ async fn concurrent_edit_keeps_both_versions() {
         let tb = tb.clone();
         async move {
             let bytes = fs_sync_daemon::read_blob_bytes(&fb, &hash).await?;
-            fs_sync_net::blobs::add_bytes(&tb, bytes).await?;
+            tb.add_bytes(bytes).await?;
             Ok(())
         }
     };
@@ -619,7 +614,7 @@ async fn full_scan_registers_blob_content() {
 
     // 内容真的进了 blob 库（对端才能拉到）
     assert!(
-        fs_sync_net::blobs::has_blob(&a.blobs, &entry.hash).await,
+        a.blobs.has(&entry.hash).await,
         "兜底扫描必须把内容加入 blob 存储"
     );
 

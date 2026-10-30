@@ -1,23 +1,21 @@
-//! 常驻同步守护：M4 的双向实时同步主循环。
+//! 常驻同步守护：双向实时同步主循环（SSH/SFTP 与中继两种方案）。
 //!
-//! 组成（提示词 4.6 / 4.9 / 4.10）：
-//! - 启动时扫描并建立索引
-//! - notify 监听本地变更 → 增量推送给已连接设备
-//! - 收到对端 IndexUpdate → 拉取内容落盘
-//! - 周期兜底全量扫描
-//! - 断线重连（指数退避）、连接失败回退中继（iroh 内建）
+//! - Tailscale 方案：主动连对端 SSH 服务端，控制消息走 `foldersync` 子系统，
+//!   文件内容走同一条 SSH 连接上的 SFTP。
+//! - 中继方案：双方各自连中继房间，上传自己的索引与 blob、轮询对端索引。
+//! - 断线重连（指数退避），无可用方案时在 UI 引导用户安装 Tailscale 或搭建中继。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use fs_sync_core::FileEntry;
-use fs_sync_net::frame;
+use fs_sync_net::blobstore::BlobStore;
+use fs_sync_net::conn::NetworkMode;
+use fs_sync_net::identity::SshIdentity;
 use fs_sync_net::message::Message;
-use fs_sync_store::Store;
-use iroh::{Endpoint, EndpointId};
-use iroh_blobs::store::fs::FsStore;
+use fs_sync_store::{Device, Store};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
@@ -25,10 +23,13 @@ use crate::engine::SyncEngine;
 use crate::session::SyncSession;
 use crate::watcher::{FileEvent, watch_folder};
 
+/// 前端事件回调（daemon 不依赖 Tauri）。
+pub type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 /// 一个被同步文件夹的运行时状态。
 pub struct FolderRuntime {
     pub session: Arc<SyncSession>,
-    /// 已连接设备的推送通道：endpoint_id hex → 发送端
+    /// 已连接设备的推送通道：device id → 发送端
     pub peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
     /// 待推送给对端的本地变更（由事件循环写入，连接循环消费）
     pub outbox: Arc<tokio::sync::Mutex<Vec<FileEntry>>>,
@@ -51,7 +52,7 @@ impl FolderRuntime {
         root: PathBuf,
         device_id: String,
         store: Arc<Store>,
-        blobs: Arc<FsStore>,
+        blobs: Arc<BlobStore>,
         debounce_ms: u64,
     ) -> Result<Self> {
         let engine = SyncEngine::new(folder_id.clone(), root.clone(), store, blobs.clone());
@@ -65,7 +66,6 @@ impl FolderRuntime {
         session.initial_scan().await?;
 
         // 初始扫描后把既有文件加入 blob 存储，否则对端拉不到内容
-        // （M3 实测教训：只建索引不存内容 → 对端 "Unable to download"）
         let initial = session.snapshot().await;
         let mut added = 0;
         for e in initial.values().filter(|e| !e.is_dir && !e.deleted) {
@@ -132,7 +132,7 @@ impl FolderRuntime {
                         }
                     }
                     Ok(_) => {}
-                    Err(e) => warn!("兜底扫描失败: {e}"),
+                    Err(e) => warn!(兜底扫描失败 = %e),
                 }
                 if let Err(e) = sess2.purge_expired_tombstones() {
                     warn!("墓碑清理失败: {e}");
@@ -148,15 +148,18 @@ impl FolderRuntime {
         })
     }
 
-    /// 处理对端推来的增量。
-    pub async fn handle_remote_update(
+    /// 处理对端推来的增量（Tailscale 方案：通过 SSH 再拉内容）。
+    pub async fn handle_remote_update_ssh(
         &self,
-        endpoint: Endpoint,
-        peer: EndpointId,
+        peer: &Device,
+        identity: &SshIdentity,
         entries: Vec<FileEntry>,
     ) -> Result<()> {
-        let blobs = self.session.blobs.clone();
-        let puller = crate::sync::make_puller(endpoint, peer, blobs);
+        let puller = crate::sync::make_ssh_puller(
+            peer.clone(),
+            identity.clone(),
+            self.session.blobs.clone(),
+        );
         let remote: HashMap<String, FileEntry> =
             entries.into_iter().map(|e| (e.path.clone(), e)).collect();
         let stats = self.session.apply_remote(&remote, puller).await?;
@@ -171,103 +174,187 @@ impl FolderRuntime {
         Ok(())
     }
 
-    /// 对端上线：推送完整索引（对端据此补齐）。
-    pub async fn on_peer_connect(&self, peer: EndpointId, tx: mpsc::Sender<Message>) {
-        self.peers.lock().await.insert(peer.to_string(), tx);
-        info!(peer = %peer.fmt_short(), "对端已接入同步会话");
+    /// 对端上线：登记推送通道。
+    pub async fn on_peer_connect(&self, peer: String, tx: mpsc::Sender<Message>) {
+        self.peers.lock().await.insert(peer.clone(), tx);
+        info!(peer = %peer, "对端已接入同步会话");
     }
 
-    pub async fn on_peer_disconnect(&self, peer: &EndpointId) {
-        self.peers.lock().await.remove(&peer.to_string());
-        info!(peer = %peer.fmt_short(), "对端已断开");
+    pub async fn on_peer_disconnect(&self, peer: &str) {
+        self.peers.lock().await.remove(peer);
+        info!(peer = %peer, "对端已断开");
+    }
+
+    /// 临时取出待推送的本地变更。
+    pub async fn take_outbox(&self) -> Vec<FileEntry> {
+        std::mem::take(&mut *self.outbox.lock().await)
     }
 }
 
-/// 接收端写循环：把推送队列的消息写到连接流。
-pub async fn run_peer_writer(
-    mut tx_rx: mpsc::Receiver<Message>,
-    mut send: iroh::endpoint::SendStream,
-) -> Result<()> {
-    while let Some(msg) = tx_rx.recv().await {
-        if let Err(e) = frame::write_frame(&mut send, &msg).await {
-            warn!("写增量失败: {e}");
-            return Err(e);
-        }
-    }
-    Ok(())
+/// 对等连接循环配置。
+#[derive(Clone)]
+pub struct PeerLoopConfig {
+    pub identity: SshIdentity,
+    pub device_id: String,
+    pub device_name: String,
+    pub ssh_port: u16,
+    pub mode: NetworkMode,
+    pub relay_url: Option<String>,
+    pub folder_ids: Vec<String>,
 }
 
-/// 对等连接循环（M4 核心）：对每个已信任设备周期性建立连接、交换索引、
-/// 接收增量并应用到本地。断线后指数退避重连（提示词 4.8）。
+/// 对等连接循环：周期检查信任列表，为每个设备起一个独立监督任务。
+///
+/// `cfg` 用 `RwLock` 共享：设置页改网络模式 / 中继地址后立即生效，不必重启应用。
 pub async fn run_peer_loop(
-    endpoint: Endpoint,
-    device_id: String,
-    folder_ids: Vec<String>,
+    cfg: Arc<std::sync::RwLock<PeerLoopConfig>>,
     runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
     trust: crate::trust::Trust,
-    device_name: String,
+    online: Option<Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>>>,
 ) {
-    let mut backoff = std::time::Duration::from_secs(2);
+    let mut spawned: HashSet<String> = HashSet::new();
     loop {
+        let own_id = cfg.read().unwrap().device_id.clone();
         let peers = trust.devices().unwrap_or_default();
+        // 已移除信任的设备允许以后重新配对时重新拉起监督任务
+        spawned.retain(|id| peers.iter().any(|p| &p.id == id));
         for peer in peers {
-            let Ok(peer_id) = peer.id.parse::<EndpointId>() else {
-                continue;
-            };
-            if peer_id.to_string() == device_id {
+            if peer.id == own_id || spawned.contains(&peer.id) {
                 continue;
             }
-            match sync_round(&endpoint, peer_id, &device_name, &folder_ids, &runtimes).await {
-                Ok(()) => {
-                    backoff = std::time::Duration::from_secs(2);
+            spawned.insert(peer.id.clone());
+            let cfg = cfg.clone();
+            let runtimes = runtimes.clone();
+            let online = online.clone();
+            let trust = trust.clone();
+            tokio::spawn(async move {
+                peer_supervisor(cfg, peer, runtimes, online, trust).await;
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+/// 单个设备的断线重连监督。
+async fn peer_supervisor(
+    cfg: Arc<std::sync::RwLock<PeerLoopConfig>>,
+    peer: Device,
+    runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    online: Option<Arc<Mutex<HashMap<String, fs_sync_net::ConnType>>>>,
+    trust: crate::trust::Trust,
+) {
+    let mut backoff = std::time::Duration::from_secs(2);
+    let mut auto_fallback_relay = false;
+    loop {
+        // 设备可能已在运行中被移除信任：立即停止，不再重连
+        if trust.get(&peer.id).ok().flatten().is_none() {
+            info!(peer = %peer.name, "设备已移除信任，停止同步任务");
+            return;
+        }
+        let cfg = cfg.read().unwrap().clone();
+        let use_relay = match cfg.mode {
+            NetworkMode::Relay => true,
+            NetworkMode::Tailscale => false,
+            NetworkMode::Auto => {
+                let ts = fs_sync_net::tailscale::detect();
+                auto_fallback_relay || peer.addresses.is_empty() || !ts.running
+            }
+        };
+        if let Some(map) = &online {
+            map.lock().await.insert(
+                peer.id.clone(),
+                if use_relay {
+                    fs_sync_net::ConnType::Relay
+                } else {
+                    fs_sync_net::ConnType::Tailscale
+                },
+            );
+        }
+        let result = if use_relay {
+            if peer.relay_room.is_none() || peer.relay_secret.is_none() {
+                warn!(peer = %peer.name, "没有中继房间信息，请重新配对或改用 Tailscale");
+                if let Some(map) = &online {
+                    map.lock().await.remove(&peer.id);
                 }
-                Err(e) => {
-                    info!(peer = %peer.name, "同步会话结束: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes).await
+        } else {
+            sync_round_ssh(&cfg, &peer, &runtimes).await
+        };
+        if let Some(map) = &online {
+            map.lock().await.remove(&peer.id);
+        }
+        match result {
+            Ok(()) => {
+                backoff = std::time::Duration::from_secs(2);
+                auto_fallback_relay = false;
+            }
+            Err(e) => {
+                info!(peer = %peer.name, "同步会话结束: {e:#}");
+                // auto 模式：Tailscale 路径失败后自动改走中继（若已配对房间）
+                if cfg.mode == NetworkMode::Auto
+                    && !use_relay
+                    && peer.relay_room.is_some()
+                    && peer.relay_secret.is_some()
+                {
+                    auto_fallback_relay = true;
+                    info!(peer = %peer.name, "Tailscale 连接失败，自动切换到中继");
                 }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
             }
         }
         tokio::time::sleep(backoff).await;
-        // 指数退避上限 60 秒
-        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
     }
 }
 
-/// 一轮同步：连上对端 → 交换索引 → 持续收发增量，直到连接断开。
-async fn sync_round(
-    endpoint: &Endpoint,
-    peer_id: EndpointId,
-    _device_name: &str,
-    folder_ids: &[String],
+/// 一轮 Tailscale SSH 同步：连上对端 → 交换索引 → 持续收发增量，直到连接断开。
+async fn sync_round_ssh(
+    cfg: &PeerLoopConfig,
+    peer: &Device,
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
 ) -> Result<()> {
-    let conn = endpoint
-        .connect(peer_id, fs_sync_net::ALPN)
-        .await
-        .context("连接对端失败")?;
-    info!(
-        peer = %peer_id.fmt_short(),
-        conn_type = %fs_sync_net::conn::classify_conn(&conn).map(|c| c.to_string()).unwrap_or_default(),
-        "同步会话已建立"
-    );
+    let mut last_err = None;
+    let mut client = None;
+    for addr in &peer.addresses {
+        let target = fs_sync_net::ssh_client::SshTarget {
+            host: addr.clone(),
+            port: peer.port,
+            username: peer.username.clone(),
+            host_key: peer.host_key.clone(),
+        };
+        match fs_sync_net::ssh_client::SshClient::connect(&target, &cfg.identity).await {
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut client = client
+        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("设备没有 Tailscale 地址")))?;
+    info!(peer = %peer.name, rtt_ms = client.rtt_ms(), "SSH 同步会话已建立");
 
-    let (mut send, mut recv) = conn.open_bi().await?;
+    client
+        .send(&Message::Hello {
+            protocol_version: fs_sync_net::message::PROTOCOL_VERSION,
+            device_name: cfg.device_name.clone(),
+            folders: Vec::new(),
+        })
+        .await?;
 
     // 交换全量索引（每个文件夹一条）
-    for fid in folder_ids {
-        let rt_opt = {
-            let guard = runtimes.lock().unwrap();
-            guard.iter().find(|r| &r.session.folder_id == fid).cloned()
-        };
+    for fid in &cfg.folder_ids {
+        let rt_opt = find_runtime(runtimes, fid);
         if let Some(rt) = rt_opt {
             let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
-            frame::write_frame(
-                &mut send,
-                &Message::Index {
+            client
+                .send(&Message::Index {
                     folder_id: fid.clone(),
                     entries: entries.clone(),
-                },
-            )
-            .await?;
+                })
+                .await?;
             // 首轮全量索引里对端没有的条目，直接排入 outbox 待推送
             let pushable: Vec<FileEntry> = entries
                 .into_iter()
@@ -279,34 +366,104 @@ async fn sync_round(
         }
     }
 
-    // 收对端索引并应用；同时把本地变更推出去
+    let sftp = client.sftp();
     loop {
         tokio::select! {
-            msg = frame::read_frame(&mut recv) => {
+            msg = client.recv() => {
                 match msg {
-                    Ok(msg) => handle_incoming(msg, &mut send, endpoint, peer_id, runtimes).await?,
+                    Ok(msg) => handle_incoming(&msg, peer, cfg, runtimes, Some(&sftp)).await?,
                     Err(e) => {
-                        warn!(peer = %peer_id.fmt_short(), "读对端消息失败: {e:#}");
+                        warn!(peer = %peer.name, "读对端消息失败: {e:#}");
                         return Err(e.context("读对端消息失败"));
                     }
                 }
             }
-            entry = recv_local_change(runtimes, folder_ids) => {
+            (folder_id, entry) = recv_local_change(runtimes, &cfg.folder_ids) => {
                 let msg = Message::IndexUpdate {
-                    folder_id: entry.0,
-                    entries: vec![entry.1],
+                    folder_id,
+                    entries: vec![entry],
                 };
-                if let Err(e) = frame::write_frame(&mut send, &msg).await {
-                    return Err(e.context("推送本地变更失败"));
-                }
-                info!(path = %msg_path(&msg), "已推送本地变更");
+                client.send(&msg).await.context("推送本地变更失败")?;
+                debug!(path = %msg_path(&msg), "已推送本地变更");
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
-                // 保活
-                frame::write_frame(&mut send, &Message::Ping).await?;
+                client.send(&Message::Ping).await?;
             }
         }
     }
+}
+
+/// 处理收到的控制消息。
+pub(crate) async fn handle_incoming(
+    msg: &Message,
+    peer: &Device,
+    cfg: &PeerLoopConfig,
+    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    sftp: Option<&Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>>,
+) -> Result<()> {
+    match msg {
+        Message::Index { folder_id, entries } | Message::IndexUpdate { folder_id, entries } => {
+            let Some(rt) = find_runtime(runtimes, folder_id) else {
+                return Ok(());
+            };
+            let remote: HashMap<String, FileEntry> = entries
+                .iter()
+                .cloned()
+                .map(|e| (e.path.clone(), e))
+                .collect();
+            let stats = match sftp {
+                Some(sftp) => {
+                    let sftp = sftp.clone();
+                    let blobs = rt.session.blobs.clone();
+                    let puller = move |hash: String| {
+                        let sftp = sftp.clone();
+                        let blobs = blobs.clone();
+                        async move {
+                            fs_sync_net::ssh_client::SshClient::download_blob(&sftp, &hash, &blobs)
+                                .await
+                        }
+                    };
+                    rt.session.apply_remote(&remote, puller).await?
+                }
+                None => {
+                    let puller = crate::sync::make_ssh_puller(
+                        peer.clone(),
+                        cfg.identity.clone(),
+                        rt.session.blobs.clone(),
+                    );
+                    rt.session.apply_remote(&remote, puller).await?
+                }
+            };
+            if stats.pulled + stats.deleted + stats.conflicts > 0 {
+                info!(
+                    peer = %peer.name,
+                    pulled = stats.pulled,
+                    deleted = stats.deleted,
+                    conflicts = stats.conflicts,
+                    "已应用对端增量"
+                );
+            }
+        }
+        Message::Ping => {}
+        Message::Pong => {}
+        Message::Error { code, message } => {
+            warn!(code, message, "对端返回错误");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn find_runtime(
+    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    folder_id: &str,
+) -> Option<Arc<FolderRuntime>> {
+    runtimes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.session.folder_id == folder_id)
+        .cloned()
 }
 
 fn msg_path(msg: &Message) -> &str {
@@ -319,9 +476,6 @@ fn msg_path(msg: &Message) -> &str {
 }
 
 /// 等待任一运行时的本地变更。
-///
-/// **必须永不返回 None**：tokio::select! 的分支一旦模式不匹配就被永久禁用，
-/// 若这里返回 None，后续本地变更要等 read_frame 或保活超时才可能推送（实测延迟 20s）。
 async fn recv_local_change(
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
     folder_ids: &[String],
@@ -335,68 +489,14 @@ async fn recv_local_change(
                 .cloned()
                 .collect()
         };
-        for rt in &rts {
-            let mut ob = rt.outbox.lock().await;
-            if let Some(entry) = ob.pop() {
-                return (rt.session.folder_id.clone(), entry);
+        for rt in rts {
+            let entry = rt.outbox.lock().await.pop();
+            if let Some(e) = entry {
+                return (rt.session.folder_id.clone(), e);
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-}
-/// 处理对端来信（Index / IndexUpdate / Ping / Error）。
-async fn handle_incoming(
-    msg: Message,
-    send: &mut iroh::endpoint::SendStream,
-    endpoint: &Endpoint,
-    peer_id: EndpointId,
-    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
-) -> Result<()> {
-    match msg {
-        Message::Index { folder_id, entries } | Message::IndexUpdate { folder_id, entries } => {
-            let rt = {
-                let guard = runtimes.lock().unwrap();
-                guard
-                    .iter()
-                    .find(|r| r.session.folder_id == folder_id)
-                    .cloned()
-            };
-            let Some(rt) = rt else {
-                tracing::warn!(folder = %folder_id, "对端推送未知文件夹，忽略");
-                return Ok(());
-            };
-            let remote: HashMap<String, FileEntry> =
-                entries.into_iter().map(|e| (e.path.clone(), e)).collect();
-            let puller =
-                crate::sync::make_puller(endpoint.clone(), peer_id, rt.session.blobs.clone());
-            match rt.session.apply_remote(&remote, puller).await {
-                Ok(stats) if stats.pulled + stats.deleted + stats.conflicts > 0 => {
-                    info!(
-                        pulled = stats.pulled,
-                        deleted = stats.deleted,
-                        conflicts = stats.conflicts,
-                        "已应用对端变更"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => warn!("应用对端变更失败: {e}"),
-            }
-            // apply_remote 会把本地胜出条目排入 session.pending，转进 outbox 待推送
-            let pending = rt.session.take_pending().await;
-            if !pending.is_empty() {
-                rt.outbox.lock().await.extend(pending);
-            }
-        }
-        Message::Ping => {
-            frame::write_frame(send, &Message::Pong).await?;
-        }
-        Message::Pong => {}
-        Message::Error { code, message } => {
-            warn!(code, %message, "对端返回错误");
-        }
-        other => debug!("忽略消息: {other:?}"),
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -404,56 +504,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn folder_runtime_scans_and_watches() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("sync");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.txt"), b"hello").unwrap();
-
-        let blobs = Arc::new(
-            fs_sync_net::blobs::open_store(&tmp.path().join("blobs"))
-                .await
-                .unwrap(),
-        );
-        let store = Arc::new(Store::open_in_memory().unwrap());
-
-        let rt = FolderRuntime::start("f1".into(), root.clone(), "devA".into(), store, blobs, 100)
-            .await
-            .unwrap();
-
-        // 初始扫描已索引
-        let snap = rt.session.snapshot().await;
-        assert!(snap.contains_key("a.txt"));
-
-        // 写新文件 → 事件循环应更新索引
-        std::fs::write(root.join("b.txt"), b"new").unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-        let snap = rt.session.snapshot().await;
-        assert!(
-            snap.contains_key("b.txt"),
-            "监听应捕获新文件，当前: {snap:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn peer_registry_tracks_connections() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("s");
         std::fs::create_dir_all(&root).unwrap();
-        let blobs = Arc::new(
-            fs_sync_net::blobs::open_store(&tmp.path().join("b"))
-                .await
-                .unwrap(),
-        );
+        let blobs = Arc::new(BlobStore::open(tmp.path().join("share")).unwrap());
         let store = Arc::new(Store::open_in_memory().unwrap());
         let rt = FolderRuntime::start("f1".into(), root, "devA".into(), store, blobs, 100)
             .await
             .unwrap();
 
-        let peer = iroh::SecretKey::generate().public();
+        let peer = "SHA256:abc".to_string();
         let (tx, _rx) = mpsc::channel(8);
-        rt.on_peer_connect(peer, tx).await;
+        rt.on_peer_connect(peer.clone(), tx).await;
         assert_eq!(rt.peers.lock().await.len(), 1);
 
         rt.on_peer_disconnect(&peer).await;

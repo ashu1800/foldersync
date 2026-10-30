@@ -3,15 +3,15 @@
 /**
  * 收到的共享邀请。
  */
-export type InviteDto = { invite_id: string, folder_id: string, folder_name: string, from_device: string, 
+export type InviteDto = { invite_id: string, folder_id: string, folder_name: string, from_device: string,
 /**
  * 建议的本地路径
  */
-suggested_path: string, 
+suggested_path: string,
 /**
  * 文件数
  */
-file_count: number, 
+file_count: number,
 /**
  * 总字节数
  */

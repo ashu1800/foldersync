@@ -4,4 +4,4 @@ import type { NetworkMode } from "./NetworkMode";
 /**
  * 设置补丁（只更新提供的字段）。
  */
-export type SettingsPatch = { device_name?: string, auto_start?: boolean, close_to_tray?: boolean, upload_limit_kbps?: number, download_limit_kbps?: number, relay_url?: string | null, network_mode?: NetworkMode, listen_port?: number | null, default_ignore?: Array<string>, log_level?: string, };
+export type SettingsPatch = { device_name?: string, auto_start?: boolean, close_to_tray?: boolean, upload_limit_kbps?: number, download_limit_kbps?: number, relay_url?: string | null, network_mode?: NetworkMode, ssh_port?: number, default_ignore?: Array<string>, log_level?: string, };

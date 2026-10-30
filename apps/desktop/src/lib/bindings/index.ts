@@ -17,6 +17,7 @@ export type { PendingPairingDto } from "./PendingPairingDto";
 export type { InviteDto } from "./InviteDto";
 export type { IgnoreRulesDto } from "./IgnoreRulesDto";
 export type { NetworkMode } from "./NetworkMode";
+export type { EnvStatusDto } from "./EnvStatusDto";
 export type { SettingsDto } from "./SettingsDto";
 export type { SettingsPatch } from "./SettingsPatch";
 export type { AddFolderRequest } from "./AddFolderRequest";

@@ -4,11 +4,11 @@ import type { ActivityKind } from "./ActivityKind";
 /**
  * 活动查询过滤。
  */
-export type ActivityFilter = { folder_id?: string, kind?: ActivityKind, 
+export type ActivityFilter = { folder_id?: string, kind?: ActivityKind,
 /**
  * 返回条数上限
  */
-limit?: number, 
+limit?: number,
 /**
  * 游标：返回 id 小于此值的条目（向下翻页）
  */

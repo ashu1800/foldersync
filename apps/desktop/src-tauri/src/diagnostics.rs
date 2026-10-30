@@ -54,7 +54,7 @@ impl DiagnosticReport {
     pub fn collect(
         data_dir: &Path,
         device_name: &str,
-        endpoint_id: &str,
+        device_id: &str,
         fingerprint: &str,
         settings_json: &str,
         store: &fs_sync_store::Store,
@@ -73,7 +73,7 @@ impl DiagnosticReport {
             std::env::consts::ARCH
         ));
         out.push_str(&format!("设备名: {device_name}\n"));
-        out.push_str(&format!("EndpointId: {endpoint_id}\n"));
+        out.push_str(&format!("设备 ID: {device_id}\n"));
         out.push_str(&format!("指纹: {fingerprint}\n"));
         out.push_str(&format!("数据目录: {}\n\n", data_dir.display()));
 

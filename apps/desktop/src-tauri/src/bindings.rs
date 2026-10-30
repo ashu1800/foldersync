@@ -32,8 +32,17 @@ mod tests {
             ($($t:ty),* $(,)?) => {
                 $({
                     let name = <$t as TS>::name(&cfg);
-                    let content = <$t as TS>::export_to_string(&cfg)
+                    let mut content = <$t as TS>::export_to_string(&cfg)
                         .unwrap_or_else(|e| panic!("生成 {name} 失败: {e}"));
+                    // ts-rs 的文档行会带尾部空格；统一清掉，避免 git diff --check 失败
+                    content = content
+                        .lines()
+                        .map(str::trim_end)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
                     let path = out.join(format!("{name}.ts"));
                     std::fs::write(&path, content)
                         .unwrap_or_else(|e| panic!("写 {} 失败: {e}", path.display()));
@@ -61,6 +70,7 @@ mod tests {
             crate::dto::InviteDto,
             crate::dto::IgnoreRulesDto,
             crate::dto::NetworkMode,
+            crate::dto::EnvStatusDto,
             crate::dto::SettingsDto,
             crate::dto::SettingsPatch,
             crate::dto::AddFolderRequest,
@@ -92,6 +102,7 @@ mod tests {
             "InviteDto",
             "IgnoreRulesDto",
             "NetworkMode",
+            "EnvStatusDto",
             "SettingsDto",
             "SettingsPatch",
             "AddFolderRequest",

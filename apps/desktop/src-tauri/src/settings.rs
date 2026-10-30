@@ -25,7 +25,15 @@ impl SettingsStore {
             }),
             Err(_) => SettingsDto::default(),
         };
-        migrate_stale_relay(&mut dto, path);
+        // 0.1.x 的 iroh 中继是 http://；0.2 起底层是 SSH/SFTP
+        if let Some(url) = &dto.relay_url
+            && (url.starts_with("http://") || url.starts_with("https://"))
+        {
+            dto.relay_url = Some(
+                url.replacen("http://", "tcp://", 1)
+                    .replacen("https://", "tcp://", 1),
+            );
+        }
         Ok(Self {
             path: path.to_path_buf(),
             inner: Mutex::new(dto),
@@ -47,7 +55,6 @@ impl SettingsStore {
         Ok(dto)
     }
 
-    /// 原子写盘（先写临时文件再 rename，避免断电留半截文件）。
     fn persist(&self, dto: &SettingsDto) -> Result<()> {
         persist_to(&self.path, dto)
     }
@@ -63,21 +70,6 @@ fn persist_to(path: &Path, dto: &SettingsDto) -> Result<()> {
     std::fs::write(&tmp, json).context("写设置临时文件失败")?;
     std::fs::rename(&tmp, path).context("替换设置文件失败")?;
     Ok(())
-}
-
-/// 已废弃的中继地址 → 现用默认中继。中继搬家后，老 settings.json 里存着
-/// 旧地址会一直连不上（设置页只有用户主动改才会更新），这里在加载时
-/// 静默搬过来并写回。用户自定义的其它 URL 一律不碰。
-fn migrate_stale_relay(dto: &mut SettingsDto, path: &Path) {
-    const STALE: &str = "https://sync.ashu180.top:8444";
-    if dto.relay_url.as_deref() == Some(STALE) {
-        let new_url = SettingsDto::default().relay_url.unwrap_or_default();
-        tracing::info!("settings.json 里的中继已迁移: {STALE} -> {new_url}");
-        dto.relay_url = SettingsDto::default().relay_url;
-        if let Err(e) = persist_to(path, dto) {
-            tracing::warn!("迁移后的设置写盘失败: {e:#}");
-        }
-    }
 }
 
 /// 只覆盖补丁里出现的字段。
@@ -99,13 +91,15 @@ fn apply_patch(s: &mut SettingsDto, p: SettingsPatch) {
     }
     // 双层 Option：外层 None = 不改；Some(None) = 清空
     if let Some(v) = p.relay_url {
-        s.relay_url = v;
+        s.relay_url = v.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
     }
     if let Some(v) = p.network_mode {
         s.network_mode = v;
     }
-    if let Some(v) = p.listen_port {
-        s.listen_port = v;
+    if let Some(v) = p.ssh_port
+        && v > 0
+    {
+        s.ssh_port = v;
     }
     if let Some(v) = p.default_ignore {
         s.default_ignore = v;
@@ -141,10 +135,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_null_clears_optional_fields() {
+    fn explicit_null_clears_relay() {
         let mut s = SettingsDto {
-            relay_url: Some("https://relay.example".into()),
-            listen_port: Some(4433),
+            relay_url: Some("tcp://relay.example:9443".into()),
             ..Default::default()
         };
 
@@ -152,13 +145,11 @@ mod tests {
             &mut s,
             SettingsPatch {
                 relay_url: Some(None),
-                listen_port: Some(None),
                 ..Default::default()
             },
         );
 
         assert_eq!(s.relay_url, None);
-        assert_eq!(s.listen_port, None);
     }
 
     #[test]
@@ -171,6 +162,7 @@ mod tests {
             .update(SettingsPatch {
                 device_name: Some("测试机".into()),
                 upload_limit_kbps: Some(1024),
+                ssh_port: Some(2223),
                 ..Default::default()
             })
             .unwrap();
@@ -179,43 +171,29 @@ mod tests {
         let s = reloaded.get();
         assert_eq!(s.device_name, "测试机");
         assert_eq!(s.upload_limit_kbps, 1024);
+        assert_eq!(s.ssh_port, 2223);
     }
 
     #[test]
-    fn stale_relay_url_migrates_to_default() {
+    fn old_settings_without_ssh_port_still_load() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        // SettingsDto 反序列化要求全字段（真实 settings.json 由 persist 写出，满足）。
-        // 注意 relay_url 用 null 会被当成 None（= 官方中继），所以这里必须写字符串。
-        let full = SettingsDto {
-            relay_url: Some("https://sync.ashu180.top:8444".into()),
-            ..Default::default()
-        };
-        std::fs::write(&path, serde_json::to_string(&full).unwrap()).unwrap();
+        // iroh 时代的设置文件：没有 ssh_port，多了 listen_port
+        std::fs::write(
+            &path,
+            r#"{"device_name":"老电脑","listen_port":null,"log_level":"debug","relay_url":"http://36.137.140.126:8444"}"#,
+        )
+        .unwrap();
 
         let store = SettingsStore::load(&path).unwrap();
         let s = store.get();
+        assert_eq!(s.device_name, "老电脑");
+        assert_eq!(s.log_level, "debug");
+        assert_eq!(s.ssh_port, fs_sync_net::env::default_ssh_port());
         assert_eq!(
-            s.relay_url,
-            SettingsDto::default().relay_url,
-            "旧中继地址应自动换成新默认值"
-        );
-
-        // 已写回磁盘：重新加载不再含旧地址
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("sync.ashu180.top"), "应写回: {text}");
-
-        // 用户自定义的其它 URL 不碰
-        let custom = SettingsDto {
-            relay_url: Some("https://my-own-relay.example:9000".into()),
-            ..Default::default()
-        };
-        std::fs::write(&path, serde_json::to_string(&custom).unwrap()).unwrap();
-        let store = SettingsStore::load(&path).unwrap();
-        assert_eq!(
-            store.get().relay_url,
-            Some("https://my-own-relay.example:9000".into()),
-            "用户自定义 URL 不应被迁移"
+            s.relay_url.as_deref(),
+            Some("tcp://36.137.140.126:8444"),
+            "旧 iroh http 地址应迁移成新 SSH 中继地址"
         );
     }
 

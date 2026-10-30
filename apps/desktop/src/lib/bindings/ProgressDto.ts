@@ -4,11 +4,11 @@ import type { Direction } from "./Direction";
 /**
  * 单文件进度事件（`sync://progress`，每文件每 200ms 至多一次）。
  */
-export type ProgressDto = { folder_id: string, path: string, 
+export type ProgressDto = { folder_id: string, path: string,
 /**
  * 已传输字节
  */
-done: number, 
+done: number,
 /**
  * 总字节
  */

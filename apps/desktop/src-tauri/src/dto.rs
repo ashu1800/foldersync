@@ -8,7 +8,7 @@ use ts_rs::TS;
 
 /// 统一错误返回。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct ErrorDto {
     /// 机器可读的错误码（前端据此做本地化）
     pub code: String,
@@ -42,7 +42,7 @@ pub type CmdResult<T> = Result<T, ErrorDto>;
 /// 全局总状态（概览页顶部）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum OverallStatus {
     /// 全部已同步
     Synced,
@@ -57,13 +57,11 @@ pub enum OverallStatus {
 /// 连接方式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum ConnKind {
-    /// 直连（打洞成功）
-    Direct,
-    /// 经中继
+    /// 经中继服务器
     Relay,
-    /// 经 Tailscale
+    /// 经 Tailscale 的 SSH/SFTP
     Tailscale,
     /// 未知/未连接
     Unknown,
@@ -71,9 +69,9 @@ pub enum ConnKind {
 
 /// 设备信息。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct DeviceDto {
-    /// EndpointId（hex）
+    /// SSH 公钥指纹（设备 ID）
     pub id: String,
     /// 设备显示名
     pub name: String,
@@ -86,12 +84,18 @@ pub struct DeviceDto {
     /// 往返延迟（毫秒），未知为 None
     #[ts(type = "number | null")]
     pub rtt_ms: Option<u64>,
+    /// Tailscale 地址（第一个）
+    pub address: Option<String>,
+    /// SSH 端口
+    pub port: u16,
+    /// 是否已配置中继房间
+    pub relay_ready: bool,
 }
 
 /// 文件夹状态。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum FolderStatus {
     /// 空闲（已同步）
     Idle,
@@ -107,7 +111,7 @@ pub enum FolderStatus {
 
 /// 文件夹信息。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct FolderDto {
     pub id: String,
     pub name: String,
@@ -129,13 +133,13 @@ pub struct FolderDto {
 
 /// 概览数据。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct OverviewDto {
     pub status: OverallStatus,
     /// 本机设备名
     pub device_name: String,
-    /// 本机 EndpointId
-    pub endpoint_id: String,
+    /// 本机 SSH 设备 ID
+    pub device_id: String,
     /// 本机指纹
     pub fingerprint: String,
     /// Tailscale 状态描述（如 `ashu.tail7ebaff.ts.net (100.81.188.46)`），未启用为 None
@@ -153,7 +157,7 @@ pub struct OverviewDto {
 /// 活动条目类型。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum ActivityKind {
     Upload,
     Download,
@@ -165,7 +169,7 @@ pub enum ActivityKind {
 
 /// 活动条目。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct ActivityDto {
     /// 自增 id（游标分页用）
     #[ts(type = "number")]
@@ -186,7 +190,7 @@ pub struct ActivityDto {
 
 /// 活动查询过滤。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/", optional_fields)]
+#[ts(export_to = "../../src/lib/bindings/", optional_fields)]
 pub struct ActivityFilter {
     #[ts(optional)]
     pub folder_id: Option<String>,
@@ -202,7 +206,7 @@ pub struct ActivityFilter {
 
 /// 冲突文件。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct ConflictDto {
     /// 冲突副本的相对路径
     pub id: String,
@@ -230,7 +234,7 @@ pub struct ConflictDto {
 /// 冲突解决方式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum ConflictResolution {
     /// 保留冲突副本（覆盖原文件）
     KeepConflict,
@@ -242,7 +246,7 @@ pub enum ConflictResolution {
 
 /// 文件树节点（文件夹详情页只读浏览）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct TreeNodeDto {
     /// 相对路径
     pub path: String,
@@ -264,7 +268,7 @@ pub struct TreeNodeDto {
 /// 单文件同步状态。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum FileState {
     /// 已同步
     Synced,
@@ -284,7 +288,7 @@ pub enum FileState {
 
 /// 配对码信息。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct PairingCodeDto {
     /// 可直接分享的配对码字符串
     pub code: String,
@@ -300,7 +304,7 @@ pub struct PairingCodeDto {
 
 /// 待确认的配对请求。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct PendingPairingDto {
     pub request_id: String,
     pub device_name: String,
@@ -312,7 +316,7 @@ pub struct PendingPairingDto {
 
 /// 收到的共享邀请。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct InviteDto {
     pub invite_id: String,
     pub folder_id: String,
@@ -329,7 +333,7 @@ pub struct InviteDto {
 
 /// 忽略规则配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct IgnoreRulesDto {
     /// 是否启用内置默认规则
     pub use_defaults: bool,
@@ -340,21 +344,72 @@ pub struct IgnoreRulesDto {
 }
 
 /// 网络模式。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum NetworkMode {
-    /// 自动（优先打洞，失败走中继）
+    /// 自动：Tailscale 可用就走 SFTP 直连，否则走中继
+    #[default]
     Auto,
-    /// 优先 Tailscale
-    PreferTailscale,
-    /// 仅 Tailscale
-    TailscaleOnly,
+    /// 仅 Tailscale（SSH/SFTP 直连）
+    Tailscale,
+    /// 仅中继服务器
+    Relay,
+}
+
+impl From<NetworkMode> for fs_sync_net::conn::NetworkMode {
+    fn from(m: NetworkMode) -> Self {
+        match m {
+            NetworkMode::Auto => Self::Auto,
+            NetworkMode::Tailscale => Self::Tailscale,
+            NetworkMode::Relay => Self::Relay,
+        }
+    }
+}
+
+/// 本机网络/SSH 环境状态（首次引导用）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "../../src/lib/bindings/")]
+pub struct EnvStatusDto {
+    pub ssh_ready: bool,
+    pub ssh_port: u16,
+    pub firewall_ok: bool,
+    pub tailscale_installed: bool,
+    pub tailscale_running: bool,
+    pub tailscale_ips: Vec<String>,
+    pub tailscale_hostname: Option<String>,
+    pub relay_configured: bool,
+    pub relay_reachable: bool,
+    /// 至少有一种可用传输方式
+    pub ready: bool,
+    /// `install_tailscale` / `tailscale_login` / `setup_relay` / `check_relay` / `repair_ssh` / `repair_firewall`
+    pub suggestions: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl From<fs_sync_net::env::EnvStatus> for EnvStatusDto {
+    fn from(s: fs_sync_net::env::EnvStatus) -> Self {
+        Self {
+            ssh_ready: s.ssh_ready,
+            ssh_port: s.ssh_port,
+            firewall_ok: s.firewall_ok,
+            tailscale_installed: s.tailscale.installed,
+            tailscale_running: s.tailscale.running,
+            tailscale_ips: s.tailscale.ips,
+            tailscale_hostname: s.tailscale.hostname,
+            relay_configured: s.relay_configured,
+            relay_reachable: s.relay_reachable,
+            ready: s.ready,
+            suggestions: s.suggestions,
+            notes: s.notes,
+        }
+    }
 }
 
 /// 应用设置。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[serde(default)]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct SettingsDto {
     pub device_name: String,
     /// 开机自启
@@ -365,11 +420,11 @@ pub struct SettingsDto {
     pub upload_limit_kbps: u32,
     /// 下载限速（KB/s），0 = 不限
     pub download_limit_kbps: u32,
-    /// 自定义中继 URL（None = 用默认）
+    /// 中继服务器地址（`tcp://IP:9443`），None = 未配置
     pub relay_url: Option<String>,
     pub network_mode: NetworkMode,
-    /// 固定监听端口（None = 随机）
-    pub listen_port: Option<u16>,
+    /// 本机 SSH 服务端口
+    pub ssh_port: u16,
     /// 全局默认忽略规则（新建文件夹时套用）
     pub default_ignore: Vec<String>,
     /// 日志级别：error/warn/info/debug/trace
@@ -384,10 +439,10 @@ impl Default for SettingsDto {
             close_to_tray: true,
             upload_limit_kbps: 0,
             download_limit_kbps: 0,
-            // 自建中继（36.137.140.126，国内，纯 HTTP）。改成 None 会退回 iroh 官方中继。
+            // 官方自建中继；用户可在设置页清空或改成自己的服务器
             relay_url: Some(fs_sync_net::DEFAULT_RELAY_URL.to_string()),
             network_mode: NetworkMode::Auto,
-            listen_port: None,
+            ssh_port: fs_sync_net::env::default_ssh_port(),
             default_ignore: Vec::new(),
             log_level: "info".into(),
         }
@@ -396,7 +451,7 @@ impl Default for SettingsDto {
 
 /// 设置补丁（只更新提供的字段）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/", optional_fields)]
+#[ts(export_to = "../../src/lib/bindings/", optional_fields)]
 pub struct SettingsPatch {
     pub device_name: Option<String>,
     pub auto_start: Option<bool>,
@@ -407,9 +462,7 @@ pub struct SettingsPatch {
     #[ts(optional, type = "string | null")]
     pub relay_url: Option<Option<String>>,
     pub network_mode: Option<NetworkMode>,
-    #[serde(default, with = "double_option")]
-    #[ts(optional, type = "number | null")]
-    pub listen_port: Option<Option<u16>>,
+    pub ssh_port: Option<u16>,
     pub default_ignore: Option<Vec<String>>,
     pub log_level: Option<String>,
 }
@@ -440,7 +493,7 @@ mod double_option {
 
 /// 新建文件夹请求。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct AddFolderRequest {
     pub path: String,
     /// 分享给哪些设备
@@ -450,7 +503,7 @@ pub struct AddFolderRequest {
 
 /// 单文件进度事件（`sync://progress`，每文件每 200ms 至多一次）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct ProgressDto {
     pub folder_id: String,
     pub path: String,
@@ -465,7 +518,7 @@ pub struct ProgressDto {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub enum Direction {
     Upload,
     Download,
@@ -473,14 +526,14 @@ pub enum Direction {
 
 /// 设备状态事件（`device://status`）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct DeviceStatusEvent {
     pub device: DeviceDto,
 }
 
 /// 文件夹状态事件（`folder://status`）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../src/lib/bindings/")]
+#[ts(export_to = "../../src/lib/bindings/")]
 pub struct FolderStatusEvent {
     pub folder: FolderDto,
 }
@@ -506,10 +559,6 @@ mod tests {
     #[test]
     fn conn_kind_variants_are_stable() {
         // 前端依赖这些字符串，改动即破坏兼容
-        assert_eq!(
-            serde_json::to_string(&ConnKind::Direct).unwrap(),
-            "\"direct\""
-        );
         assert_eq!(
             serde_json::to_string(&ConnKind::Relay).unwrap(),
             "\"relay\""

@@ -5,11 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-iroh.workspace = true
-iroh-blobs = { version = "0.103.1", features = ["fs-store"] }
+russh.workspace = true
+russh-sftp.workspace = true
+rand010.workspace = true
 blake3.workspace = true
 fs-sync-core.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

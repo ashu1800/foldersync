@@ -23,11 +23,27 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// 已配对设备。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Device {
-    /// iroh EndpointId（32 字节公钥 hex）
+    /// SSH 公钥 SHA256 指纹（设备 ID）
     pub id: String,
     pub name: String,
     /// 配对时间（Unix 秒）
     pub paired_at: i64,
+    /// 对端 `authorized_keys` 公钥
+    pub ssh_public_key: String,
+    /// 对端 SSH 服务端主机公钥
+    pub host_key: String,
+    /// SSH 登录用户名（应用专用）
+    pub username: String,
+    /// Tailscale 地址（IP / MagicDNS）
+    pub addresses: Vec<String>,
+    /// SSH 服务端端口
+    pub port: u16,
+    /// 中继地址
+    pub relay_url: Option<String>,
+    /// 中继房间 ID
+    pub relay_room: Option<String>,
+    /// 中继房间口令
+    pub relay_secret: Option<String>,
 }
 
 /// 同步文件夹。
@@ -92,7 +108,15 @@ impl Store {
             CREATE TABLE IF NOT EXISTS devices (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                paired_at INTEGER NOT NULL
+                paired_at INTEGER NOT NULL,
+                ssh_public_key TEXT NOT NULL DEFAULT '',
+                host_key TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT 'foldersync',
+                addresses TEXT NOT NULL DEFAULT '[]',
+                port INTEGER NOT NULL DEFAULT 2222,
+                relay_url TEXT,
+                relay_room TEXT,
+                relay_secret TEXT
             );
             CREATE TABLE IF NOT EXISTS folders (
                 id TEXT PRIMARY KEY,
@@ -129,6 +153,20 @@ impl Store {
             );
             "#,
         )?;
+        // 老版本（iroh）数据库升级：补 SSH 相关列。SQLite 没有 ADD COLUMN IF NOT EXISTS，
+        // 先查 PRAGMA 再逐个补，失败只可能是已存在。
+        for (name, ddl) in [
+            ("ssh_public_key", "TEXT NOT NULL DEFAULT ''"),
+            ("host_key", "TEXT NOT NULL DEFAULT ''"),
+            ("username", "TEXT NOT NULL DEFAULT 'foldersync'"),
+            ("addresses", "TEXT NOT NULL DEFAULT '[]'"),
+            ("port", "INTEGER NOT NULL DEFAULT 2222"),
+            ("relay_url", "TEXT"),
+            ("relay_room", "TEXT"),
+            ("relay_secret", "TEXT"),
+        ] {
+            ensure_column(conn, "devices", name, ddl)?;
+        }
         Ok(())
     }
 
@@ -137,22 +175,60 @@ impl Store {
     pub fn upsert_device(&self, d: &Device) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO devices (id, name, paired_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET name = ?2",
-            rusqlite::params![d.id, d.name, d.paired_at],
+            "INSERT INTO devices
+                (id, name, paired_at, ssh_public_key, host_key, username, addresses, port, relay_url, relay_room, relay_secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                name = ?2, paired_at = ?3, ssh_public_key = ?4, host_key = ?5,
+                username = ?6, addresses = ?7, port = ?8,
+                relay_url = ?9, relay_room = ?10, relay_secret = ?11",
+            rusqlite::params![
+                d.id,
+                d.name,
+                d.paired_at,
+                d.ssh_public_key,
+                d.host_key,
+                d.username,
+                serde_json::to_string(&d.addresses)?,
+                d.port,
+                d.relay_url,
+                d.relay_room,
+                d.relay_secret
+            ],
         )?;
         Ok(())
     }
 
     pub fn list_devices(&self) -> Result<Vec<Device>> {
         let conn = self.lock();
-        let mut st = conn.prepare("SELECT id, name, paired_at FROM devices ORDER BY name")?;
+        let mut st = conn.prepare(
+            "SELECT id, name, paired_at, ssh_public_key, host_key, username, addresses, port,
+                    relay_url, relay_room, relay_secret
+             FROM devices ORDER BY name",
+        )?;
         let rows = st
             .query_map([], |r| {
+                let addresses_json: Option<String> = r.get(6)?;
                 Ok(Device {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     paired_at: r.get(2)?,
+                    // 旧 iroh 设备行这些列是 NULL：给安全默认值，让 UI 能列出并删除
+                    ssh_public_key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    host_key: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    username: r
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "foldersync".into()),
+                    addresses: addresses_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
+                    port: r
+                        .get::<_, Option<i64>>(7)?
+                        .map(|p| p as u16)
+                        .unwrap_or(2222),
+                    relay_url: r.get(8)?,
+                    relay_room: r.get(9)?,
+                    relay_secret: r.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -325,6 +401,17 @@ impl Store {
     }
 
     /// 一次性消费 token：存在且未过期则删除并返回 true。
+    /// 只校验不消费（SSH 密码认证阶段用；真正消费在配对请求处理时）。
+    pub fn validate_pairing_token(&self, token: &str, now: i64) -> Result<bool> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pairing_tokens WHERE token = ?1 AND expires_at >= ?2",
+            rusqlite::params![token, now],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn consume_pairing_token(&self, token: &str, now: i64) -> Result<bool> {
         let conn = self.lock();
         let n = conn.execute(
@@ -349,6 +436,19 @@ impl Store {
         )?;
         Ok(n as u32)
     }
+}
+
+fn ensure_column(conn: &Connection, table: &str, name: &str, ddl: &str) -> Result<()> {
+    let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == name);
+    drop(st);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {ddl}"), [])?;
+    }
+    Ok(())
 }
 
 fn insert_entry(conn: &Connection, folder_id: &str, e: &FileEntry) -> Result<()> {
@@ -400,26 +500,36 @@ mod tests {
         e
     }
 
+    fn sample_device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            paired_at: 100,
+            ssh_public_key: "ssh-ed25519 AAAA".into(),
+            host_key: "ssh-ed25519 BBBB".into(),
+            username: "foldersync".into(),
+            addresses: vec!["100.64.0.2".into()],
+            port: 2222,
+            relay_url: Some("tcp://relay:9443".into()),
+            relay_room: Some("room".into()),
+            relay_secret: Some("secret".into()),
+        }
+    }
+
     #[test]
     fn device_crud() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_device(&Device {
-            id: "a".repeat(64),
-            name: "home-pc".into(),
-            paired_at: 100,
-        })
-        .unwrap();
+        s.upsert_device(&sample_device(&"a".repeat(64), "home-pc"))
+            .unwrap();
         let devs = s.list_devices().unwrap();
         assert_eq!(devs.len(), 1);
         assert_eq!(devs[0].name, "home-pc");
+        assert_eq!(devs[0].addresses, vec!["100.64.0.2".to_string()]);
+        assert_eq!(devs[0].port, 2222);
 
         // 重命名 = upsert
-        s.upsert_device(&Device {
-            id: "a".repeat(64),
-            name: "renamed".into(),
-            paired_at: 100,
-        })
-        .unwrap();
+        s.upsert_device(&sample_device(&"a".repeat(64), "renamed"))
+            .unwrap();
         assert_eq!(s.list_devices().unwrap()[0].name, "renamed");
 
         s.remove_device(&"a".repeat(64)).unwrap();

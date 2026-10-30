@@ -3,11 +3,11 @@
 /**
  * 统一错误返回。
  */
-export type ErrorDto = { 
+export type ErrorDto = {
 /**
  * 机器可读的错误码（前端据此做本地化）
  */
-code: string, 
+code: string,
 /**
  * 人类可读的描述（已本地化）
  */

@@ -3,35 +3,35 @@
 /**
  * 冲突文件。
  */
-export type ConflictDto = { 
+export type ConflictDto = {
 /**
  * 冲突副本的相对路径
  */
-id: string, folder_id: string, 
+id: string, folder_id: string,
 /**
  * 原文件路径
  */
-original_path: string, 
+original_path: string,
 /**
  * 冲突副本路径
  */
-conflict_path: string, 
+conflict_path: string,
 /**
  * 副本大小
  */
-conflict_size: number, 
+conflict_size: number,
 /**
  * 原始大小（本地不存在则为 None）
  */
-original_size: number | null, 
+original_size: number | null,
 /**
  * 副本修改时间（Unix 秒）
  */
-conflict_mtime: number, 
+conflict_mtime: number,
 /**
  * 原始修改时间
  */
-original_mtime: number | null, 
+original_mtime: number | null,
 /**
  * 副本来源设备名（从文件名解析）
  */

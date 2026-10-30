@@ -2,13 +2,16 @@
 //!
 //! 帧格式：`u32` 大端长度 + postcard 编码的 `Message`。
 //! 所有消息携带 `protocol_version`，不匹配即报错断连。
+//!
+//! v2 起不再有 iroh：控制消息走 SSH 的 `foldersync` 子系统，
+//! 文件内容走 SFTP，按 blake3 hash 取。
 
 use serde::{Deserialize, Serialize};
 
 use fs_sync_core::FileEntry;
 
 /// 当前协议版本。
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// 文件夹摘要（Hello 中交换）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,19 +20,49 @@ pub struct FolderSummary {
     pub name: String,
 }
 
-/// 配对请求（设备 B → A）：token + 自己的名字。
+/// 一台设备的完整配对信息。
+///
+/// 配对码只带“发起方”的这一份；配对请求/响应各带一份。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInfo {
+    /// SSH 公钥 SHA256 指纹（设备 ID）
+    pub device_id: String,
+    pub device_name: String,
+    /// `authorized_keys` 一行格式
+    pub ssh_public_key: String,
+    /// 对端 SSH 服务端主机公钥（首次连接时校验）
+    pub host_key: String,
+    /// SSH 登录用户名（应用专用账号名，不映射到系统账号）
+    pub username: String,
+    /// SSH 服务端端口
+    pub port: u16,
+    /// Tailscale 地址（IP 或 MagicDNS 名），可为空
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// 双方约定的中继服务器地址（`tcp://host:port`）
+    #[serde(default)]
+    pub relay: Option<String>,
+    /// 中继房间 ID（配对成功后由发起方生成）
+    #[serde(default)]
+    pub relay_room: Option<String>,
+    /// 中继房间口令
+    #[serde(default)]
+    pub relay_secret: Option<String>,
+}
+
+/// 配对请求（设备 B → A）：token + B 的 SSH 身份与地址。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingRequest {
     pub token: String,
-    pub device_name: String,
+    pub peer: PeerInfo,
 }
 
 /// 配对结果（A → B）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingResponse {
     pub accepted: bool,
-    /// 接受时返回 A 的设备名，供 B 显示
-    pub device_name: String,
+    /// 接受时返回 A 的设备信息（含中继房间）；拒绝时为空。
+    pub peer: PeerInfo,
 }
 
 /// 文件夹共享邀请（提示词 4.3）。
@@ -47,7 +80,7 @@ pub struct FolderInviteResponse {
     pub accepted: bool,
 }
 
-/// FolderSync 控制消息（ALPN `/foldersync/1`）。
+/// FolderSync 控制消息（SSH 子系统 `foldersync`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     Hello {
@@ -60,16 +93,10 @@ pub enum Message {
         folder_id: String,
         entries: Vec<FileEntry>,
     },
-    /// 增量更新
+    /// 增量更新（实际文件内容走 SFTP，按 hash 拉取）
     IndexUpdate {
         folder_id: String,
         entries: Vec<FileEntry>,
-    },
-    /// 请求文件内容（实际数据走 iroh-blobs，按 hash）
-    Request {
-        folder_id: String,
-        path: String,
-        hash: String,
     },
     PairingRequest(PairingRequest),
     PairingResponse(PairingResponse),
@@ -133,6 +160,18 @@ mod tests {
             version: vv,
             modified_by: "dev-a".into(),
         }];
+        let peer = PeerInfo {
+            device_id: "SHA256:abc".into(),
+            device_name: "home".into(),
+            ssh_public_key: "ssh-ed25519 AAAA test".into(),
+            host_key: "ssh-ed25519 BBBB".into(),
+            username: "foldersync".into(),
+            port: 2222,
+            addrs: vec!["100.64.0.1".into()],
+            relay: Some("tcp://relay:9443".into()),
+            relay_room: Some("room".into()),
+            relay_secret: Some("secret".into()),
+        };
         let msgs = vec![
             Message::Hello {
                 protocol_version: PROTOCOL_VERSION,
@@ -150,18 +189,13 @@ mod tests {
                 folder_id: "f1".into(),
                 entries,
             },
-            Message::Request {
-                folder_id: "f1".into(),
-                path: "a.txt".into(),
-                hash: "ab".repeat(32),
-            },
             Message::PairingRequest(PairingRequest {
                 token: "tok".into(),
-                device_name: "b".into(),
+                peer: peer.clone(),
             }),
             Message::PairingResponse(PairingResponse {
                 accepted: true,
-                device_name: "a".into(),
+                peer,
             }),
             Message::FolderInvite(FolderInvite {
                 folder_id: "f1".into(),

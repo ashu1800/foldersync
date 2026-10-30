@@ -1,8 +1,9 @@
 // 共享 UI 组件：小、无依赖、各页面复用。
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { ConnKind, FolderStatus, OverallStatus } from "../lib/bindings";
+import * as api from "../lib/tauri";
 
 // ---------- 状态占位 ----------
 
@@ -147,17 +148,54 @@ export function FolderBadge({ status }: { status: FolderStatus }) {
 export function ConnBadge({ conn, rtt }: { conn: ConnKind; rtt?: number | null }) {
   const { t } = useTranslation();
   const label = t(`devices.${conn}`);
-  const cls =
-    conn === "direct"
-      ? "badge-success"
-      : conn === "relay" || conn === "tailscale"
-        ? "badge-muted"
-        : "badge-muted";
+  const cls = conn === "tailscale" ? "badge-success" : "badge-muted";
   return (
     <span className={`badge ${cls}`}>
       {label}
       {rtt != null && ` · ${rtt}ms`}
     </span>
+  );
+}
+
+/** 中继服务器搭建步骤（Markdown 原文按等宽文本展示）。 */
+export function RelayGuideModal({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation();
+  const [guide, setGuide] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const text = await api.getRelayGuide();
+        if (!cancelled) setGuide(text);
+      } catch (e) {
+        if (!cancelled) setError(api.asCmdError(e).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Modal
+      title={t("settings.relayGuideTitle")}
+      onClose={onClose}
+      width={640}
+      footer={
+        <button className="btn" onClick={onClose}>
+          {t("common.close")}
+        </button>
+      }
+    >
+      {error && <ErrorBanner message={error} />}
+      {guide ? (
+        <pre className="guide-pre">{guide}</pre>
+      ) : (
+        !error && <Loading text={t("app.loading")} />
+      )}
+    </Modal>
   );
 }
 

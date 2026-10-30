@@ -399,3 +399,32 @@ healthz 从本地实测 200。
 
 **旧机处置**：66.42.99.110 上的 iroh-relay 先留着（没有 DNS 指过去，客户端
 默认已不再指向它），观察新中继稳定一周后可下线。
+
+## 2026-10-30 从 iroh 迁移到 SSH/SFTP + 中继
+
+**背景**：iroh 1.4 + iroh-blobs 的跨网/跨境链路反复受到中继质量与 UDP 可达性影响，配对超时和连接不稳的问题难以靠调参收敛。Tailscale 已经能提供稳定的 NAT 穿透，文件同步真正需要的只是一个「按 hash 可靠取文件」的通道；把网络层收敛到系统级、可运维的 SSH/SFTP，比继续维护 iroh 的中继、QAD 和打洞逻辑更简单。
+
+**决策**：
+
+1. 删除 iroh / iroh-blobs，网络层改为 `russh` 0.65（嵌入应用的 SSH 服务端与客户端）+ `russh-sftp` 3.0.1。每台设备既是 SSH 服务端也是客户端。
+2. 设备身份从 iroh `SecretKey` 改为 SSH 密钥对：首次启动生成 `~/.foldersync/ssh_identity` 和 `~/.foldersync/ssh_host_ed25519`（Unix 0600；Windows 依赖用户目录 ACL）。设备 ID = SSH 公钥的 SHA256 指纹。
+3. 配对码为 `foldersync:<base64url(JSON)>`，携带发起方 `PeerInfo`（SSH 公钥、主机公钥、用户名、端口、Tailscale 地址、中继地址）、一次性 token 和 5 分钟有效期。加入方用 token 做 SSH 密码认证，走 `foldersync-pair` 子系统提交自己的 `PeerInfo`；双方把对端公钥写入信任列表，之后只用公钥认证。
+4. 文件内容按 blake3 寻址：SFTP 根目录为 `<data>/share`，blob 存放在 `<data>/share/blobs/<blake3>`。对端通过 SFTP 按 hash 拉取，落盘前重新校验 blake3；控制消息走 SSH 子系统 `foldersync`，文件内容不塞进控制帧。
+5. 默认 SSH 端口改为 2222，避开系统 sshd 的 22。Windows 安装钩子（`installer.nsh`）为程序添加 `FolderSync SSH` 的 TCP 2222 入站规则，并额外做程序级 TCP 放行；不再添加 iroh 需要的 UDP 规则。安装模式仍为 `currentUser`；没有管理员权限时 netsh 可能失败，设置页「初始化/修复 SSH 环境」会用 UAC 再试一次。
+6. 网络模式提供 `auto` / `tailscale` / `relay`：`auto` 在 Tailscale 可用时走 SFTP 直连，否则走中继；`tailscale` 只直连；`relay` 只走中继。Tailscale 方案要求两台电脑登录同一 tailnet，并放行本机 TCP 2222。
+7. 中继方案新增独立二进制 `foldersync-relay`（`apps/relay`）。服务端按房间隔离 SFTP：房间 ID = `blake3(口令)`，SSH 用户名 = 房间 ID、密码 = 房间口令；服务端只校验 `blake3(口令) == 房间 ID`，无需预注册。默认监听 TCP 9443，客户端只主动出站连接，不需要在客户端开放入站端口。
+8. 中继房间目录布局为 `rooms/<room-id>/devices/<device-id>/index.json` 和 `.../blobs/<blake3>`；索引原子写（临时文件 + rename），文件按 hash 寻址。中继同步轮询间隔 1 秒。
+
+**安全边界**：中继是**自建可信服务器**，不是端到端加密存储方案。SSH/SFTP 保护的是传输链路；客户端上传的文件以普通文件形式落在中继服务器磁盘上，应用层没有额外加密，服务器管理员或入侵者可以读取。部署方必须自行负责磁盘加密、文件权限、备份、访问控制和防火墙。房间隔离由 SFTP 沙箱保证（禁止绝对路径、`..` 和符号链接），但知道房间口令的人都能进入同一个房间。
+
+**迁移影响**：
+
+- 旧 `secret.key`、iroh 信任列表和协议 v1 都不再使用；新旧版本无法互通，双方升级后需要重新配对。
+- `state.sqlite3` 里的历史活动与索引数据可以保留，但旧的设备信任记录使用的是 iroh 身份，不再匹配新的 SSH 指纹，需要重新配对。
+- 历史 iroh 实测数据只代表旧架构，不再作为当前版本的指标；README 已删除 iroh 版本表和 iroh 时代的实测表。
+
+**不采用的方案**：
+
+- 继续修补 iroh 的中继/QAD：维护成本高、跨网络行为不可控，而且依赖 UDP。
+- 用第三方云盘中转：违背「不依赖第三方云盘」的项目目标。
+- 在中继上做端到端加密层：当前目标只是自建可信服务器，SSH/SFTP 已覆盖传输安全；若未来要防服务器管理员，另做客户端加密，不在本次范围。

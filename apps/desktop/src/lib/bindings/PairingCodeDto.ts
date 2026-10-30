@@ -3,19 +3,19 @@
 /**
  * 配对码信息。
  */
-export type PairingCodeDto = { 
+export type PairingCodeDto = {
 /**
  * 可直接分享的配对码字符串
  */
-code: string, 
+code: string,
 /**
  * 过期时间（Unix 秒）
  */
-expires_at: number, 
+expires_at: number,
 /**
  * 剩余秒数
  */
-ttl_seconds: number, 
+ttl_seconds: number,
 /**
  * 二维码内容（与 code 相同，单独给出便于前端渲染）
  */

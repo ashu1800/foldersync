@@ -102,7 +102,7 @@ gh release download v0.2.0 -p latest.json -O - | head -30
 1. 打开应用 → 设置 → 检查更新
 2. 应显示"发现新版本 0.2.0"
 3. 点「下载并安装」→ 自动重启 → 版本变成 0.2.0
-4. **确认 `~/.foldersync/` 里的 `secret.key` 没变**（设备身份不能丢）
+4. **确认 `~/.foldersync/` 里的 `ssh_identity` 与 `ssh_host_ed25519` 没变**（设备身份与主机密钥不能丢）
 
 ## 出问题怎么办
 

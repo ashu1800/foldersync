@@ -1,14 +1,13 @@
 //! FolderSync 桌面端入口。
 //!
-//! 组装顺序：加载设置 → 启动 daemon（端点/存储/信任/配对）→ 恢复文件夹监听
-//! → 启动对等连接循环 → 建托盘 → 打开主窗口（提示词 5.1 / 5.2）。
+//! 组装顺序：加载设置 → 初始化 SSH 环境/存储/信任/配对 → 恢复文件夹监听
+//! → 启动 SSH 服务端与对等连接循环 → 建托盘 → 打开主窗口。
 
 pub mod bindings;
 pub mod commands;
 pub mod diagnostics;
 pub mod dto;
 pub mod limits;
-pub mod protocol;
 pub mod settings;
 pub mod state;
 
@@ -32,7 +31,6 @@ fn default_data_dir() -> std::path::PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 日志同时写终端与文件（M6：日志与诊断包导出）
     let data_dir = default_data_dir();
     let log_guard = diagnostics::init(&data_dir.join("logs"), "info")
         .unwrap_or_else(|e| panic!("日志初始化失败: {e:#}"));
@@ -47,74 +45,30 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            // 日志 guard 必须活得比进程长，否则文件写入会立刻停
             std::mem::forget(log_guard);
             info!(dir = %data_dir.display(), "启动 FolderSync");
-            // 开机自启（提示词 5.1）：设置里开着就登记，关着就撤销。
-            // 失败只记日志——注册表被策略锁住时不该让应用起不来。
-            {
-                use tauri_plugin_autostart::ManagerExt;
-                let want = app
-                    .try_state::<Arc<AppState>>()
-                    .map(|s| s.settings_dto().auto_start)
-                    .unwrap_or(false);
-                let mgr = app.autolaunch();
-                let currently = mgr.is_enabled().unwrap_or(false);
-                if want && !currently {
-                    match mgr.enable() {
-                        Ok(()) => info!("已启用开机自启"),
-                        Err(e) => warn!("启用开机自启失败: {e}"),
-                    }
-                } else if !want && currently {
-                    match mgr.disable() {
-                        Ok(()) => info!("已关闭开机自启"),
-                        Err(e) => warn!("关闭开机自启失败: {e}"),
-                    }
-                }
-            }
 
-            // daemon 初始化是异步的，塞进 tokio 运行时
             let handle = app.handle().clone();
             let dir_for_init = data_dir.clone();
             tauri::async_runtime::spawn(async move {
-                match AppState::init(dir_for_init.clone()).await {
+                match AppState::init(dir_for_init).await {
                     Ok(st) => {
-                        // 恢复已登记的文件夹监听
+                        let want_auto_start = st.settings_dto().auto_start;
                         state::restore_folders(st.clone()).await;
-
-                        // 挂载 ALPN 协议处理器：没有这一步，对端无法连进来
-                        let events = make_event_sink(handle.clone());
-                        let server = protocol::DesktopServer {
-                            state: st.clone(),
-                            events: events.clone(),
-                        };
-                        let _router = iroh::protocol::Router::builder(st.endpoint.clone())
-                            .accept(fs_sync_net::ALPN, server)
-                            .accept(
-                                iroh_blobs::ALPN,
-                                iroh_blobs::BlobsProtocol::new(&st.blobs, None),
-                            )
-                            .spawn();
-
-                        // 对等连接循环：主动连每个已信任设备
-                        spawn_peer_loop(st.clone(), events);
-
                         handle.manage(st);
-                        info!("daemon 就绪（协议已挂载）");
+                        apply_autostart(&handle, want_auto_start);
+                        info!("daemon 就绪（SSH 服务端已启动）");
                     }
                     Err(e) => {
                         warn!("daemon 初始化失败: {e:#}");
-                        // 仍然 manage 一个状态，避免所有命令都返回 "state not managed"
                     }
                 }
             });
 
-            // 托盘
             build_tray(app)?;
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关闭窗口 → 最小化到托盘（提示词 5.1）
             if let WindowEvent::CloseRequested { api, .. } = event
                 && window.label() == "main"
             {
@@ -131,6 +85,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_overview,
+            commands::get_environment_status,
+            commands::repair_ssh_environment,
+            commands::open_tailscale_download,
+            commands::get_relay_guide,
             commands::list_devices,
             commands::create_pairing_code,
             commands::accept_pairing_code,
@@ -162,274 +120,21 @@ pub fn run() {
         .expect("Tauri 启动失败");
 }
 
-/// 构造事件发送器：把后端事件转发到前端。
-fn make_event_sink(app: tauri::AppHandle) -> protocol::EventSink {
-    Arc::new(move |name: &str, payload: serde_json::Value| {
-        let _ = tauri::Emitter::emit(&app, name, payload);
-    })
-}
-
-/// 对等连接循环：主动连每个已信任设备，交换索引并持续收发增量。
-///
-/// 断线后指数退避重连（提示词 4.8 / 7：断网再联网自动恢复）。
-fn spawn_peer_loop(state: Arc<AppState>, events: protocol::EventSink) {
-    tauri::async_runtime::spawn(async move {
-        let mut backoff = crate::state::Backoff::new();
-        loop {
-            let peers = state.trust.devices().unwrap_or_default();
-            for peer in peers {
-                let Ok(peer_id) = peer.id.parse::<iroh::EndpointId>() else {
-                    continue;
-                };
-                if peer_id == state.endpoint_id {
-                    continue;
-                }
-                let folder_ids: Vec<String> = {
-                    let guard = state.runtimes.lock().await;
-                    guard.keys().cloned().collect()
-                };
-                if folder_ids.is_empty() {
-                    // 没有文件夹就没必要连接，省电省流量
-                    continue;
-                }
-
-                match sync_round(&state, peer_id, &folder_ids, &events).await {
-                    Ok(()) => backoff.reset(),
-                    Err(e) => {
-                        tracing::debug!(peer = %peer.name, "同步会话结束: {e:#}");
-                        backoff.back_off();
-                    }
-                }
-            }
-            tokio::time::sleep(backoff.current()).await;
+/// 按设置启用/关闭开机自启（必须在 AppState 就绪后调用）。
+fn apply_autostart(app: &tauri::AppHandle, want: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let mgr = app.autolaunch();
+    let currently = mgr.is_enabled().unwrap_or(false);
+    if want && !currently {
+        match mgr.enable() {
+            Ok(()) => info!("已启用开机自启"),
+            Err(e) => warn!("启用开机自启失败: {e}"),
         }
-    });
-}
-
-/// 一轮同步会话：连上 → 发全量索引 → 持续收发，直到断线。
-async fn sync_round(
-    state: &Arc<AppState>,
-    peer_id: iroh::EndpointId,
-    folder_ids: &[String],
-    events: &protocol::EventSink,
-) -> anyhow::Result<()> {
-    use fs_sync_net::frame;
-    use fs_sync_net::message::Message;
-
-    let conn = state
-        .endpoint
-        .connect(peer_id, fs_sync_net::ALPN)
-        .await
-        .map_err(|e| anyhow::anyhow!("连接对端失败: {e}"))?;
-
-    // 报告连接方式（前端"直连/中继/经 Tailscale"）
-    let kind = match fs_sync_net::conn::classify_conn(&conn) {
-        Some(fs_sync_net::conn::ConnType::Direct) => dto::ConnKind::Direct,
-        Some(fs_sync_net::conn::ConnType::Relay) => dto::ConnKind::Relay,
-        Some(fs_sync_net::conn::ConnType::Tailscale) => dto::ConnKind::Tailscale,
-        None => dto::ConnKind::Unknown,
-    };
-    let rtt = fs_sync_net::conn::measure_rtt(&conn).map(|d| d.as_millis() as u64);
-    state
-        .conns
-        .lock()
-        .await
-        .insert(peer_id.to_string(), (kind, rtt));
-    info!(peer = %peer_id.fmt_short(), conn = ?kind, "同步会话已建立");
-
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    // Hello 握手：让对端确认我们已信任
-    frame::write_frame(
-        &mut send,
-        &Message::Hello {
-            protocol_version: fs_sync_net::message::PROTOCOL_VERSION,
-            device_name: state.device_name.clone(),
-            folders: folder_ids
-                .iter()
-                .map(|id| fs_sync_net::message::FolderSummary {
-                    folder_id: id.clone(),
-                    name: id.clone(),
-                })
-                .collect(),
-        },
-    )
-    .await?;
-
-    // 全量索引
-    for fid in folder_ids {
-        let snap = {
-            let guard = state.runtimes.lock().await;
-            guard.get(fid).cloned()
-        };
-        if let Some(rt) = snap {
-            let entries: Vec<_> = rt.session.snapshot().await.into_values().collect();
-            frame::write_frame(
-                &mut send,
-                &Message::Index {
-                    folder_id: fid.clone(),
-                    entries,
-                },
-            )
-            .await?;
+    } else if !want && currently {
+        match mgr.disable() {
+            Ok(()) => info!("已关闭开机自启"),
+            Err(e) => warn!("关闭开机自启失败: {e}"),
         }
-    }
-
-    // 连接建立/升级后推一次设备状态（提示词 5.3）。
-    // 之后前端靠 5 秒轮询兜底刷新 RTT，因为 iroh 内部的路径升级
-    // 不产生我们能看到的事件。
-    if let Some(d) = state
-        .devices()
-        .await
-        .into_iter()
-        .find(|d| d.id == peer_id.to_string())
-    {
-        events(
-            "device://status",
-            serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
-        );
-    }
-
-    // 持续收发
-    loop {
-        tokio::select! {
-            msg = frame::read_frame(&mut recv) => {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        state.conns.lock().await.remove(&peer_id.to_string());
-                        // 断开也要通知界面，否则设备一直显示"已连接"
-                        if let Some(d) = state
-                            .devices()
-                            .await
-                            .into_iter()
-                            .find(|d| d.id == peer_id.to_string())
-                        {
-                            events(
-                                "device://status",
-                                serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
-                            );
-                        }
-                        return Err(anyhow::anyhow!("读对端消息失败: {e}"));
-                    }
-                };
-                match msg {
-                    Message::Index { folder_id, entries }
-                    | Message::IndexUpdate { folder_id, entries } => {
-                        let rt = {
-                            let guard = state.runtimes.lock().await;
-                            guard.get(&folder_id).cloned()
-                        };
-                        if let Some(rt) = rt {
-                            let count = entries.len();
-                            let hint = entries.first().map(|e| e.path.clone()).unwrap_or_default();
-                            let remote: std::collections::HashMap<_, _> =
-                                entries.into_iter().map(|e| (e.path.clone(), e)).collect();
-                            let puller = fs_sync_daemon::make_puller(
-                                state.endpoint.clone(),
-                                peer_id,
-                                rt.session.blobs.clone(),
-                            );
-                            match rt.session.apply_remote(&remote, puller).await {
-                                Ok(stats) if stats.pulled + stats.deleted + stats.conflicts > 0 => {
-                                    info!(pulled = stats.pulled, deleted = stats.deleted, "已应用对端变更");
-                                    // 下载限速：按拉取到的条目大小消耗配额（M6）
-                                    let bytes: u64 = remote
-                                        .values()
-                                        .filter(|e| !e.is_dir && !e.deleted)
-                                        .map(|e| e.size)
-                                        .sum();
-                                    state.limits_snapshot().download.consume(bytes).await;
-                                    protocol::emit_activity(
-                                        events,
-                                        dto::ActivityKind::Download,
-                                        &folder_id,
-                                        &hint,
-                                        &format!("同步 {count} 项"),
-                                    );
-                                    // 同步进度事件（提示词 5.3）：一轮同步结束时发一次
-                                    // total = done，界面进度条会立刻收尾。
-                                    let total = stats.pulled + stats.deleted + stats.conflicts;
-                                    events(
-                                        "sync://progress",
-                                        serde_json::json!({
-                                            "folder_id": folder_id,
-                                            "path": hint,
-                                            "done": total,
-                                            "total": total,
-                                            "direction": "download",
-                                        }),
-                                    );
-                                    // 冲突事件：本轮产生了冲突就逐个通知界面
-                                    if stats.conflicts > 0 {
-                                        for c in crate::commands::conflict_dtos_for(state, Some(folder_id.clone()))
-                                        .into_iter()
-                                        .take(stats.conflicts as usize)
-                                        {
-                                            events(
-                                                "conflict://new",
-                                                serde_json::to_value(c)
-                                                    .unwrap_or(serde_json::Value::Null),
-                                            );
-                                        }
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(e) => warn!("应用对端变更失败: {e:#}"),
-                            }
-                        }
-                    }
-                    Message::Ping => {
-                        frame::write_frame(&mut send, &Message::Pong).await.ok();
-                    }
-                    Message::Pong => {}
-                    other => tracing::debug!("忽略消息: {other:?}"),
-                }
-            }
-            entry = recv_local_change(state, folder_ids) => {
-                let (fid, ent) = entry;
-                // 上传限速：按条目大小消耗配额（M6）
-                if !ent.is_dir && !ent.deleted {
-                    state.limits_snapshot().upload.consume(ent.size).await;
-                }
-                let msg = Message::IndexUpdate {
-                    folder_id: fid,
-                    entries: vec![ent],
-                };
-                if let Err(e) = frame::write_frame(&mut send, &msg).await {
-                    return Err(anyhow::anyhow!("推送本地变更失败: {e}"));
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
-                frame::write_frame(&mut send, &Message::Ping).await.ok();
-            }
-        }
-    }
-}
-
-/// 等待任一文件夹的本地变更。
-///
-/// 永不返回 None：tokio::select! 的分支一旦模式不匹配就被永久禁用
-/// （见 docs/decisions.md 里 M4 的教训）。
-async fn recv_local_change(
-    state: &Arc<AppState>,
-    folder_ids: &[String],
-) -> (String, fs_sync_core::FileEntry) {
-    loop {
-        let rts: Vec<(String, Arc<fs_sync_daemon::FolderRuntime>)> = {
-            let guard = state.runtimes.lock().await;
-            folder_ids
-                .iter()
-                .filter_map(|id| guard.get(id).map(|rt| (id.clone(), rt.clone())))
-                .collect()
-        };
-        for (id, rt) in &rts {
-            let mut ob = rt.outbox.lock().await;
-            if let Some(entry) = ob.pop() {
-                return (id.clone(), entry);
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -475,7 +180,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            // 左键点击托盘图标 → 显示主窗口
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -490,6 +194,5 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
-
     Ok(())
 }

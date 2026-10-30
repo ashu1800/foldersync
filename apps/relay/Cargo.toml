@@ -1,0 +1,17 @@
+[package]
+name = "foldersync-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "foldersync-relay"
+path = "src/main.rs"
+
+[dependencies]
+fs-sync-net.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

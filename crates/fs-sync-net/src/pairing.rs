@@ -1,10 +1,11 @@
-//! 配对码：`foldersync:<base64url(JSON)>` 文本，含端点公钥 + 一次性 token + 过期时间。
+//! 配对码：`foldersync:<base64url(JSON)>` 文本，含对端 SSH 身份、地址、一次性 token。
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+use crate::message::PeerInfo;
 
 /// 配对码默认有效期（秒）。
 pub const DEFAULT_TTL_SECS: u64 = 300;
@@ -12,31 +13,21 @@ pub const DEFAULT_TTL_SECS: u64 = 300;
 /// 配对码负载。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingCode {
-    pub endpoint_id: String,
+    /// 发起方（显示配对码的一方）的 SSH 身份与网络地址。
+    pub peer: PeerInfo,
     /// 一次性 token（16 字节 hex）
     pub token: String,
     /// 过期时间（Unix 秒）
     pub expires_at: u64,
-    /// 附加直连地址（如本机 Tailscale IP:端口），可为空
-    #[serde(default)]
-    pub addrs: Vec<String>,
-    /// 生成方使用的中继 URL。
-    ///
-    /// 必须带上：拨号方如果 DNS 发现被墙/被代理干扰，只靠 EndpointId 是找不到人的，
-    /// 连接会直接超时。带上中继后，双方只要都能连到这个中继就能建立连接。
-    #[serde(default)]
-    pub relay: Option<String>,
 }
 
 /// 生成新配对码。
-pub fn generate(my_id: &str, now: u64, relay: Option<&str>) -> PairingCode {
+pub fn generate(peer: PeerInfo, now: u64) -> PairingCode {
     let token: [u8; 16] = rand::rng().random();
     PairingCode {
-        endpoint_id: my_id.to_string(),
+        peer,
         token: hex::encode(token),
         expires_at: now + DEFAULT_TTL_SECS,
-        addrs: Vec::new(),
-        relay: relay.map(str::to_string),
     }
 }
 
@@ -65,27 +56,6 @@ pub fn decode(text: &str, now: u64) -> Result<PairingCode> {
     Ok(code)
 }
 
-/// 配对码 → 拨号地址（含附加直连地址）。
-pub fn to_endpoint_addr(code: &PairingCode) -> Result<EndpointAddr> {
-    let id: EndpointId = code
-        .endpoint_id
-        .parse()
-        .context("配对码中的 EndpointId 无效")?;
-    let mut addr = EndpointAddr::from(id);
-    if let Some(ref relay) = code.relay {
-        match relay.parse::<iroh::RelayUrl>() {
-            Ok(url) => addr = addr.with_relay_url(url),
-            Err(e) => tracing::warn!(%relay, "配对码里的中继 URL 无效: {e}"),
-        }
-    }
-    for s in &code.addrs {
-        if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
-            addr.addrs.insert(TransportAddr::Ip(sa));
-        }
-    }
-    Ok(addr)
-}
-
 /// 当前 Unix 秒。
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -94,20 +64,51 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 配对阶段的中继房间：房间 ID = blake3(token)，口令 = token。
+///
+/// token 本身是 128 位随机数，知道它才能进房间；配对完成后改用正式的
+/// 32 字节房间口令（见 [`new_relay_room`]）。
+pub fn pair_room(token: &str) -> String {
+    blake3::hash(token.as_bytes()).to_hex().to_string()
+}
+
+/// 生成中继房间：随机 32 字节口令，房间 ID = blake3(口令)。
+///
+/// 这样中继服务端不需要预注册房间：只要校验 `blake3(口令) == 房间 ID`
+/// 就能确认对方知道房间秘密，同时目录名仍是定长 hex。
+pub fn new_relay_room() -> (String, String) {
+    let mut secret = [0u8; 32];
+    rand::rng().fill(&mut secret);
+    let secret = hex::encode(secret);
+    let room = blake3::hash(secret.as_bytes()).to_hex().to_string();
+    (room, secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn peer() -> PeerInfo {
+        PeerInfo {
+            device_id: "SHA256:abc".into(),
+            device_name: "home".into(),
+            ssh_public_key: "ssh-ed25519 AAAA".into(),
+            host_key: "ssh-ed25519 BBBB".into(),
+            username: "foldersync".into(),
+            port: 2222,
+            addrs: vec!["100.64.0.1".into()],
+            relay: Some("tcp://relay:9443".into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn roundtrip_and_expiry() {
-        let id = iroh::SecretKey::generate().public().to_string();
-        let code = generate(&id, 1_000_000, None);
+        let code = generate(peer(), 1_000_000);
         let text = encode(&code);
         assert!(text.starts_with("foldersync:"));
         assert_eq!(decode(&text, 1_000_000).unwrap(), code);
-        // 恰好过期时刻仍有效
         assert!(decode(&text, code.expires_at).is_ok());
-        // 过期一秒后失效
         assert!(decode(&text, code.expires_at + 1).is_err());
     }
 
@@ -120,27 +121,24 @@ mod tests {
 
     #[test]
     fn token_is_hex16_bytes() {
-        let code = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
+        let code = generate(peer(), 0);
         assert_eq!(code.token.len(), 32);
         assert_eq!(hex::decode(&code.token).unwrap().len(), 16);
     }
 
     #[test]
     fn tokens_differ_between_codes() {
-        let a = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
-        let b = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
+        let a = generate(peer(), 0);
+        let b = generate(peer(), 0);
         assert_ne!(a.token, b.token);
     }
 
     #[test]
-    fn extra_addrs_survive_roundtrip() {
-        let mut code = generate(&iroh::SecretKey::generate().public().to_string(), 0, None);
-        code.addrs = vec!["100.102.104.88:40000".into(), "bad-addr".into()];
-        let text = encode(&code);
-        let got = decode(&text, 0).unwrap();
-        assert_eq!(got.addrs.len(), 2);
-        let addr = to_endpoint_addr(&got).unwrap();
-        // 只有合法地址被注入
-        assert_eq!(addr.addrs.len(), 1);
+    fn relay_room_is_random_hex32() {
+        let (room, secret) = new_relay_room();
+        assert_eq!(room.len(), 64);
+        assert_eq!(secret.len(), 64);
+        assert_ne!(room, secret);
+        assert_ne!(new_relay_room().0, room);
     }
 }

@@ -3,15 +3,15 @@
 /**
  * 忽略规则配置。
  */
-export type IgnoreRulesDto = { 
+export type IgnoreRulesDto = {
 /**
  * 是否启用内置默认规则
  */
-use_defaults: boolean, 
+use_defaults: boolean,
 /**
  * 用户自定义规则（.gitignore 语法，每行一条）
  */
-custom: Array<string>, 
+custom: Array<string>,
 /**
  * 生效的内置规则（只读回显，让用户知道默认忽略了什么）
  */

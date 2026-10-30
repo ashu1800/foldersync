@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder};
-use iroh::EndpointId;
-use iroh_blobs::store::fs::FsStore;
+use fs_sync_net::blobstore::BlobStore;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
@@ -51,7 +50,7 @@ pub struct SyncSession {
     /// 待发送的增量
     pending: Arc<Mutex<Vec<FileEntry>>>,
     /// 缓存的 blob 存储
-    pub blobs: Arc<FsStore>,
+    pub blobs: Arc<BlobStore>,
 }
 
 impl SyncSession {
@@ -60,7 +59,7 @@ impl SyncSession {
         folder_id: String,
         root: PathBuf,
         device_id: String,
-        blobs: Arc<FsStore>,
+        blobs: Arc<BlobStore>,
     ) -> Self {
         Self {
             engine,
@@ -551,7 +550,7 @@ pub fn to_index_update(folder_id: &str, entries: Vec<FileEntry>) -> fs_sync_net:
 }
 
 /// 供上层构造"推送器"：把本地条目推给对端指定设备。
-pub type PushFn = Arc<dyn Fn(EndpointId, Vec<FileEntry>) + Send + Sync>;
+pub type PushFn = Arc<dyn Fn(String, Vec<FileEntry>) + Send + Sync>;
 
 #[cfg(test)]
 mod tests {
@@ -563,11 +562,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("sync");
         std::fs::create_dir_all(&root).unwrap();
-        let blobs = Arc::new(
-            fs_sync_net::blobs::open_store(&tmp.path().join("blobs"))
-                .await
-                .unwrap(),
-        );
+        let blobs = Arc::new(BlobStore::open(tmp.path().join("share")).unwrap());
         let store = Arc::new(Store::open_in_memory().unwrap());
         let engine = SyncEngine::new("f1".into(), root.clone(), store, blobs.clone());
         let s = SyncSession::new(engine, "f1".into(), root, "devA".into(), blobs);
@@ -693,9 +688,7 @@ mod tests {
     async fn apply_remote_pulls_missing_file() {
         let (s, _t) = session().await;
         // 准备远端内容
-        let hash = fs_sync_net::blobs::add_bytes(&s.blobs, b"remote".to_vec())
-            .await
-            .unwrap();
+        let hash = s.blobs.add_bytes(b"remote".to_vec()).await.unwrap();
         let remote = HashMap::from([("r.txt".to_string(), entry("r.txt", &hash, "devB", 1))]);
 
         let stats = s
@@ -773,12 +766,8 @@ mod tests {
         s.take_pending().await;
 
         // 双方内容都已在本地 blob 存储（模拟已拉取完成）
-        let local_hash = fs_sync_net::blobs::add_bytes(&s.blobs, b"local".to_vec())
-            .await
-            .unwrap();
-        let remote_hash = fs_sync_net::blobs::add_bytes(&s.blobs, b"remote".to_vec())
-            .await
-            .unwrap();
+        let local_hash = s.blobs.add_bytes(b"local".to_vec()).await.unwrap();
+        let remote_hash = s.blobs.add_bytes(b"remote".to_vec()).await.unwrap();
         // 让本地条目与本轮内容一致
         let local_map =
             HashMap::from([("c.txt".to_string(), entry("c.txt", &local_hash, "devA", 1))]);

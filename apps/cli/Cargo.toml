@@ -13,11 +13,12 @@ fs-sync-net.workspace = true
 fs-sync-daemon.workspace = true
 fs-sync-store.workspace = true
 fs-sync-core.workspace = true
-iroh.workspace = true
-iroh-blobs.workspace = true
+russh.workspace = true
 blake3.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
+rand.workspace = true

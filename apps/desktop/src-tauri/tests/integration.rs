@@ -23,10 +23,17 @@ async fn init_creates_identity_and_store() {
     let tmp = tempfile::tempdir().unwrap();
     let st = AppState::init(tmp.path().to_path_buf()).await.unwrap();
 
-    assert!(tmp.path().join("secret.key").exists(), "应创建设备身份");
+    assert!(
+        tmp.path().join("ssh_identity").exists(),
+        "应创建 SSH 身份密钥"
+    );
+    assert!(
+        tmp.path().join("ssh_host_ed25519").exists(),
+        "应创建 SSH 主机密钥"
+    );
     assert!(tmp.path().join("state.sqlite3").exists(), "应创建数据库");
     assert!(!st.device_name.is_empty(), "应有默认设备名");
-    assert!(!st.endpoint_id.to_string().is_empty());
+    assert!(!st.device_id.is_empty());
 }
 
 #[tokio::test]
@@ -124,10 +131,10 @@ async fn stop_folder_removes_runtime() {
     let dir = tmp.path().join("s");
     std::fs::create_dir_all(&dir).unwrap();
     st.start_folder("f-s".into(), dir).await.unwrap();
-    assert_eq!(st.runtimes.lock().await.len(), 1);
+    assert_eq!(st.runtimes.lock().unwrap().len(), 1);
 
     st.stop_folder("f-s").await;
-    assert!(st.runtimes.lock().await.is_empty());
+    assert!(st.runtimes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

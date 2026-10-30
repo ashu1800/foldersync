@@ -4,7 +4,7 @@ import type { IgnoreRulesDto } from "./IgnoreRulesDto";
 /**
  * 新建文件夹请求。
  */
-export type AddFolderRequest = { path: string, 
+export type AddFolderRequest = { path: string,
 /**
  * 分享给哪些设备
  */

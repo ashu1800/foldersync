@@ -4,35 +4,35 @@ import type { NetworkMode } from "./NetworkMode";
 /**
  * 应用设置。
  */
-export type SettingsDto = { device_name: string, 
+export type SettingsDto = { device_name: string,
 /**
  * 开机自启
  */
-auto_start: boolean, 
+auto_start: boolean,
 /**
  * 关闭窗口时最小化到托盘
  */
-close_to_tray: boolean, 
+close_to_tray: boolean,
 /**
  * 上传限速（KB/s），0 = 不限
  */
-upload_limit_kbps: number, 
+upload_limit_kbps: number,
 /**
  * 下载限速（KB/s），0 = 不限
  */
-download_limit_kbps: number, 
+download_limit_kbps: number,
 /**
- * 自定义中继 URL（None = 用默认）
+ * 中继服务器地址（`tcp://IP:9443`），None = 未配置
  */
-relay_url: string | null, network_mode: NetworkMode, 
+relay_url: string | null, network_mode: NetworkMode,
 /**
- * 固定监听端口（None = 随机）
+ * 本机 SSH 服务端口
  */
-listen_port: number | null, 
+ssh_port: number,
 /**
  * 全局默认忽略规则（新建文件夹时套用）
  */
-default_ignore: Array<string>, 
+default_ignore: Array<string>,
 /**
  * 日志级别：error/warn/info/debug/trace
  */

@@ -3,7 +3,7 @@
 /**
  * 待确认的配对请求。
  */
-export type PendingPairingDto = { request_id: string, device_name: string, fingerprint: string, 
+export type PendingPairingDto = { request_id: string, device_name: string, fingerprint: string,
 /**
  * 过期时间（Unix 秒）
  */

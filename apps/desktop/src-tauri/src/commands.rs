@@ -1,10 +1,11 @@
-//! Tauri commands：前端唯一入口（提示词 5.3）。
+//! Tauri commands：前端唯一入口。
 //!
 //! 所有命令返回 `Result<T, ErrorDto>`，错误码稳定可本地化。
 
 use std::sync::Arc;
 
 use fs_sync_daemon::{EventKind, FileEvent};
+use fs_sync_net::message::{PairingRequest, PeerInfo};
 use fs_sync_store::Folder;
 use tauri::State;
 use tracing::info;
@@ -50,14 +51,75 @@ pub async fn get_overview(state: State<'_, Arc<AppState>>) -> CmdResult<Overview
     Ok(OverviewDto {
         status,
         device_name: state.device_name.clone(),
-        endpoint_id: state.endpoint_id.to_string(),
-        fingerprint: fingerprint_of(&state.endpoint_id),
+        device_id: state.device_id.clone(),
+        fingerprint: fingerprint_of(&state.device_id),
         tailscale: ts_desc,
         online_devices: online,
         syncing_files: 0,
         remaining_files: remaining,
         error_count: if any_error { 1 } else { 0 },
     })
+}
+
+// ---------- 环境引导 ----------
+
+/// 本机 SSH / Tailscale / 中继环境状态。
+#[tauri::command]
+pub async fn get_environment_status(state: State<'_, Arc<AppState>>) -> CmdResult<EnvStatusDto> {
+    Ok(state.env_status())
+}
+
+/// 重新初始化 SSH 环境（生成密钥、目录、尝试修复防火墙）。
+#[tauri::command]
+pub async fn repair_ssh_environment(state: State<'_, Arc<AppState>>) -> CmdResult<EnvStatusDto> {
+    let settings = state.settings_dto();
+    let env = fs_sync_net::env::ensure_ssh_env(&state.data_dir, settings.ssh_port);
+    if !env.firewall_ok {
+        // 普通权限加规则会失败，这里主动弹 UAC（失败也不阻塞，UI 会提示重试）
+        let _ = fs_sync_net::env::repair_firewall_elevated(settings.ssh_port);
+    }
+    Ok(state.env_status())
+}
+
+/// 打开 Tailscale 下载页（引导安装）。
+#[tauri::command]
+pub async fn open_tailscale_download() -> CmdResult<()> {
+    open_url("https://tailscale.com/download")
+        .map_err(|e| ErrorDto::new("open_failed", format!("打开下载页失败: {e}")))
+}
+
+/// 中继服务器搭建步骤（Markdown 文本，前端弹窗展示）。
+#[tauri::command]
+pub async fn get_relay_guide() -> CmdResult<String> {
+    Ok(concat!(
+        "## 搭建 FolderSync 中继服务器\n\n",
+        "1. 找一台有公网 IP 的服务器（1 核 1G 即可）。\n",
+        "2. 下载 `foldersync-relay` 可执行文件，运行：\n\n",
+        "```bash\nfoldersync-relay --port 9443 --data-dir ./foldersync-relay-data\n```\n\n",
+        "3. 在服务器防火墙放行 TCP 9443（云厂商安全组也要放行）。\n",
+        "4. 回到 FolderSync 设置页，把中继地址填成 `tcp://服务器IP:9443`。\n",
+        "5. 两台电脑填同一个地址，然后在设备页重新配对/同步。\n\n",
+        "中继只中转加密后的 SSH/SFTP 流量，不保存文件内容；房间之间互相隔离。"
+    )
+    .to_string())
+}
+
+fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    Ok(())
 }
 
 // ---------- 设备 ----------
@@ -68,10 +130,7 @@ pub async fn list_devices(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<Devi
     Ok(state.devices().await)
 }
 
-/// 推送单个文件夹的最新状态（提示词 5.3 的 `folder://status`）。
-///
-/// 命令本身已经返回了新状态，但其它窗口/托盘菜单也可能触发变化，
-/// 所以统一用事件广播一次，前端不必重拉整个列表。
+/// 推送单个文件夹的最新状态。
 async fn emit_folder_status(app: &tauri::AppHandle, state: &Arc<AppState>, folder_id: &str) {
     use tauri::Emitter;
     if let Some(f) = state
@@ -84,34 +143,23 @@ async fn emit_folder_status(app: &tauri::AppHandle, state: &Arc<AppState>, folde
     }
 }
 
+/// 本机用于配对码的 Tailscale 地址。
+fn local_tailscale_addrs() -> Vec<String> {
+    fs_sync_net::tailscale::detect().ips
+}
+
 /// 生成配对码（5 分钟有效，一次性）。
 #[tauri::command]
 pub async fn create_pairing_code(state: State<'_, Arc<AppState>>) -> CmdResult<PairingCodeDto> {
-    // 把当前中继 + 本机 Tailscale 直连地址写进配对码。
-    //
-    // 直连地址尤其重要：自建中继在新加坡，两地跨境的长连接会被反复重置，
-    // 只靠中继配对会超时。两台机器只要都在同一个 Tailscale 网络里，
-    // 带上 `100.x.x.x:端口` 就能直接连上，完全绕开中继。
     let relay = state.settings.get().relay_url;
-    let ts = fs_sync_daemon::pairing::detect_tailscale();
-    let ports: Vec<u16> = state
-        .endpoint
-        .bound_sockets()
-        .iter()
-        .map(|s| s.port())
-        .collect();
-    let mut addrs = Vec::new();
-    for ip in &ts.ips {
-        for p in &ports {
-            // IPv6 要加方括号，否则 SocketAddr 解析不了
-            if ip.contains(':') {
-                addrs.push(format!("[{ip}]:{p}"));
-            } else {
-                addrs.push(format!("{ip}:{p}"));
-            }
-        }
+    let code = state
+        .pairing
+        .create_code(local_tailscale_addrs(), relay.as_deref())
+        .await;
+    // 中继方案：生成后在后台监听配对房间，等对端提交 SSH 公钥
+    if let Some(url) = relay.clone() {
+        state.pairing.spawn_relay_pairing_watcher(code.clone(), url);
     }
-    let code = state.pairing.create_code(addrs, relay.as_deref()).await;
     let encoded = fs_sync_net::pairing::encode(&code);
     let expires_at = code.expires_at as i64;
     Ok(PairingCodeDto {
@@ -128,78 +176,93 @@ pub async fn accept_pairing_code(
     state: State<'_, Arc<AppState>>,
     code: String,
 ) -> CmdResult<DeviceDto> {
-    let parsed = fs_sync_net::pairing::decode(
-        &code,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
-    .map_err(|e| ErrorDto::new("bad_code", format!("配对码无效: {e}")))?;
-    let peer = parsed
-        .endpoint_id
-        .parse::<iroh::EndpointId>()
-        .map_err(|e| ErrorDto::new("bad_code", format!("配对码中的设备 ID 无效: {e}")))?;
+    let parsed = fs_sync_net::pairing::decode(&code, now_secs() as u64)
+        .map_err(|e| ErrorDto::new("bad_code", format!("配对码无效: {e}")))?;
 
-    // 用配对码里的完整地址（含中继）拨号，而不是只给 EndpointId 等 DNS 解析
-    let addr = fs_sync_net::pairing::to_endpoint_addr(&parsed)
-        .map_err(|e| ErrorDto::new("bad_code", format!("配对码地址无效: {e}")))?;
-    tracing::info!(
-        peer = %peer,
-        addrs = ?addr.addrs,
-        "开始配对拨号"
-    );
-    let conn = state
-        .endpoint
-        .connect(addr, fs_sync_net::ALPN)
-        .await
-        .map_err(|e| {
-            // 配对失败是排障最费时的环节，日志里必须留下拨了哪些地址、错在哪
-            tracing::warn!(peer = %peer, "配对连接失败: {e}");
-            ErrorDto::new("connect_failed", format!("连接对端失败: {e}"))
-        })?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| ErrorDto::new("connect_failed", e.to_string()))?;
+    let mut me = state
+        .pairing
+        .own_info(local_tailscale_addrs())
+        .map_err(|e| ErrorDto::new("identity", format!("读取本机身份失败: {e:#}")))?;
+    // 对端可能已经配了中继但本机还没配：沿用配对码里的中继地址，保证响应能带回
+    me.relay = state
+        .settings
+        .get()
+        .relay_url
+        .clone()
+        .or_else(|| parsed.peer.relay.clone());
+    let request = PairingRequest {
+        token: parsed.token.clone(),
+        peer: me,
+    };
 
-    fs_sync_net::frame::write_frame(
-        &mut send,
-        &fs_sync_net::message::Message::PairingRequest(fs_sync_net::message::PairingRequest {
-            token: parsed.token.clone(),
-            device_name: state.device_name.clone(),
-        }),
-    )
-    .await
-    .map_err(|e| ErrorDto::new("connect_failed", e.to_string()))?;
-
-    let resp = fs_sync_net::frame::read_frame(&mut recv)
-        .await
-        .map_err(|e| ErrorDto::new("connect_failed", e.to_string()))?;
-
-    match resp {
-        fs_sync_net::message::Message::PairingResponse(r) if r.accepted => {
-            state
-                .trust
-                .add(&peer, &r.device_name)
-                .map_err(|e| ErrorDto::new("store", e.to_string()))?;
-            info!(%peer, name = %r.device_name, "配对成功");
-            Ok(DeviceDto {
-                id: peer.to_string(),
-                name: r.device_name,
-                fingerprint: fingerprint_of(&peer),
-                online: true,
-                conn: ConnKind::Relay,
-                rtt_ms: None,
-            })
+    // 优先 Tailscale 直连；失败再回退中继。
+    let mut response = None;
+    let mut errors = Vec::new();
+    for host in &parsed.peer.addrs {
+        let target = fs_sync_net::ssh_client::SshTarget {
+            host: host.clone(),
+            port: parsed.peer.port,
+            username: parsed.peer.username.clone(),
+            host_key: parsed.peer.host_key.clone(),
+        };
+        match fs_sync_net::ssh_client::pair_via_ssh(&target, &parsed.token, request.clone()).await {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(e) => errors.push(format!("{host}: {e:#}")),
         }
-        fs_sync_net::message::Message::PairingResponse(_) => {
-            Err(ErrorDto::new("rejected", "对端拒绝了配对请求".to_string()))
+    }
+    if response.is_none()
+        && let Some(relay) = parsed
+            .peer
+            .relay
+            .clone()
+            .or_else(|| state.settings.get().relay_url.clone())
+    {
+        match fs_sync_net::relay::pair_via_relay(&relay, &parsed.token, request).await {
+            Ok(r) => response = Some(r),
+            Err(e) => errors.push(format!("中继 {relay}: {e:#}")),
         }
-        fs_sync_net::message::Message::Error { message, .. } => {
-            Err(ErrorDto::new("pairing_failed", message))
+    }
+    let response = response.ok_or_else(|| {
+        if parsed.peer.addrs.is_empty() && parsed.peer.relay.is_none() {
+            ErrorDto::new(
+                "no_network",
+                "双方都没有可用的网络：请先安装并登录 Tailscale，或在服务器上搭建 FolderSync 中继",
+            )
+        } else {
+            ErrorDto::new(
+                "connect_failed",
+                format!("连接对端失败（已尝试所有地址）: {}", errors.join("; ")),
+            )
         }
-        _ => Err(ErrorDto::new("pairing_failed", "对端返回了意外响应")),
+    })?;
+
+    if !response.accepted {
+        return Err(ErrorDto::new("rejected", "对端拒绝了配对请求".to_string()));
+    }
+    fs_sync_net::identity::verify_peer_info(&response.peer)
+        .map_err(|e| ErrorDto::new("bad_peer", format!("对端身份校验失败: {e:#}")))?;
+    state
+        .trust
+        .add(&response.peer)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    info!(device = %response.peer.device_name, "配对成功");
+    Ok(device_dto(response.peer))
+}
+
+fn device_dto(peer: PeerInfo) -> DeviceDto {
+    DeviceDto {
+        id: peer.device_id.clone(),
+        name: peer.device_name,
+        fingerprint: fingerprint_of(&peer.device_id),
+        online: false,
+        conn: ConnKind::Unknown,
+        rtt_ms: None,
+        address: peer.addrs.first().cloned(),
+        port: peer.port,
+        relay_ready: peer.relay_room.is_some(),
     }
 }
 
@@ -213,9 +276,6 @@ pub async fn confirm_pairing(
     if !state.pairing.confirm(&request_id, accept).await {
         return Err(ErrorDto::new("not_found", "配对请求不存在或已过期"));
     }
-    if !accept {
-        state.pending_pairings.lock().await.remove(&request_id);
-    }
     Ok(())
 }
 
@@ -224,16 +284,17 @@ pub async fn confirm_pairing(
 pub async fn list_pending_pairings(
     state: State<'_, Arc<AppState>>,
 ) -> CmdResult<Vec<PendingPairingDto>> {
-    let map = state.pending_pairings.lock().await;
     let now = now_secs();
-    Ok(map
-        .iter()
-        .filter(|(_, (_, _, exp))| *exp > now)
-        .map(|(id, (name, fp, exp))| PendingPairingDto {
-            request_id: id.clone(),
-            device_name: name.clone(),
-            fingerprint: fp.clone(),
-            expires_at: *exp,
+    Ok(state
+        .pairing
+        .list_pending()
+        .await
+        .into_iter()
+        .map(|p| PendingPairingDto {
+            request_id: p.request_id,
+            device_name: p.peer_name,
+            fingerprint: p.fingerprint,
+            expires_at: now + 120,
         })
         .collect())
 }
@@ -245,12 +306,15 @@ pub async fn rename_device(
     id: String,
     name: String,
 ) -> CmdResult<()> {
-    let peer = id
-        .parse::<iroh::EndpointId>()
-        .map_err(|e| ErrorDto::new("bad_id", e.to_string()))?;
+    let mut device = state
+        .trust
+        .get(&id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?
+        .ok_or_else(|| ErrorDto::new("not_found", "设备不存在"))?;
+    device.name = name;
     state
         .trust
-        .add(&peer, &name)
+        .upsert(&device)
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
     Ok(())
 }
@@ -258,12 +322,9 @@ pub async fn rename_device(
 /// 取消配对。
 #[tauri::command]
 pub async fn remove_device(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
-    let peer = id
-        .parse::<iroh::EndpointId>()
-        .map_err(|e| ErrorDto::new("bad_id", e.to_string()))?;
     state
         .trust
-        .remove(&peer)
+        .remove(&id)
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
     Ok(())
 }
@@ -294,8 +355,6 @@ pub async fn add_folder(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "根目录".into());
 
-    // ponytail: CLI/桌面初版用文件夹名派生 id（见 docs/decisions.md），
-    // 接入邀请流程后改为创建方生成 UUID。
     let folder_id = format!("folder-{}", &blake3::hash(name.as_bytes()).to_hex()[..16]);
     if state
         .store
@@ -307,7 +366,6 @@ pub async fn add_folder(
         return Err(ErrorDto::new("duplicate", "该文件夹已在同步列表中"));
     }
 
-    // 写入忽略规则
     if !req.ignore.custom.is_empty() {
         let ignore_path = path.join(".syncignore");
         let _ = std::fs::write(&ignore_path, req.ignore.custom.join("\n"));
@@ -440,7 +498,6 @@ pub async fn get_folder_tree(
     folder_id: String,
     subpath: Option<String>,
 ) -> CmdResult<Vec<TreeNodeDto>> {
-    // 校验文件夹确实存在（防止前端传错 id 时返回空列表误导用户）
     if !state
         .store
         .list_folders()
@@ -566,10 +623,6 @@ pub async fn list_activity(
 
 // ---------- 冲突 ----------
 
-/// 收集冲突条目（命令与事件共用）。
-///
-/// 独立出来是因为 `conflict://new` 事件也要用同一套解析逻辑，
-/// 不能在事件路径里复制一份。
 pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<ConflictDto> {
     let mut out = Vec::new();
     for f in state.store.list_folders().unwrap_or_default() {
@@ -583,7 +636,6 @@ pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<Con
             .iter()
             .filter(|e| e.path.contains(".sync-conflict-"))
         {
-            // 从文件名解析原文件与来源设备
             let name = e.path.rsplit('/').next().unwrap_or(&e.path);
             let (original_name, device) = parse_conflict_name(name);
             let original_path = match e.path.rsplit_once('/') {
@@ -611,7 +663,7 @@ pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<Con
     out
 }
 
-/// 列出所有冲突副本文件（提示词 5.2）。
+/// 列出所有冲突副本文件。
 #[tauri::command]
 pub async fn list_conflicts(
     state: State<'_, Arc<AppState>>,
@@ -627,12 +679,10 @@ fn parse_conflict_name(name: &str) -> (String, String) {
     };
     let stem = &name[..pos];
     let rest = &name[pos + ".sync-conflict-".len()..];
-    // rest = 20260101-120000-设备[.ext]
     let (ext, body) = match rest.rsplit_once('.') {
         Some((body, ext)) => (format!(".{ext}"), body),
         None => (String::new(), rest),
     };
-    // body = 20260101-120000-设备名
     let device = body.splitn(3, '-').nth(2).unwrap_or("").to_string();
     (format!("{stem}{ext}"), device)
 }
@@ -673,7 +723,6 @@ pub async fn resolve_conflict(
                 .map_err(|e| ErrorDto::new("io", format!("删除副本失败: {e}")))?;
         }
         ConflictResolution::KeepBoth => {
-            // 副本换个后缀留档，原文件不动
             let archived = conflict_abs.with_extension("resolved.bak");
             std::fs::rename(&conflict_abs, &archived)
                 .map_err(|e| ErrorDto::new("io", format!("存档失败: {e}")))?;
@@ -681,7 +730,14 @@ pub async fn resolve_conflict(
     }
 
     // 触发重新扫描，让索引跟上磁盘现实
-    if let Some(rt) = state.runtimes.lock().await.get(&folder.id).cloned() {
+    let rt = {
+        let guard = state.runtimes.lock().unwrap();
+        guard
+            .iter()
+            .find(|r| r.session.folder_id == folder.id)
+            .cloned()
+    };
+    if let Some(rt) = rt {
         let _ = rt
             .session
             .on_local_event(FileEvent {
@@ -710,19 +766,16 @@ pub async fn update_settings(
     let next = state
         .update_settings(patch)
         .map_err(|e| ErrorDto::new("settings", format!("保存设置失败: {e}")))?;
-    // 限速改动立即生效（重建限速器，无需重启）
     state.replace_limits(next.upload_limit_kbps, next.download_limit_kbps);
     Ok(next)
 }
 
-/// 打开日志目录（调用系统文件管理器）。
+/// 打开日志目录。
 #[tauri::command]
 pub async fn open_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> {
     let dir = state.data_dir.join("logs");
     std::fs::create_dir_all(&dir).ok();
     let path = dir.to_string_lossy().to_string();
-    // 之前这个命令只返回路径、前端复制到剪贴板，按钮写「打开」却什么都没打开。
-    // 这里真的调用系统文件管理器。
     tauri_plugin_opener::open_path(&path, None::<&str>)
         .map_err(|e| ErrorDto::new("open_failed", format!("打开日志目录失败: {e}")))?;
     Ok(path)
@@ -732,13 +785,48 @@ pub async fn open_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> 
 #[tauri::command]
 pub async fn get_local_info(state: State<'_, Arc<AppState>>) -> CmdResult<serde_json::Value> {
     Ok(serde_json::json!({
-        "endpoint_id": state.endpoint_id.to_string(),
-        "fingerprint": fingerprint_of(&state.endpoint_id),
+        "device_id": state.device_id,
+        "fingerprint": fingerprint_of(&state.device_id),
         "device_name": state.device_name,
         "hostname": hostname(),
         "data_dir": state.data_dir.to_string_lossy(),
+        "ssh_port": state.ssh_port,
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// 生成并保存诊断包，返回文件路径。
+#[tauri::command]
+pub async fn export_diagnostics(
+    state: State<'_, Arc<AppState>>,
+    out_dir: Option<String>,
+) -> CmdResult<String> {
+    let settings_json =
+        serde_json::to_string_pretty(&state.settings_dto()).unwrap_or_else(|_| "{}".into());
+    let report = crate::diagnostics::DiagnosticReport::collect(
+        &state.data_dir,
+        &state.device_name,
+        &state.device_id,
+        &fingerprint_of(&state.device_id),
+        &settings_json,
+        &state.store,
+    )
+    .map_err(|e| ErrorDto::new("diagnostics", format!("收集诊断信息失败: {e:#}")))?;
+
+    let dir = out_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| state.data_dir.join("diagnostics"));
+    let path = report
+        .write_to(&dir)
+        .map_err(|e| ErrorDto::new("diagnostics", format!("写诊断文件失败: {e:#}")))?;
+    info!(path = %path.display(), "诊断包已导出");
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 日志目录路径。
+#[tauri::command]
+pub async fn get_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> {
+    Ok(state.data_dir.join("logs").to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -766,38 +854,4 @@ mod tests {
         assert_eq!(orig, "normal.txt");
         assert!(dev.is_empty());
     }
-}
-
-/// 生成并保存诊断包（M6），返回文件路径。
-#[tauri::command]
-pub async fn export_diagnostics(
-    state: State<'_, Arc<AppState>>,
-    out_dir: Option<String>,
-) -> CmdResult<String> {
-    let settings_json =
-        serde_json::to_string_pretty(&state.settings_dto()).unwrap_or_else(|_| "{}".into());
-    let report = crate::diagnostics::DiagnosticReport::collect(
-        &state.data_dir,
-        &state.device_name,
-        &state.endpoint_id.to_string(),
-        &fingerprint_of(&state.endpoint_id),
-        &settings_json,
-        &state.store,
-    )
-    .map_err(|e| ErrorDto::new("diagnostics", format!("收集诊断信息失败: {e:#}")))?;
-
-    let dir = out_dir
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.data_dir.join("diagnostics"));
-    let path = report
-        .write_to(&dir)
-        .map_err(|e| ErrorDto::new("diagnostics", format!("写诊断文件失败: {e:#}")))?;
-    info!(path = %path.display(), "诊断包已导出");
-    Ok(path.to_string_lossy().to_string())
-}
-
-/// 日志目录路径（前端用来打开或提示用户）。
-#[tauri::command]
-pub async fn get_log_dir(state: State<'_, Arc<AppState>>) -> CmdResult<String> {
-    Ok(state.data_dir.join("logs").to_string_lossy().to_string())
 }

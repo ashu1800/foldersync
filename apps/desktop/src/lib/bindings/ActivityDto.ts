@@ -4,23 +4,23 @@ import type { ActivityKind } from "./ActivityKind";
 /**
  * 活动条目。
  */
-export type ActivityDto = { 
+export type ActivityDto = {
 /**
  * 自增 id（游标分页用）
  */
-id: number, 
+id: number,
 /**
  * Unix 秒
  */
-at: number, kind: ActivityKind, folder_id: string, 
+at: number, kind: ActivityKind, folder_id: string,
 /**
  * 相对路径
  */
-path: string, 
+path: string,
 /**
  * 文件大小（字节）
  */
-size: number, 
+size: number,
 /**
  * 描述文本
  */

@@ -4,27 +4,27 @@ import type { FileState } from "./FileState";
 /**
  * 文件树节点（文件夹详情页只读浏览）。
  */
-export type TreeNodeDto = { 
+export type TreeNodeDto = {
 /**
  * 相对路径
  */
-path: string, 
+path: string,
 /**
  * 文件名
  */
-name: string, is_dir: boolean, 
+name: string, is_dir: boolean,
 /**
  * 字节数
  */
-size: number, 
+size: number,
 /**
  * Unix 秒
  */
-mtime: number, 
+mtime: number,
 /**
  * 同步状态
  */
-state: FileState, 
+state: FileState,
 /**
  * 是否冲突副本
  */

@@ -4,35 +4,35 @@ import type { OverallStatus } from "./OverallStatus";
 /**
  * 概览数据。
  */
-export type OverviewDto = { status: OverallStatus, 
+export type OverviewDto = { status: OverallStatus,
 /**
  * 本机设备名
  */
-device_name: string, 
+device_name: string,
 /**
- * 本机 EndpointId
+ * 本机 SSH 设备 ID
  */
-endpoint_id: string, 
+device_id: string,
 /**
  * 本机指纹
  */
-fingerprint: string, 
+fingerprint: string,
 /**
  * Tailscale 状态描述（如 `ashu.tail7ebaff.ts.net (100.81.188.46)`），未启用为 None
  */
-tailscale: string | null, 
+tailscale: string | null,
 /**
  * 在线设备数
  */
-online_devices: number, 
+online_devices: number,
 /**
  * 同步中的文件数（用于进度显示）
  */
-syncing_files: number, 
+syncing_files: number,
 /**
  * 剩余待同步文件数
  */
-remaining_files: number, 
+remaining_files: number,
 /**
  * 错误数
  */

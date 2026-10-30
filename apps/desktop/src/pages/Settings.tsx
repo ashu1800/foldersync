@@ -1,13 +1,18 @@
 // 设置页（提示词 5.2.6）。
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useTranslation } from "react-i18next";
-import type { NetworkMode, SettingsDto, SettingsPatch } from "../lib/bindings";
+import type {
+  EnvStatusDto,
+  NetworkMode,
+  SettingsDto,
+  SettingsPatch,
+} from "../lib/bindings";
 import * as api from "../lib/tauri";
 import { setLanguage } from "../i18n";
-import { ErrorBanner, Loading } from "../components/ui";
+import { ErrorBanner, Loading, RelayGuideModal } from "../components/ui";
 
 const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"];
 
@@ -18,8 +23,12 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [version, setVersion] = useState("");
-  const [endpointId, setEndpointId] = useState("");
+  const [deviceId, setDeviceId] = useState("");
   const [diagPath, setDiagPath] = useState<string | null>(null);
+  const [env, setEnv] = useState<EnvStatusDto | null>(null);
+  const [envBusy, setEnvBusy] = useState(false);
+  const [envError, setEnvError] = useState<string | null>(null);
+  const [showRelayGuide, setShowRelayGuide] = useState(false);
   // 更新检查（基于 GitHub Releases）
   const [updateState, setUpdateState] = useState<
     "idle" | "checking" | "found" | "downloading" | "latest" | "error"
@@ -34,6 +43,16 @@ export default function Settings() {
   // ref 变化不会触发重渲染，读它得到的可能是过期值。
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
 
+  const refreshEnv = useCallback(async () => {
+    try {
+      const next = await api.getEnvironmentStatus();
+      setEnv(next);
+      setEnvError(null);
+    } catch (e) {
+      setEnvError(api.asCmdError(e).message);
+    }
+  }, []);
+
   useEffect(() => {
     (async () => {
       try {
@@ -43,13 +62,28 @@ export default function Settings() {
         ]);
         setS(settings);
         setVersion(String(info.version ?? ""));
-        setEndpointId(String(info.endpoint_id ?? ""));
+        setDeviceId(String(info.device_id ?? ""));
       } catch (e) {
         setError(api.asCmdError(e).message);
       } finally {
         setLoading(false);
       }
     })();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const next = await api.getEnvironmentStatus();
+        if (!cancelled) setEnv(next);
+      } catch (e) {
+        if (!cancelled) setEnvError(api.asCmdError(e).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const save = async (patch: SettingsPatch) => {
@@ -62,9 +96,32 @@ export default function Settings() {
       setS(next);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
+      if (patch.ssh_port !== undefined || patch.relay_url !== undefined) {
+        void refreshEnv();
+      }
     } catch (e) {
       setS(prev);
       setError(api.asCmdError(e).message);
+    }
+  };
+
+  const repairSsh = async () => {
+    setEnvBusy(true);
+    setEnvError(null);
+    try {
+      setEnv(await api.repairSshEnvironment());
+    } catch (e) {
+      setEnvError(api.asCmdError(e).message);
+    } finally {
+      setEnvBusy(false);
+    }
+  };
+
+  const installTailscale = async () => {
+    try {
+      await api.openTailscaleDownload();
+    } catch (e) {
+      setEnvError(api.asCmdError(e).message);
     }
   };
 
@@ -96,8 +153,8 @@ export default function Settings() {
             aria-label={t("settings.deviceName")}
           />
         </div>
-        <div className="card-meta mono truncate" title={endpointId}>
-          {endpointId}
+        <div className="card-meta mono truncate" title={deviceId}>
+          {deviceId}
         </div>
       </div>
 
@@ -192,20 +249,151 @@ export default function Settings() {
       {/* 网络 */}
       <div className="card">
         <h2 className="card-title" style={{ marginBottom: 14 }}>
-          {t("settings.networkMode")}
+          {t("settings.networkTitle")}
         </h2>
+
+        {envError && (
+          <p className="hint" style={{ color: "var(--danger)", marginBottom: 10 }}>
+            {envError}
+          </p>
+        )}
+
+        <div className="list" style={{ marginBottom: 16 }}>
+          <div className="list-item">
+            <div className="list-main">
+              <div className="list-title">{t("settings.envSsh")}</div>
+              <div className="list-sub">
+                {env
+                  ? `${t("settings.envPort")} ${env.ssh_port} · ${
+                      env.firewall_ok
+                        ? t("settings.envFirewallOk")
+                        : t("settings.envFirewallBad")
+                    }`
+                  : t("settings.envUnknown")}
+              </div>
+            </div>
+            <span
+              className={`badge ${
+                !env ? "badge-muted" : env.ssh_ready ? "badge-success" : "badge-warn"
+              }`}
+            >
+              {!env
+                ? t("settings.envUnknown")
+                : env.ssh_ready
+                  ? t("settings.envSshReady")
+                  : t("settings.envSshNotReady")}
+            </span>
+          </div>
+
+          <div className="list-item">
+            <div className="list-main">
+              <div className="list-title">{t("settings.envTailscale")}</div>
+              <div className="list-sub">
+                {!env
+                  ? t("settings.envUnknown")
+                  : !env.tailscale_installed
+                    ? t("settings.envTailscaleMissing")
+                    : !env.tailscale_running
+                      ? t("settings.envTailscaleStopped")
+                      : [
+                          ...(env.tailscale_hostname ? [env.tailscale_hostname] : []),
+                          ...env.tailscale_ips,
+                        ].join(" · ") || "—"}
+              </div>
+            </div>
+            <span
+              className={`badge ${
+                !env
+                  ? "badge-muted"
+                  : env.tailscale_running
+                    ? "badge-success"
+                    : env.tailscale_installed
+                      ? "badge-warn"
+                      : "badge-muted"
+              }`}
+            >
+              {!env
+                ? t("settings.envUnknown")
+                : env.tailscale_running
+                  ? t("settings.envTailscaleConnected")
+                  : env.tailscale_installed
+                    ? t("settings.envTailscaleStopped")
+                    : t("settings.envTailscaleMissing")}
+            </span>
+          </div>
+
+          <div className="list-item">
+            <div className="list-main">
+              <div className="list-title">{t("settings.envRelay")}</div>
+              <div className="list-sub">
+                {!env
+                  ? t("settings.envUnknown")
+                  : !env.relay_configured
+                    ? t("settings.envRelayMissing")
+                    : env.relay_reachable
+                      ? t("settings.envRelayReachable")
+                      : t("settings.envRelayUnreachable")}
+              </div>
+            </div>
+            <span
+              className={`badge ${
+                env?.relay_reachable
+                  ? "badge-success"
+                  : env?.relay_configured
+                    ? "badge-danger"
+                    : "badge-muted"
+              }`}
+            >
+              {!env
+                ? t("settings.envUnknown")
+                : env.relay_reachable
+                  ? t("settings.envRelayReachable")
+                  : env.relay_configured
+                    ? t("settings.envRelayUnreachable")
+                    : t("settings.envRelayMissing")}
+            </span>
+          </div>
+        </div>
+
+        <div className="btn-row" style={{ marginBottom: 16 }}>
+          <button
+            className="btn"
+            onClick={() => void repairSsh()}
+            disabled={envBusy}
+            aria-label={t("settings.repairSsh")}
+          >
+            {envBusy ? t("settings.repairing") : t("settings.repairSsh")}
+          </button>
+          <button
+            className="btn"
+            onClick={() => void installTailscale()}
+            aria-label={t("settings.installTailscale")}
+          >
+            {t("settings.installTailscale")}
+          </button>
+          <button
+            className="btn"
+            onClick={() => setShowRelayGuide(true)}
+            aria-label={t("settings.relayGuide")}
+          >
+            {t("settings.relayGuide")}
+          </button>
+        </div>
+
         <div className="field">
+          <label className="label" htmlFor="network-mode">
+            {t("settings.networkMode")}
+          </label>
           <select
+            id="network-mode"
             className="select"
             value={s.network_mode}
             onChange={(e) => void save({ network_mode: e.target.value as NetworkMode })}
             aria-label={t("settings.networkMode")}
           >
             <option value="auto">{t("settings.modeAuto")}</option>
-            <option value="prefer_tailscale">
-              {t("settings.modePreferTailscale")}
-            </option>
-            <option value="tailscale_only">{t("settings.modeTailscaleOnly")}</option>
+            <option value="tailscale">{t("settings.modeTailscale")}</option>
+            <option value="relay">{t("settings.modeRelay")}</option>
           </select>
         </div>
 
@@ -216,39 +404,42 @@ export default function Settings() {
           <input
             id="relay"
             className="input"
-            placeholder={t("settings.relayDefault")}
+            placeholder={t("settings.relayPlaceholder")}
             value={s.relay_url ?? ""}
             onChange={(e) => setS({ ...s, relay_url: e.target.value || null })}
             onBlur={() => void save({ relay_url: s.relay_url })}
           />
-          <p className="hint">
-            默认是自建中继 <code>http://36.137.140.126:8444</code>（国内服务器，纯 IP
-            直连）。留空则退回 iroh 官方中继（公共设施，不保证可用性）。
-          </p>
+          <p className="hint">{t("settings.relayHint")}</p>
         </div>
 
-        <div className="field">
-          <label className="label" htmlFor="port">
-            {t("settings.listenPort")}
+        <div className="field" style={{ marginBottom: 0 }}>
+          <label className="label" htmlFor="ssh-port">
+            {t("settings.sshPort")}
           </label>
           <input
-            id="port"
+            id="ssh-port"
             className="input"
             type="number"
             min={1}
             max={65535}
-            placeholder={t("settings.listenPortHint")}
-            value={s.listen_port ?? ""}
+            value={s.ssh_port}
             onChange={(e) =>
               setS({
                 ...s,
-                listen_port: e.target.value ? Number(e.target.value) : null,
+                ssh_port: e.target.value ? Number(e.target.value) : 0,
               })
             }
-            onBlur={() => void save({ listen_port: s.listen_port })}
+            onBlur={() => {
+              if (s.ssh_port >= 1 && s.ssh_port <= 65535) {
+                void save({ ssh_port: s.ssh_port });
+              }
+            }}
           />
+          <p className="hint">{t("settings.sshPortHint")}</p>
         </div>
       </div>
+
+      {showRelayGuide && <RelayGuideModal onClose={() => setShowRelayGuide(false)} />}
 
       {/* 诊断 */}
       <div className="card">
@@ -427,6 +618,6 @@ function patchToPreview(p: SettingsPatch): Partial<SettingsDto> {
   if (p.network_mode !== undefined) out.network_mode = p.network_mode;
   if (p.log_level !== undefined) out.log_level = p.log_level;
   if (p.relay_url !== undefined) out.relay_url = p.relay_url;
-  if (p.listen_port !== undefined) out.listen_port = p.listen_port;
+  if (p.ssh_port !== undefined) out.ssh_port = p.ssh_port;
   return out;
 }
