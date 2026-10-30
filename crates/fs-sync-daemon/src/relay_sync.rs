@@ -128,6 +128,8 @@ pub async fn relay_sync_round(
                                 async move { pull_blob(&relay, &peer_dir, &hash, &blobs).await }
                             };
                             let stats = rt.session.apply_remote(&remote, puller).await?;
+                            // 中继每轮上传全量索引，合并结果已包含在内；这里只是别让 pending 堆积
+                            rt.flush_pending().await;
                             if stats.pulled + stats.deleted + stats.conflicts > 0 {
                                 info!(
                                     folder = %folder.folder_id,

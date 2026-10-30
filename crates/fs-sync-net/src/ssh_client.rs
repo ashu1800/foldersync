@@ -136,8 +136,28 @@ impl SshClient {
     }
 
     /// 收一条控制消息。
+    ///
+    /// 注意：不是取消安全的（内部两次 read_exact），不要直接放进 `select!`，
+    /// 否则别的分支先就绪时会丢掉半帧，流从此错位。需要 select 时用 [`Self::spawn_reader`]。
     pub async fn recv(&mut self) -> Result<Message> {
         frame::read_frame(&mut self.reader).await
+    }
+
+    /// 把读半边移到独立任务里逐帧读取，经 channel 交出。channel 的 `recv` 是取消安全的。
+    /// 读出错（含对端关闭）时发出最后一个 `Err` 后结束。之后不要再调用 [`Self::recv`]。
+    pub fn spawn_reader(&mut self) -> tokio::sync::mpsc::Receiver<Result<Message>> {
+        let mut reader = std::mem::replace(&mut self.reader, Box::new(tokio::io::empty()));
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                let r = frame::read_frame(&mut reader).await;
+                let stop = r.is_err();
+                if tx.send(r).await.is_err() || stop {
+                    break;
+                }
+            }
+        });
+        rx
     }
 
     /// SFTP 会话句柄（多个拉取任务共享）。

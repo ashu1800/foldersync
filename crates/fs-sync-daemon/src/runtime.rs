@@ -26,13 +26,58 @@ use crate::watcher::{FileEvent, watch_folder};
 /// 前端事件回调（daemon 不依赖 Tauri）。
 pub type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
+/// 待推送队列：先进先出，同一路径只保留最新条目。
+///
+/// 去重让队列大小以文件数为上限：没有连接在消费时（中继模式、对端离线）不会无限增长，
+/// 同一文件连改多次也只推最后一版。
+#[derive(Debug, Default)]
+pub struct Outbox {
+    order: std::collections::VecDeque<String>,
+    entries: HashMap<String, FileEntry>,
+}
+
+impl Outbox {
+    pub fn push(&mut self, e: FileEntry) {
+        if self.entries.insert(e.path.clone(), e.clone()).is_none() {
+            self.order.push_back(e.path);
+        }
+    }
+
+    pub fn extend(&mut self, it: impl IntoIterator<Item = FileEntry>) {
+        for e in it {
+            self.push(e);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<FileEntry> {
+        let path = self.order.pop_front()?;
+        self.entries.remove(&path)
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    pub fn take_all(&mut self) -> Vec<FileEntry> {
+        let mut out = Vec::with_capacity(self.order.len());
+        while let Some(e) = self.pop() {
+            out.push(e);
+        }
+        out
+    }
+}
+
 /// 一个被同步文件夹的运行时状态。
 pub struct FolderRuntime {
     pub session: Arc<SyncSession>,
     /// 已连接设备的推送通道：device id → 发送端
     pub peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>,
     /// 待推送给对端的本地变更（由事件循环写入，连接循环消费）
-    pub outbox: Arc<tokio::sync::Mutex<Vec<FileEntry>>>,
+    pub outbox: Arc<tokio::sync::Mutex<Outbox>>,
     /// 持有 debouncer 防 drop
     _debouncer: notify_debouncer_full::Debouncer<
         notify::RecommendedWatcher,
@@ -92,7 +137,7 @@ impl FolderRuntime {
 
         // 事件循环：本地变更 → 入 blob → 写入 outbox（由连接循环推送）
         let sess = session.clone();
-        let outbox = Arc::new(tokio::sync::Mutex::new(Vec::<FileEntry>::new()));
+        let outbox = Arc::new(tokio::sync::Mutex::new(Outbox::default()));
         let outbox_for_events = outbox.clone();
         tokio::spawn(async move {
             let mut rx: mpsc::Receiver<FileEvent> = rx;
@@ -105,7 +150,10 @@ impl FolderRuntime {
                         {
                             warn!(path = %entry.path, "加入 blob 失败: {e}");
                         }
-                        outbox_for_events.lock().await.push(entry);
+                        // on_local_event 已把条目放进 session.pending；从 pending 取，
+                        // 否则 pending 只进不出，永远堆积
+                        let pending = sess.take_pending().await;
+                        outbox_for_events.lock().await.extend(pending);
                     }
                     Ok(None) => {}
                     Err(e) => warn!("本地事件处理失败: {e}"),
@@ -163,6 +211,7 @@ impl FolderRuntime {
         let remote: HashMap<String, FileEntry> =
             entries.into_iter().map(|e| (e.path.clone(), e)).collect();
         let stats = self.session.apply_remote(&remote, puller).await?;
+        self.flush_pending().await;
         if stats.pulled + stats.deleted + stats.conflicts > 0 {
             info!(
                 pulled = stats.pulled,
@@ -187,7 +236,16 @@ impl FolderRuntime {
 
     /// 临时取出待推送的本地变更。
     pub async fn take_outbox(&self) -> Vec<FileEntry> {
-        std::mem::take(&mut *self.outbox.lock().await)
+        self.outbox.lock().await.take_all()
+    }
+
+    /// 把 session.pending（apply_remote 产生的冲突合并 / 删改合并结果）转进 outbox，
+    /// 让对端尽快收到收敛后的版本；同时避免 pending 只进不出。
+    pub async fn flush_pending(&self) {
+        let pending = self.session.take_pending().await;
+        if !pending.is_empty() {
+            self.outbox.lock().await.extend(pending);
+        }
     }
 }
 
@@ -297,6 +355,19 @@ async fn peer_supervisor(
                         Err(anyhow::anyhow!("切换到 Tailscale 直连"))
                     }
                 }
+            } else if cfg.mode == NetworkMode::Auto {
+                // 直连失败后回退到了中继。中继轮次正常情况下不会返回，
+                // 以前 auto_fallback_relay 就永远不会被清掉，直连恢复了也一直走中继。
+                // 冷却一段时间后探测对端 SSH 端口，通了就结束中继、回到直连。
+                // 冷却期保证即使直连"时通时不通"，最多每 RELAY_RETRY_DIRECT_AFTER 跳一次。
+                tokio::select! {
+                    result = crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes) => result,
+                    _ = wait_for_direct_reachable(&trust, &peer.id) => {
+                        info!(peer = %peer.name, "对端直连已恢复，从中继切回 Tailscale");
+                        // 走 Ok 分支：重置退避并清掉 auto_fallback_relay
+                        Ok(())
+                    }
+                }
             } else {
                 crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes).await
             }
@@ -345,6 +416,29 @@ async fn wait_for_peer_tailscale(trust: &crate::trust::Trust, peer_id: &str) {
     }
 }
 
+/// 回退到中继后，至少等这么久才尝试切回直连（防止来回跳）。
+const RELAY_RETRY_DIRECT_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 冷却期过后，周期探测对端 SSH 端口，任一地址 TCP 可连即返回。
+async fn wait_for_direct_reachable(trust: &crate::trust::Trust, peer_id: &str) {
+    tokio::time::sleep(RELAY_RETRY_DIRECT_AFTER).await;
+    loop {
+        if fs_sync_net::tailscale::detect().running
+            && let Some(p) = trust.get(peer_id).ok().flatten()
+        {
+            for addr in &p.addresses {
+                let probe = tokio::net::TcpStream::connect((addr.as_str(), p.port));
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), probe).await
+                {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
 /// 一轮 Tailscale SSH 同步：连上对端 → 交换索引 → 持续收发增量，直到连接断开。
 async fn sync_round_ssh(
     cfg: &PeerLoopConfig,
@@ -384,34 +478,33 @@ async fn sync_round_ssh(
     for fid in &cfg.folder_ids {
         let rt_opt = find_runtime(runtimes, fid);
         if let Some(rt) = rt_opt {
+            // 全量索引已经包含全部条目，对端据此 diff 拉取即可。
+            // 以前还把每个条目再排进 outbox 逐条推一遍：10 万文件就是 10 万条重复消息，
+            // 而且（LIFO 时）会压在真实的新变更前面。
             let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
             client
                 .send(&Message::Index {
                     folder_id: fid.clone(),
-                    entries: entries.clone(),
+                    entries,
                 })
                 .await?;
-            // 首轮全量索引里对端没有的条目，直接排入 outbox 待推送
-            let pushable: Vec<FileEntry> = entries
-                .into_iter()
-                .filter(|e| !e.is_dir && !e.deleted)
-                .collect();
-            if !pushable.is_empty() {
-                rt.outbox.lock().await.extend(pushable);
-            }
         }
     }
 
     let sftp = client.sftp();
+    // 读帧放到独立任务：read_frame 不是取消安全的，直接放进 select! 时
+    // 只要别的分支（本地变更、心跳）先就绪，读了一半的帧就丢了，之后整条流错位。
+    let mut incoming = client.spawn_reader();
     loop {
         tokio::select! {
-            msg = client.recv() => {
+            msg = incoming.recv() => {
                 match msg {
-                    Ok(msg) => handle_incoming(&msg, peer, cfg, runtimes, Some(&sftp)).await?,
-                    Err(e) => {
+                    Some(Ok(msg)) => handle_incoming(&msg, peer, cfg, runtimes, Some(&sftp)).await?,
+                    Some(Err(e)) => {
                         warn!(peer = %peer.name, "读对端消息失败: {e:#}");
                         return Err(e.context("读对端消息失败"));
                     }
+                    None => anyhow::bail!("对端控制通道已关闭"),
                 }
             }
             (folder_id, entry) = recv_local_change(runtimes, &cfg.folder_ids) => {
@@ -470,6 +563,7 @@ pub(crate) async fn handle_incoming(
                     rt.session.apply_remote(&remote, puller).await?
                 }
             };
+            rt.flush_pending().await;
             if stats.pulled + stats.deleted + stats.conflicts > 0 {
                 info!(
                     peer = %peer.name,
@@ -538,6 +632,24 @@ async fn recv_local_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fe(path: &str, hash: &str) -> FileEntry {
+        FileEntry::new(path, 1, 1, hash, false, "devA")
+    }
+
+    #[test]
+    fn outbox_is_fifo_and_dedupes_by_path() {
+        let mut o = Outbox::default();
+        o.push(fe("a", "1"));
+        o.push(fe("b", "1"));
+        o.push(fe("a", "2")); // 同路径：覆盖内容，不改变排队位置
+        assert_eq!(o.len(), 2);
+        let first = o.pop().unwrap();
+        assert_eq!((first.path.as_str(), first.hash.as_str()), ("a", "2"));
+        assert_eq!(o.pop().unwrap().path, "b");
+        assert!(o.pop().is_none());
+        assert!(o.is_empty());
+    }
 
     #[tokio::test]
     async fn peer_registry_tracks_connections() {

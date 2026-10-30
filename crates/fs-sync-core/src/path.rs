@@ -71,9 +71,87 @@ pub fn case_conflict(a: &str, b: &str) -> bool {
     a != b && a.eq_ignore_ascii_case(b)
 }
 
+/// 大小写不敏感文件系统上的落盘前检查：本地是否已有一个"仅大小写不同"的活路径。
+/// 命中时调用方应跳过这次拉取，否则 `Readme.md` 会直接覆盖本地的 `README.md`。
+///
+/// 按小写路径建索引，一轮 apply 只建一次：逐个线性扫描的话，
+/// 首次同步 10 万个新文件就是 10^10 次比较。
+/// 折叠规则与 [`case_conflict`] 一致，只折叠 ASCII。
+#[derive(Debug, Default)]
+pub struct CaseIndex {
+    by_lower: std::collections::HashMap<String, String>,
+}
+
+impl CaseIndex {
+    /// 只收录活条目：墓碑对应的文件已不在磁盘上，落盘不会覆盖任何东西。
+    pub fn new(local: &std::collections::HashMap<String, crate::FileEntry>) -> Self {
+        let mut idx = Self::default();
+        for (p, e) in local {
+            if !e.deleted {
+                idx.insert(p);
+            }
+        }
+        idx
+    }
+
+    /// 返回与 `incoming` 仅大小写不同的本地路径。比较整条路径，
+    /// 所以 `a/B.txt` 和 `A/b.txt` 也算冲突。完全同名不算，交给正常的版本比较。
+    pub fn clash(&self, incoming: &str) -> Option<&str> {
+        self.by_lower
+            .get(&incoming.to_ascii_lowercase())
+            .map(String::as_str)
+            .filter(|p| case_conflict(p, incoming))
+    }
+
+    /// 本轮新落盘的路径也要登记，同一批里的 `a.txt` / `A.txt` 才能被拦住。
+    pub fn insert(&mut self, path: &str) {
+        self.by_lower.insert(path.to_ascii_lowercase(), path.to_string());
+    }
+
+    /// 删除落盘后注销，仅大小写改名（先删旧名）才能在同一轮里完成。
+    pub fn remove(&mut self, path: &str) {
+        let key = path.to_ascii_lowercase();
+        if self.by_lower.get(&key).is_some_and(|p| p == path) {
+            self.by_lower.remove(&key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_index_policy() {
+        use crate::FileEntry;
+        let mut local = std::collections::HashMap::new();
+        local.insert("README.md".to_string(), FileEntry::new("README.md", 1, 1, "h", false, "A"));
+        local.insert("a/B.txt".to_string(), FileEntry::new("a/B.txt", 1, 1, "h", false, "A"));
+        let mut tomb = FileEntry::new("old.txt", 1, 1, "h", false, "A");
+        tomb.deleted = true;
+        local.insert("old.txt".to_string(), tomb);
+        let mut idx = CaseIndex::new(&local);
+
+        // 活文件仅大小写不同 → 冲突，返回本地那条路径
+        assert_eq!(idx.clash("Readme.md"), Some("README.md"));
+        // 父目录大小写不同也算
+        assert_eq!(idx.clash("A/b.txt"), Some("a/B.txt"));
+        // 完全同名不是大小写冲突（正常的版本比较流程处理）
+        assert_eq!(idx.clash("README.md"), None);
+        // 本地是墓碑：磁盘上已没有文件
+        assert_eq!(idx.clash("OLD.txt"), None);
+        assert_eq!(idx.clash("other.md"), None);
+
+        // 同一批里先落盘的路径也要拦住后来的
+        idx.insert("new.txt");
+        assert_eq!(idx.clash("NEW.txt"), Some("new.txt"));
+        // 删掉旧名后，仅大小写改名可以落盘
+        idx.remove("README.md");
+        assert_eq!(idx.clash("Readme.md"), None);
+        // remove 只注销完全同名的那条
+        idx.remove("NEW.TXT");
+        assert_eq!(idx.clash("New.txt"), Some("new.txt"));
+    }
 
     #[test]
     fn accepts_normal_relative_paths() {

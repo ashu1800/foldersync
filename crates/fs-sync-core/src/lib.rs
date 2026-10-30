@@ -16,7 +16,7 @@ pub use diff::{Side, SyncAction, conflict_winner, diff};
 pub use entry::{FileEntry, SyncState};
 pub use error::{PathError, Result};
 pub use ignore_mod::{IgnoreMatcher, matcher_for_folder, read_syncignore};
-pub use path::{case_conflict, validate_path};
+pub use path::{CaseIndex, case_conflict, validate_path};
 pub use scan::{hash_file, scan_folder};
 pub use version::{Ordering as VvOrdering, VersionVector, compare, merge};
 

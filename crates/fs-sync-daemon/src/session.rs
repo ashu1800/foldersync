@@ -155,6 +155,19 @@ impl SyncSession {
                 }
 
                 let hash = fs_sync_core::hash_file(&abs)?;
+                // 内容没变（拉取落盘后抑制窗口已过、touch 等）：只刷新元数据，不算新版本
+                if let Some(o) = &old
+                    && !o.deleted
+                    && !o.is_dir
+                    && o.hash == hash
+                {
+                    let mut e = o.clone();
+                    e.size = meta.len();
+                    e.mtime = mtime;
+                    self.engine.store.upsert_entry(&self.folder_id, &e)?;
+                    idx.insert(ev.path.clone(), e);
+                    return Ok(None);
+                }
                 let mut entry = match old {
                     // 已有条目：递增版本
                     Some(mut o) => {
@@ -210,6 +223,10 @@ impl SyncSession {
         let local = self.snapshot().await;
         let actions = diff(&local, remote);
         let mut stats = SyncStats::default();
+        // Windows / macOS 默认文件系统大小写不敏感：对端的 `Readme.md` 落盘会直接
+        // 覆盖本地的 `README.md`。只在这两个平台检查，一轮只建一次索引。
+        let mut case_idx = cfg!(any(windows, target_os = "macos"))
+            .then(|| fs_sync_core::CaseIndex::new(&local));
 
         for action in &actions {
             match action {
@@ -234,6 +251,9 @@ impl SyncSession {
                     if entry.deleted {
                         match self.engine.apply_delete(path).await {
                             Ok(()) => {
+                                if let Some(ci) = &mut case_idx {
+                                    ci.remove(path);
+                                }
                                 self.mark_deleted(path).await;
                                 stats.deleted += 1;
                             }
@@ -253,9 +273,18 @@ impl SyncSession {
                         }
                         continue;
                     }
+                    // 命中就跳过，等用户手动改名（目录不检查：落进同一个目录不丢数据）
+                    if let Some(existing) = case_idx.as_ref().and_then(|ci| ci.clash(path)) {
+                        warn!(%path, %existing, "对端文件与本地文件仅大小写不同，跳过以免覆盖，请手动改名");
+                        stats.failed += 1;
+                        continue;
+                    }
                     match pull_blob(entry.hash.clone()).await {
                         Ok(()) => match self.engine.apply_pulled(entry, &entry.hash).await {
                             Ok(()) => {
+                                if let Some(ci) = &mut case_idx {
+                                    ci.insert(path);
+                                }
                                 self.set_index_entry(entry.clone()).await;
                                 stats.pulled += 1;
                             }
@@ -276,10 +305,9 @@ impl SyncSession {
                     winner,
                     loser,
                 } => {
-                    let (win, lose) = match winner_side {
-                        fs_sync_core::Side::Remote => (winner, loser),
-                        fs_sync_core::Side::Local => (loser, winner),
-                    };
+                    // diff 产出的 winner/loser 已经是按 winner_side 挑好的，不能再按 side 对调
+                    let (win, lose) = (winner, loser);
+                    let win_local = matches!(winner_side, fs_sync_core::Side::Local);
 
                     // 删除 vs 修改 的冲突（提示词 4.4：修改优先于删除）：
                     // 删除侧没有内容可拉，直接保留文件侧，不产生副本、不丢数据。
@@ -304,11 +332,24 @@ impl SyncSession {
                         continue;
                     }
 
-                    if pull_blob(win.hash.clone()).await.is_err() {
+                    // 本地一侧的内容在本地文件里，入 blob 库即可；只有远端一侧才需要拉取
+                    let (win_got, lose_got) = if win_local {
+                        (
+                            self.engine.ensure_blob(win).await.map(|_| ()),
+                            pull_blob(lose.hash.clone()).await,
+                        )
+                    } else {
+                        (
+                            pull_blob(win.hash.clone()).await,
+                            self.engine.ensure_blob(lose).await.map(|_| ()),
+                        )
+                    };
+                    if let Err(e) = win_got {
+                        warn!(%path, "冲突胜者内容不可得: {e}");
                         stats.failed += 1;
                         continue;
                     }
-                    let loser_bytes = match pull_blob(lose.hash.clone()).await {
+                    let loser_bytes = match lose_got {
                         Ok(()) => crate::sync::read_blob_bytes(&self.blobs, &lose.hash)
                             .await
                             .ok(),
@@ -384,15 +425,18 @@ impl SyncSession {
     pub async fn full_scan(&self) -> Result<Vec<FileEntry>> {
         let root = self.root.clone();
         let matcher = fs_sync_core::matcher_for_folder(&root);
-        let scan = tokio::task::spawn_blocking(move || scan_folder(&root, &matcher))
+        let mut scan = tokio::task::spawn_blocking(move || scan_folder(&root, &matcher))
             .await
             .context("兜底扫描任务失败")??;
+        if !scan.unreadable.is_empty() {
+            warn!(count = scan.unreadable.len(), first = %scan.unreadable[0], "兜底扫描有路径读取失败，保留旧条目");
+        }
 
         let mut idx = self.index.lock().await;
         let mut changed = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for (path, mut fresh) in scan.entries {
+        for (path, mut fresh) in std::mem::take(&mut scan.entries) {
             seen.insert(path.clone());
             // 判等不能只看 size + mtime：外部程序在同一秒内写入等长内容时三者全同，
             // 会漏掉真实变更，导致「索引说已同步、磁盘还是旧内容」而且永不修正。
@@ -407,9 +451,20 @@ impl SyncSession {
                 }
                 None => false,
             };
+            // 内容相同、仅 mtime/size 元数据不同（拉取落盘、touch）：不是新版本，
+            // 只刷新本地记录，不递增版本、不广播，否则两端会来回互推
+            let meta_only = !unchanged
+                && matches!(idx.get(&path), Some(old)
+                    if !old.deleted && old.is_dir == fresh.is_dir && old.hash == fresh.hash);
             match idx.get(&path) {
                 _ if unchanged => {
                     // 未变化
+                }
+                Some(old) if meta_only => {
+                    fresh.version = old.version.clone();
+                    fresh.modified_by = old.modified_by.clone();
+                    self.engine.store.upsert_entry(&self.folder_id, &fresh)?;
+                    idx.insert(path.clone(), fresh);
                 }
                 old => {
                     fresh.version = old.map(|o| o.version.clone()).unwrap_or_default();
@@ -441,7 +496,8 @@ impl SyncSession {
         // 扫描中消失的 → 墓碑
         let gone: Vec<String> = idx
             .iter()
-            .filter(|(p, e)| !e.deleted && !seen.contains(*p))
+            // 读不了的路径不算消失：读失败 ≠ 已删除
+            .filter(|(p, e)| !e.deleted && !seen.contains(*p) && !scan.is_unreadable(p))
             .map(|(p, _)| p.clone())
             .collect();
         for path in gone {
@@ -672,6 +728,65 @@ mod tests {
         );
     }
 
+    /// 回归：拉取落盘后 mtime 要对齐对端，且之后的兜底扫描 / 监听事件
+    /// 不能把"同内容只改了 mtime"当成新版本推回去（两端互推）。
+    #[tokio::test]
+    async fn pulled_file_does_not_bounce_back() {
+        let (s, _t) = session().await;
+        s.initial_scan().await.unwrap();
+        let hash = s.blobs.add_bytes(b"abc".to_vec()).await.unwrap();
+        let mut remote = entry("p.txt", &hash, "devB", 1);
+        remote.mtime = 1_600_000_000;
+        let stats = s
+            .apply_remote(&HashMap::from([("p.txt".to_string(), remote.clone())]), |_h| async {
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(stats.pulled, 1);
+        s.take_pending().await;
+
+        let disk_mtime = std::fs::metadata(s.root.join("p.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(disk_mtime, remote.mtime, "落盘文件 mtime 应对齐对端");
+
+        assert!(s.full_scan().await.unwrap().is_empty(), "拉取后兜底扫描不应产生变更");
+
+        // 即便 mtime 被改（touch），内容不变也不算新版本
+        let f = std::fs::File::options().write(true).open(s.root.join("p.txt")).unwrap();
+        f.set_modified(std::time::SystemTime::now()).unwrap();
+        drop(f);
+        assert!(s.full_scan().await.unwrap().is_empty(), "仅 mtime 变化不应递增版本");
+        let ev = s
+            .on_local_event(FileEvent { path: "p.txt".into(), kind: EventKind::Changed })
+            .await
+            .unwrap();
+        assert!(ev.is_none());
+        let snap: HashMap<String, FileEntry> = s.snapshot().await.into_iter().collect();
+        assert_eq!(snap["p.txt"].version, remote.version, "版本不应被本端递增");
+        assert!(s.take_pending().await.is_empty());
+    }
+
+    /// 大小写不敏感平台：对端的 `Readme.md` 不能覆盖本地的 `README.md`。
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn case_clash_does_not_overwrite_local() {
+        let (s, _t) = session().await;
+        std::fs::write(s.root.join("README.md"), b"mine").unwrap();
+        s.initial_scan().await.unwrap();
+        let hash = s.blobs.add_bytes(b"theirs".to_vec()).await.unwrap();
+        let remote = HashMap::from([("Readme.md".to_string(), entry("Readme.md", &hash, "devB", 1))]);
+
+        let stats = s.apply_remote(&remote, |_h| async { Ok(()) }).await.unwrap();
+        assert_eq!(stats.pulled, 0, "大小写冲突的文件不应落盘");
+        assert_eq!(std::fs::read(s.root.join("README.md")).unwrap(), b"mine");
+    }
+
     #[tokio::test]
     async fn full_scan_creates_tombstones_for_deleted() {
         let (s, _t) = session().await;
@@ -798,5 +913,40 @@ mod tests {
             .unwrap();
         assert_eq!(second.conflicts, 0, "重复应用同一远端版本不应再次冲突");
         assert_eq!(copies(&s.root), after_first, "冲突副本不应持续增加");
+    }
+
+    /// 回归：本地胜出时，原路径必须是本地内容，远端内容进冲突副本。
+    /// 曾经按 winner_side 把 winner/loser 又对调了一次，本地胜出时反而用败者覆盖了原文件。
+    #[tokio::test]
+    async fn conflict_local_winner_keeps_local_content() {
+        for (local_mtime, remote_mtime, expect_main, expect_copy) in [
+            (100, 1, "local", "remote"), // 本地 mtime 新 → 本地胜
+            (1, 100, "remote", "local"), // 远端 mtime 新 → 远端胜
+        ] {
+            let (s, _t) = session().await;
+            std::fs::write(s.root.join("c.txt"), b"local").unwrap();
+            let local_hash = s.blobs.add_bytes(b"local".to_vec()).await.unwrap();
+            let remote_hash = s.blobs.add_bytes(b"remote".to_vec()).await.unwrap();
+            let mut l = entry("c.txt", &local_hash, "devA", 1);
+            l.mtime = local_mtime;
+            let mut r = entry("c.txt", &remote_hash, "devB", 1);
+            r.mtime = remote_mtime;
+            s.force_index(HashMap::from([("c.txt".to_string(), l)])).await;
+
+            let stats = s
+                .apply_remote(&HashMap::from([("c.txt".to_string(), r)]), |_h| async { Ok(()) })
+                .await
+                .unwrap();
+            assert_eq!(stats.conflicts, 1);
+
+            let main = std::fs::read_to_string(s.root.join("c.txt")).unwrap();
+            assert_eq!(main, expect_main, "原路径应是胜者内容");
+            let copy = std::fs::read_dir(&s.root)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .find(|e| e.file_name().to_string_lossy().contains("sync-conflict"))
+                .expect("应产生冲突副本");
+            assert_eq!(std::fs::read_to_string(copy.path()).unwrap(), expect_copy);
+        }
     }
 }

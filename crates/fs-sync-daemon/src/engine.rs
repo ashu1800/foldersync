@@ -127,6 +127,20 @@ impl SyncEngine {
         // 从共享 blob 存储导出（原子写）
         self.blobs.export_to(blob_hash, &dest).await?;
 
+        // 落盘文件的 mtime 对齐对端条目。否则本地 mtime 是"现在"，兜底扫描看到
+        // mtime 变化就会递增版本推回去，两端来回互推。失败不致命（扫描侧还有 hash 判等兜底）。
+        if entry.mtime > 0 {
+            let p = dest.clone();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime as u64);
+            let r = tokio::task::spawn_blocking(move || {
+                std::fs::File::options().write(true).open(&p)?.set_modified(t)
+            })
+            .await;
+            if let Ok(Err(e)) = r {
+                warn!(path = %rel, "设置 mtime 失败: {e}");
+            }
+        }
+
         // 自写抑制：避免监听循环
         self.suppression.insert(&rel, blob_hash).await;
         self.mark_applied(entry).await?;

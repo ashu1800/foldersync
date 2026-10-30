@@ -17,31 +17,88 @@ pub struct ScanResult {
     pub entries: HashMap<String, FileEntry>,
     /// 被忽略/跳过的路径（符号链接等），供日志展示
     pub skipped: Vec<String>,
+    /// 读取失败的路径（权限不足、被占用等）。调用方必须保留这些路径（及其子路径）
+    /// 的旧条目，不能当成"已删除"生成墓碑。
+    pub unreadable: Vec<String>,
+}
+
+impl ScanResult {
+    /// `path` 本身或其某个祖先目录读取失败。
+    pub fn is_unreadable(&self, path: &str) -> bool {
+        self.unreadable.iter().any(|u| {
+            path == u || (path.len() > u.len() && path.starts_with(u.as_str()) && path.as_bytes()[u.len()] == b'/')
+        })
+    }
+}
+
+/// 把绝对路径转成相对 root 的 `/` 分隔路径。
+fn rel_of(root: &Path, abs: &Path) -> Option<String> {
+    let rel = abs.strip_prefix(root).ok()?;
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// 从 walker 错误里挖出出错的路径（错误可能被 WithDepth 等多层包裹）。
+fn error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => error_path(err),
+        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
+        _ => None,
+    }
 }
 
 /// 扫描整个文件夹。跳过符号链接（初版不同步链接，提示词 4.8）。
 pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<ScanResult> {
     let mut res = ScanResult::default();
 
+    // 关掉 walker 的所有内置过滤（隐藏文件、.gitignore、.ignore 等），
+    // 否则 `.env`、被 gitignore 的文件会被当成"已删除"传给对端。
+    // 忽略规则统一走我们的 matcher，并在 filter_entry 里剪枝，忽略目录不再往下走。
+    let filter_root = root.to_path_buf();
+    let filter_matcher = matcher.clone();
     let walker = WalkBuilder::new(root)
         .follow_links(false)
-        .filter_entry(|_| true) // 不用 walker 内置过滤，统一走我们的 matcher
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .parents(false)
+        .filter_entry(move |e| match rel_of(&filter_root, e.path()) {
+            Some(rel) => {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                !filter_matcher.matched(&rel, is_dir)
+            }
+            None => true,
+        })
         .build();
 
     for item in walker {
         let e = match item {
             Ok(e) => e,
-            Err(_) => continue, // 读不了的条目跳过
+            Err(err) => {
+                // 读不了的目录/条目：记下来，调用方保留旧条目
+                match error_path(&err) {
+                    // 根目录本身读不了：整体失败，绝不能返回空结果让调用方全删
+                    Some(p) if p == root => {
+                        return Err(std::io::Error::other(err.to_string()));
+                    }
+                    Some(p) => {
+                        if let Some(rel) = rel_of(root, p) {
+                            res.unreadable.push(rel);
+                        }
+                    }
+                    None => return Err(std::io::Error::other(err.to_string())),
+                }
+                continue;
+            }
         };
         let abs = e.path();
-        if abs == root {
-            continue;
-        }
-        let rel = match abs.strip_prefix(root) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let rel_str = match rel_of(root, abs) {
+            Some(r) => r,
+            None => continue, // 根目录本身
         };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         let meta = match e.file_type() {
             Some(ft) if ft.is_symlink() => {
@@ -52,10 +109,8 @@ pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<Scan
             None => continue,
         };
 
+        // 忽略规则已在 filter_entry 里处理（含目录剪枝）
         let is_dir = meta.is_dir();
-        if matcher.matched(&rel_str, is_dir) {
-            continue;
-        }
 
         let (size, mtime, hash) = if is_dir {
             (0u64, 0i64, String::new())
@@ -63,7 +118,7 @@ pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<Scan
             let md = match std::fs::metadata(abs) {
                 Ok(m) => m,
                 Err(_) => {
-                    res.skipped.push(rel_str);
+                    res.unreadable.push(rel_str);
                     continue;
                 }
             };
@@ -73,7 +128,14 @@ pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<Scan
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let hash = hash_file(abs).unwrap_or_default();
+            // 哈希失败（文件被独占锁定等）不能写空 hash，否则会被当成内容变化广播出去
+            let hash = match hash_file(abs) {
+                Ok(h) => h,
+                Err(_) => {
+                    res.unreadable.push(rel_str);
+                    continue;
+                }
+            };
             (md.len(), mtime, hash)
         };
 
@@ -151,6 +213,39 @@ mod tests {
         let r = scan_folder(root, &m).unwrap();
         assert!(r.entries.contains_key("keep.rs"));
         assert!(!r.entries.contains_key("debug.log"));
+    }
+
+    #[test]
+    fn scan_includes_hidden_and_gitignored_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(&root.join(".env"), "SECRET=1");
+        write(&root.join(".hidden/x.txt"), "x");
+        write(&root.join(".gitignore"), "secret.txt\n");
+        write(&root.join("secret.txt"), "s");
+        write(&root.join("node_modules/lib.js"), "x");
+
+        let m = IgnoreMatcher::with_defaults(root);
+        let r = scan_folder(root, &m).unwrap();
+        assert!(r.entries.contains_key(".env"), "隐藏文件不能被跳过");
+        assert!(r.entries.contains_key(".hidden/x.txt"));
+        assert!(r.entries.contains_key("secret.txt"), ".gitignore 不应影响同步");
+        // 我们自己的忽略规则仍然生效，且整棵目录被剪掉
+        assert!(!r.entries.contains_key("node_modules"));
+        assert!(!r.entries.contains_key("node_modules/lib.js"));
+        assert!(r.unreadable.is_empty());
+    }
+
+    #[test]
+    fn is_unreadable_matches_self_and_children_only() {
+        let r = ScanResult {
+            unreadable: vec!["locked".into()],
+            ..Default::default()
+        };
+        assert!(r.is_unreadable("locked"));
+        assert!(r.is_unreadable("locked/a.txt"));
+        assert!(!r.is_unreadable("locked2"));
+        assert!(!r.is_unreadable("other"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub fn scan_and_index(
     store: &Store,
 ) -> Result<HashMap<String, FileEntry>> {
     let matcher = fs_sync_core::matcher_for_folder(root);
-    let scan = scan_folder(root, &matcher)?;
+    let mut scan = scan_folder(root, &matcher)?;
     let existing: HashMap<String, FileEntry> = store
         .list_entries(folder_id)?
         .into_iter()
@@ -49,10 +49,12 @@ pub fn scan_and_index(
         .collect();
 
     let mut out = HashMap::new();
-    for (path, mut entry) in scan.entries {
+    for (path, mut entry) in std::mem::take(&mut scan.entries) {
         // 与数据库已有版本对比：内容未变则沿用旧版本向量，变了则递增
         if let Some(old) = existing.get(&path) {
-            if old.hash == entry.hash && old.mtime == entry.mtime && !old.deleted {
+            // 只看内容：hash 相同而 mtime 不同（拉取落盘、touch）不是新版本，
+            // 沿用旧版本向量，只刷新 mtime，避免两端互推
+            if old.hash == entry.hash && old.is_dir == entry.is_dir && !old.deleted {
                 entry.version = old.version.clone();
                 entry.modified_by = old.modified_by.clone();
             } else {
@@ -67,9 +69,18 @@ pub fn scan_and_index(
         out.insert(path, entry);
     }
 
-    // 本地消失的文件 → 墓碑
     for (path, old) in &existing {
-        if !old.deleted && !out.contains_key(path) {
+        if out.contains_key(path) {
+            continue;
+        }
+        // 读不了的路径：原样保留旧条目，读失败 ≠ 已删除
+        // 已有墓碑：原样保留，否则 replace_entries 会把它抹掉，对端就收不到删除
+        if old.deleted || scan.is_unreadable(path) {
+            out.insert(path.clone(), old.clone());
+            continue;
+        }
+        // 本地消失的文件 → 墓碑
+        {
             let mut tomb = old.clone();
             tomb.deleted = true;
             tomb.version.increment(device_id);
@@ -153,18 +164,27 @@ where
                 winner,
                 loser,
             } => {
-                // 胜者内容落原路径，败者另存
-                let (win, lose) = match winner_side {
-                    fs_sync_core::Side::Remote => (winner, loser),
-                    fs_sync_core::Side::Local => (loser, winner),
+                // 胜者内容落原路径，败者另存。
+                // diff 产出的 winner/loser 已经是按 winner_side 挑好的，不能再按 side 对调。
+                let (win, lose) = (winner, loser);
+                // 本地一侧的内容入 blob 库即可，只有远端一侧需要拉取
+                let (win_got, lose_got) = match winner_side {
+                    fs_sync_core::Side::Local => (
+                        engine.ensure_blob(win).await.map(|_| ()),
+                        pull_blob(lose.hash.clone()).await,
+                    ),
+                    fs_sync_core::Side::Remote => (
+                        pull_blob(win.hash.clone()).await,
+                        engine.ensure_blob(lose).await.map(|_| ()),
+                    ),
                 };
                 // 确保本地有胜者内容
-                if pull_blob(win.hash.clone()).await.is_err() {
+                if win_got.is_err() {
                     stats.failed += 1;
                     continue;
                 }
                 // 败者内容也要取到本地，才能作为冲突副本保留（绝不丢数据）
-                let loser_bytes = if pull_blob(lose.hash.clone()).await.is_ok() {
+                let loser_bytes = if lose_got.is_ok() {
                     read_blob_bytes(&engine.blobs, &lose.hash).await.ok()
                 } else {
                     None
@@ -353,6 +373,28 @@ mod tests {
         std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
         let second = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
         assert!(second["a.txt"].deleted, "消失的文件应变成墓碑");
+    }
+
+    /// 回归：墓碑必须跨扫描保留。曾经第二次扫描时墓碑没进 out，
+    /// replace_entries 直接把它抹掉，重启后对端永远收不到这次删除。
+    #[test]
+    fn tombstone_survives_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+        std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        let second = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+        let v = second["a.txt"].version.clone();
+
+        let third = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+        assert!(third["a.txt"].deleted, "墓碑在再次扫描后必须还在");
+        assert_eq!(third["a.txt"].version, v, "墓碑不应重复递增版本");
+        assert!(store
+            .list_entries("f1")
+            .unwrap()
+            .iter()
+            .any(|e| e.path == "a.txt" && e.deleted));
     }
 
     #[test]
