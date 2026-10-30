@@ -111,8 +111,10 @@ pub async fn run_ssh_server(shared: Arc<SshServerShared>) -> Result<SshServerHan
                         Ok((stream, peer)) => {
                             let config = config.clone();
                             let shared = shared.clone();
+                            let remote_ip = fs_sync_net::tailscale::is_tailscale_ip(peer.ip())
+                                .then(|| peer.ip().to_string());
                             tokio::spawn(async move {
-                                let handler = SshSession::new(shared);
+                                let handler = SshSession::new(shared, remote_ip);
                                 if let Err(e) = server::run_stream(config, stream, handler).await {
                                     debug!(%peer, "SSH 会话失败: {e}");
                                 }
@@ -144,14 +146,17 @@ struct SshSession {
     shared: Arc<SshServerShared>,
     auth: AuthState,
     channels: HashMap<russh::ChannelId, russh::Channel<Msg>>,
+    /// 对端 SSH 源地址（仅 Tailscale 网段），用于学习对端地址。
+    remote_ip: Option<String>,
 }
 
 impl SshSession {
-    fn new(shared: Arc<SshServerShared>) -> Self {
+    fn new(shared: Arc<SshServerShared>, remote_ip: Option<String>) -> Self {
         Self {
             shared,
             auth: AuthState::None,
             channels: HashMap::new(),
+            remote_ip,
         }
     }
 }
@@ -167,6 +172,11 @@ impl server::Handler for SshSession {
         let id = public_key_id(key.public_key);
         if self.shared.trust.is_trusted(&id).unwrap_or(false) {
             info!(device = %id, "SSH 公钥认证通过");
+            // 对端能从 Tailscale 连进来，说明它的当前地址就是连接源地址；
+            // 反过来记录后，下一轮本机也能主动走 Tailscale，避免一端直连一端中继。
+            if let Some(ip) = &self.remote_ip {
+                let _ = self.shared.trust.set_addresses(&id, vec![ip.clone()]);
+            }
             self.auth = AuthState::Trusted { peer_id: id };
             Ok(Auth::Accept)
         } else {

@@ -36,11 +36,21 @@ export function asCmdError(e: unknown): CmdError {
 }
 
 /** 命令调用：失败时抛出 CmdError。 */
-async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+async function call<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+  attempt = 0,
+): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
   } catch (e) {
-    throw asCmdError(e);
+    const err = asCmdError(e);
+    // 前端可能比 setup() 里的 manage(state) 更早挂载；短暂等待初始化完成。
+    if (err.message.includes("state not managed") && attempt < 50) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return call<T>(cmd, args, attempt + 1);
+    }
+    throw err;
   }
 }
 

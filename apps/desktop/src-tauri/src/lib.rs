@@ -48,22 +48,24 @@ pub fn run() {
             std::mem::forget(log_guard);
             info!(dir = %data_dir.display(), "启动 FolderSync");
 
-            let handle = app.handle().clone();
-            let dir_for_init = data_dir.clone();
-            tauri::async_runtime::spawn(async move {
-                match AppState::init(dir_for_init).await {
-                    Ok(st) => {
-                        let want_auto_start = st.settings_dto().auto_start;
-                        state::restore_folders(st.clone()).await;
-                        handle.manage(st);
-                        apply_autostart(&handle, want_auto_start);
-                        info!("daemon 就绪（SSH 服务端已启动）");
-                    }
-                    Err(e) => {
-                        warn!("daemon 初始化失败: {e:#}");
-                    }
-                }
+            // 必须在窗口加载前完成 manage()：前端挂载后会立刻调用命令，
+            // 异步 spawn 初始化会出现短暂的 "state not managed" 报错。
+            let initialized = tauri::async_runtime::block_on(async {
+                let st = AppState::init(data_dir.clone()).await?;
+                state::restore_folders(st.clone()).await;
+                Ok::<_, anyhow::Error>(st)
             });
+            match initialized {
+                Ok(st) => {
+                    let want_auto_start = st.settings_dto().auto_start;
+                    app.manage(st);
+                    apply_autostart(app.handle(), want_auto_start);
+                    info!("daemon 就绪（SSH 服务端已启动）");
+                }
+                Err(e) => {
+                    warn!("daemon 初始化失败: {e:#}");
+                }
+            }
 
             build_tray(app)?;
             Ok(())

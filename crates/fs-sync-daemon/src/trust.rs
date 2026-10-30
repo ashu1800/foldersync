@@ -54,6 +54,17 @@ impl Trust {
         Ok(())
     }
 
+    /// 更新设备的 Tailscale 地址（对端 SSH 连入时从连接源地址学习）。
+    pub fn set_addresses(&self, id: &str, addresses: Vec<String>) -> Result<(), TrustError> {
+        if let Some(mut device) = self.get(id)?
+            && device.addresses != addresses
+        {
+            device.addresses = addresses;
+            self.upsert(&device)?;
+        }
+        Ok(())
+    }
+
     /// 移除信任。
     pub fn remove(&self, id: &str) -> Result<(), TrustError> {
         self.store.remove_device(id)?;
@@ -131,6 +142,18 @@ mod tests {
         assert!(t.is_trusted("SHA256:a").unwrap());
         assert_eq!(t.require("SHA256:a").unwrap(), "home-pc");
         assert_eq!(t.devices().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn learns_peer_address() {
+        let t = trust();
+        t.add(&peer("SHA256:a", "home-pc")).unwrap();
+        t.set_addresses("SHA256:a", vec!["100.64.0.2".into()])
+            .unwrap();
+        assert_eq!(
+            t.get("SHA256:a").unwrap().unwrap().addresses,
+            vec!["100.64.0.2"]
+        );
     }
 
     #[test]

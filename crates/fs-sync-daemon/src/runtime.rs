@@ -246,11 +246,19 @@ async fn peer_supervisor(
     let mut backoff = std::time::Duration::from_secs(2);
     let mut auto_fallback_relay = false;
     loop {
-        // 设备可能已在运行中被移除信任：立即停止，不再重连
-        if trust.get(&peer.id).ok().flatten().is_none() {
-            info!(peer = %peer.name, "设备已移除信任，停止同步任务");
-            return;
-        }
+        // 设备可能已被移除，或对端地址已更新：每轮都读最新记录
+        let peer = match trust.get(&peer.id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                info!(peer = %peer.name, "设备已移除信任，停止同步任务");
+                return;
+            }
+            Err(e) => {
+                warn!(peer = %peer.name, "读取信任列表失败: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
         let cfg = cfg.read().unwrap().clone();
         let use_relay = match cfg.mode {
             NetworkMode::Relay => true,
@@ -279,7 +287,19 @@ async fn peer_supervisor(
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
             }
-            crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes).await
+            if cfg.mode == NetworkMode::Auto && !auto_fallback_relay {
+                // 对端刚获得 Tailscale 地址时，主动结束中继会话并改走直连，
+                // 避免出现「一端 Tailscale、一端中继」的分裂状态。
+                tokio::select! {
+                    result = crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes) => result,
+                    _ = wait_for_peer_tailscale(&trust, &peer.id) => {
+                        info!(peer = %peer.name, "检测到对端 Tailscale 地址，切换为直连");
+                        Err(anyhow::anyhow!("切换到 Tailscale 直连"))
+                    }
+                }
+            } else {
+                crate::relay_sync::relay_sync_round(&cfg, &peer, &runtimes).await
+            }
         } else {
             sync_round_ssh(&cfg, &peer, &runtimes).await
         };
@@ -306,6 +326,22 @@ async fn peer_supervisor(
             }
         }
         tokio::time::sleep(backoff).await;
+    }
+}
+
+/// 等待对端出现可用的 Tailscale 地址（用于从中继切回直连）。
+async fn wait_for_peer_tailscale(trust: &crate::trust::Trust, peer_id: &str) {
+    loop {
+        let has_addr = trust
+            .get(peer_id)
+            .ok()
+            .flatten()
+            .map(|p| !p.addresses.is_empty())
+            .unwrap_or(false);
+        if has_addr && fs_sync_net::tailscale::detect().running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
 }
 
