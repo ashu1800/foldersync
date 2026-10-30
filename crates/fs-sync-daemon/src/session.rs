@@ -223,18 +223,57 @@ impl SyncSession {
         self.index.lock().await.clone()
     }
 
-    /// 应用对端索引/增量：算出需要拉取的动作并执行。
+    /// 应用对端的**全量**索引：算出需要拉取的动作并执行。
+    /// 本地有、对端索引里没有的条目会排进 pending 推给对端。
     pub async fn apply_remote<F, Fut>(
         &self,
         remote: &HashMap<String, FileEntry>,
+        pull_blob: F,
+    ) -> Result<SyncStats>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.apply_inner(remote, pull_blob, false).await
+    }
+
+    /// 应用对端的**增量**（IndexUpdate）：只比对消息里带的路径。
+    ///
+    /// 增量只含几条变更，"本地有、消息里没有"不代表对端缺。以前增量也走全量比对，
+    /// 每收到一条增量就把本地独有的条目全推回去，对端收到后又推回来，两端无限互推。
+    pub async fn apply_remote_update<F, Fut>(
+        &self,
+        remote: &HashMap<String, FileEntry>,
+        pull_blob: F,
+    ) -> Result<SyncStats>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.apply_inner(remote, pull_blob, true).await
+    }
+
+    async fn apply_inner<F, Fut>(
+        &self,
+        remote: &HashMap<String, FileEntry>,
         mut pull_blob: F,
+        partial: bool,
     ) -> Result<SyncStats>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
         let local = self.snapshot().await;
-        let actions = diff(&local, remote);
+        let actions = if partial {
+            let scoped: HashMap<String, FileEntry> = local
+                .iter()
+                .filter(|(p, _)| remote.contains_key(*p))
+                .map(|(p, e)| (p.clone(), e.clone()))
+                .collect();
+            diff(&scoped, remote)
+        } else {
+            diff(&local, remote)
+        };
         let mut stats = SyncStats::default();
         // Windows / macOS 默认文件系统大小写不敏感：对端的 `Readme.md` 落盘会直接
         // 覆盖本地的 `README.md`。只在这两个平台检查，一轮只建一次索引。
@@ -796,6 +835,33 @@ mod tests {
         let snap: HashMap<String, FileEntry> = s.snapshot().await.into_iter().collect();
         assert_eq!(snap["p.txt"].version, remote.version, "版本不应被本端递增");
         assert!(s.take_pending().await.is_empty());
+    }
+
+    /// 回归：增量只比对消息里的路径。曾经增量也走全量比对，本地独有的条目
+    /// 每收到一条增量就被推回去一次，两端无限互推（真机上每秒约 10 条）。
+    #[tokio::test]
+    async fn partial_update_does_not_push_unrelated_local_entries() {
+        let (s, _t) = session().await;
+        std::fs::write(s.root.join("mine.txt"), b"local only").unwrap();
+        s.initial_scan().await.unwrap();
+        s.take_pending().await;
+
+        let hash = s.blobs.add_bytes(b"theirs".to_vec()).await.unwrap();
+        let update = HashMap::from([("t.txt".to_string(), entry("t.txt", &hash, "devB", 1))]);
+        let stats = s
+            .apply_remote_update(&update, |_h| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(stats.pulled, 1);
+        assert_eq!(stats.pushed, 0, "增量不应把无关的本地条目推回去");
+        assert!(s.take_pending().await.is_empty());
+
+        // 全量索引里没有 mine.txt：这时才该推
+        let full = s
+            .apply_remote(&update, |_h| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(full.pushed, 1);
     }
 
     /// 回归：改名时 notify 对源路径报 Modify(Name) 而不是 Remove，

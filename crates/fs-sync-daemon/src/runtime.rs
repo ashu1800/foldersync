@@ -210,7 +210,7 @@ impl FolderRuntime {
         );
         let remote: HashMap<String, FileEntry> =
             entries.into_iter().map(|e| (e.path.clone(), e)).collect();
-        let stats = self.session.apply_remote(&remote, puller).await?;
+        let stats = self.session.apply_remote_update(&remote, puller).await?;
         self.flush_pending().await;
         if stats.pulled + stats.deleted + stats.conflicts > 0 {
             info!(
@@ -562,6 +562,8 @@ pub(crate) async fn handle_incoming(
             let Some(rt) = find_runtime(runtimes, folder_id) else {
                 return Ok(());
             };
+            // 增量只比对消息里的路径，否则本地独有的条目每次都被推回去，两端互推
+            let partial = matches!(msg, Message::IndexUpdate { .. });
             let remote: HashMap<String, FileEntry> = entries
                 .iter()
                 .cloned()
@@ -579,7 +581,11 @@ pub(crate) async fn handle_incoming(
                                 .await
                         }
                     };
-                    rt.session.apply_remote(&remote, puller).await?
+                    if partial {
+                        rt.session.apply_remote_update(&remote, puller).await?
+                    } else {
+                        rt.session.apply_remote(&remote, puller).await?
+                    }
                 }
                 None => {
                     let puller = crate::sync::make_ssh_puller(
@@ -587,7 +593,11 @@ pub(crate) async fn handle_incoming(
                         cfg.identity.clone(),
                         rt.session.blobs.clone(),
                     );
-                    rt.session.apply_remote(&remote, puller).await?
+                    if partial {
+                        rt.session.apply_remote_update(&remote, puller).await?
+                    } else {
+                        rt.session.apply_remote(&remote, puller).await?
+                    }
                 }
             };
             rt.flush_pending().await;
