@@ -26,7 +26,10 @@ impl ScanResult {
     /// `path` 本身或其某个祖先目录读取失败。
     pub fn is_unreadable(&self, path: &str) -> bool {
         self.unreadable.iter().any(|u| {
-            path == u || (path.len() > u.len() && path.starts_with(u.as_str()) && path.as_bytes()[u.len()] == b'/')
+            path == u
+                || (path.len() > u.len()
+                    && path.starts_with(u.as_str())
+                    && path.as_bytes()[u.len()] == b'/')
         })
     }
 }
@@ -42,7 +45,9 @@ fn rel_of(root: &Path, abs: &Path) -> Option<String> {
 fn error_path(err: &ignore::Error) -> Option<&Path> {
     match err {
         ignore::Error::WithPath { path, .. } => Some(path.as_path()),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => error_path(err),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err)
+        }
         ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
         _ => None,
     }
@@ -229,7 +234,10 @@ mod tests {
         let r = scan_folder(root, &m).unwrap();
         assert!(r.entries.contains_key(".env"), "隐藏文件不能被跳过");
         assert!(r.entries.contains_key(".hidden/x.txt"));
-        assert!(r.entries.contains_key("secret.txt"), ".gitignore 不应影响同步");
+        assert!(
+            r.entries.contains_key("secret.txt"),
+            ".gitignore 不应影响同步"
+        );
         // 我们自己的忽略规则仍然生效，且整棵目录被剪掉
         assert!(!r.entries.contains_key("node_modules"));
         assert!(!r.entries.contains_key("node_modules/lib.js"));

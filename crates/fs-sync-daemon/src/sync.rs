@@ -390,11 +390,13 @@ mod tests {
         let third = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
         assert!(third["a.txt"].deleted, "墓碑在再次扫描后必须还在");
         assert_eq!(third["a.txt"].version, v, "墓碑不应重复递增版本");
-        assert!(store
-            .list_entries("f1")
-            .unwrap()
-            .iter()
-            .any(|e| e.path == "a.txt" && e.deleted));
+        assert!(
+            store
+                .list_entries("f1")
+                .unwrap()
+                .iter()
+                .any(|e| e.path == "a.txt" && e.deleted)
+        );
     }
 
     #[test]

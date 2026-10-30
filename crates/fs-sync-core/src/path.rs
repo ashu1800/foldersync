@@ -105,7 +105,8 @@ impl CaseIndex {
 
     /// 本轮新落盘的路径也要登记，同一批里的 `a.txt` / `A.txt` 才能被拦住。
     pub fn insert(&mut self, path: &str) {
-        self.by_lower.insert(path.to_ascii_lowercase(), path.to_string());
+        self.by_lower
+            .insert(path.to_ascii_lowercase(), path.to_string());
     }
 
     /// 删除落盘后注销，仅大小写改名（先删旧名）才能在同一轮里完成。
@@ -125,8 +126,14 @@ mod tests {
     fn case_index_policy() {
         use crate::FileEntry;
         let mut local = std::collections::HashMap::new();
-        local.insert("README.md".to_string(), FileEntry::new("README.md", 1, 1, "h", false, "A"));
-        local.insert("a/B.txt".to_string(), FileEntry::new("a/B.txt", 1, 1, "h", false, "A"));
+        local.insert(
+            "README.md".to_string(),
+            FileEntry::new("README.md", 1, 1, "h", false, "A"),
+        );
+        local.insert(
+            "a/B.txt".to_string(),
+            FileEntry::new("a/B.txt", 1, 1, "h", false, "A"),
+        );
         let mut tomb = FileEntry::new("old.txt", 1, 1, "h", false, "A");
         tomb.deleted = true;
         local.insert("old.txt".to_string(), tomb);

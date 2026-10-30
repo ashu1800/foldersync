@@ -225,8 +225,8 @@ impl SyncSession {
         let mut stats = SyncStats::default();
         // Windows / macOS 默认文件系统大小写不敏感：对端的 `Readme.md` 落盘会直接
         // 覆盖本地的 `README.md`。只在这两个平台检查，一轮只建一次索引。
-        let mut case_idx = cfg!(any(windows, target_os = "macos"))
-            .then(|| fs_sync_core::CaseIndex::new(&local));
+        let mut case_idx =
+            cfg!(any(windows, target_os = "macos")).then(|| fs_sync_core::CaseIndex::new(&local));
 
         for action in &actions {
             match action {
@@ -738,9 +738,10 @@ mod tests {
         let mut remote = entry("p.txt", &hash, "devB", 1);
         remote.mtime = 1_600_000_000;
         let stats = s
-            .apply_remote(&HashMap::from([("p.txt".to_string(), remote.clone())]), |_h| async {
-                Ok(())
-            })
+            .apply_remote(
+                &HashMap::from([("p.txt".to_string(), remote.clone())]),
+                |_h| async { Ok(()) },
+            )
             .await
             .unwrap();
         assert_eq!(stats.pulled, 1);
@@ -755,15 +756,27 @@ mod tests {
             .as_secs() as i64;
         assert_eq!(disk_mtime, remote.mtime, "落盘文件 mtime 应对齐对端");
 
-        assert!(s.full_scan().await.unwrap().is_empty(), "拉取后兜底扫描不应产生变更");
+        assert!(
+            s.full_scan().await.unwrap().is_empty(),
+            "拉取后兜底扫描不应产生变更"
+        );
 
         // 即便 mtime 被改（touch），内容不变也不算新版本
-        let f = std::fs::File::options().write(true).open(s.root.join("p.txt")).unwrap();
+        let f = std::fs::File::options()
+            .write(true)
+            .open(s.root.join("p.txt"))
+            .unwrap();
         f.set_modified(std::time::SystemTime::now()).unwrap();
         drop(f);
-        assert!(s.full_scan().await.unwrap().is_empty(), "仅 mtime 变化不应递增版本");
+        assert!(
+            s.full_scan().await.unwrap().is_empty(),
+            "仅 mtime 变化不应递增版本"
+        );
         let ev = s
-            .on_local_event(FileEvent { path: "p.txt".into(), kind: EventKind::Changed })
+            .on_local_event(FileEvent {
+                path: "p.txt".into(),
+                kind: EventKind::Changed,
+            })
             .await
             .unwrap();
         assert!(ev.is_none());
@@ -780,9 +793,15 @@ mod tests {
         std::fs::write(s.root.join("README.md"), b"mine").unwrap();
         s.initial_scan().await.unwrap();
         let hash = s.blobs.add_bytes(b"theirs".to_vec()).await.unwrap();
-        let remote = HashMap::from([("Readme.md".to_string(), entry("Readme.md", &hash, "devB", 1))]);
+        let remote = HashMap::from([(
+            "Readme.md".to_string(),
+            entry("Readme.md", &hash, "devB", 1),
+        )]);
 
-        let stats = s.apply_remote(&remote, |_h| async { Ok(()) }).await.unwrap();
+        let stats = s
+            .apply_remote(&remote, |_h| async { Ok(()) })
+            .await
+            .unwrap();
         assert_eq!(stats.pulled, 0, "大小写冲突的文件不应落盘");
         assert_eq!(std::fs::read(s.root.join("README.md")).unwrap(), b"mine");
     }
@@ -931,10 +950,13 @@ mod tests {
             l.mtime = local_mtime;
             let mut r = entry("c.txt", &remote_hash, "devB", 1);
             r.mtime = remote_mtime;
-            s.force_index(HashMap::from([("c.txt".to_string(), l)])).await;
+            s.force_index(HashMap::from([("c.txt".to_string(), l)]))
+                .await;
 
             let stats = s
-                .apply_remote(&HashMap::from([("c.txt".to_string(), r)]), |_h| async { Ok(()) })
+                .apply_remote(&HashMap::from([("c.txt".to_string(), r)]), |_h| async {
+                    Ok(())
+                })
                 .await
                 .unwrap();
             assert_eq!(stats.conflicts, 1);

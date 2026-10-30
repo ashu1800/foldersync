@@ -133,7 +133,10 @@ impl SyncEngine {
             let p = dest.clone();
             let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.mtime as u64);
             let r = tokio::task::spawn_blocking(move || {
-                std::fs::File::options().write(true).open(&p)?.set_modified(t)
+                std::fs::File::options()
+                    .write(true)
+                    .open(&p)?
+                    .set_modified(t)
             })
             .await;
             if let Ok(Err(e)) = r {
