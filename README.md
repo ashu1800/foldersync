@@ -65,7 +65,7 @@ cd apps/desktop && pnpm install && pnpm tauri dev
 - [x] M4 双向实时同步（实测：新增 1.0~1.1s、删除 1.0s 双向传播；冲突保留副本不丢数据且不重复）
 - [x] M5 桌面应用（6 个页面、托盘、开机自启、关闭到托盘、6 个事件推送、ts-rs 类型自动生成、中英双语、ESLint+Prettier）
 - [x] M6 打磨发布（带宽限速、自建中继、固定端口、日志落盘、诊断包导出、规模测试、NSIS 安装包）
-  - 自建中继已实际部署：`https://sync.ashu180.top:8444`（见下节）。
+  - 自建中继已实际部署：`http://36.137.140.126:8444`（见下节）。
 
 ## 同步实测数据（家 ↔ 公司，经 Tailscale/打洞）
 
@@ -183,26 +183,31 @@ git push origin main --tags
 
 ## 自建中继
 
-公网中继部署在 `66.42.99.110`（Vultr 新加坡），域名为 `sync.ashu180.top`。
+公网中继部署在 `36.137.140.126`（国内服务器，纯 IP 直连，无域名）。
+2026-10-30 从 `sync.ashu180.top:8444`（Vultr 新加坡）迁来：跨境链路被干扰，
+用户两端的中继连接反复被重置，表现为配对一直超时。
 
 | 项 | 值 |
 |----|-----|
-| RelayUrl | `https://sync.ashu180.top:8444` |
-| HTTPS / WSS | TCP 8444（**必须带端口**：443/80 被同机 nginx 占用） |
-| QUIC 地址发现（QAD） | UDP 7842，用于探测公网地址、提高打洞成功率 |
+| RelayUrl | `http://36.137.140.126:8444` |
+| HTTP / WS | TCP 8444 |
+| QUIC 地址发现（QAD） | 无——纯 HTTP 模式不支持（QAD 依赖 TLS），打洞辅助少一项 |
 | 服务 | systemd `iroh-relay.service`，二进制 `/usr/local/bin/iroh-relay` |
 | 配置 | `/etc/iroh-relay/config.toml` |
-| 证书 | certbot 签发到 `/etc/letsencrypt/live/sync.ashu180.top/`，复制到 `/var/lib/iroh-relay/certs/`，`cert_mode = "Reloading"` 自动热加载 |
 | 版本 | 与客户端同版本 `iroh-relay 1.4.1`（中继协议必须对齐） |
 
 应用默认就用这个中继（`SettingsDto::default()`），设置页里清空「中继服务器」即可退回 iroh 官方中继。
+老配置里存的 `https://sync.ashu180.top:8444` 会在启动加载设置时自动迁移到新地址。
+
+为什么纯 HTTP 不降安全性：iroh 的传输载荷本身端到端加密，中继只转发密文；
+没有域名就没有正规 TLS 证书，自签证书还得让客户端关校验，得不偿失。
 
 运维命令：
 
 ```bash
 systemctl status iroh-relay
 journalctl -u iroh-relay -n 50 --no-pager
-curl --fail https://sync.ashu180.top:8444/healthz
+curl --fail http://36.137.140.126:8444/healthz
 ```
 
 连通性自查（需要外网）：

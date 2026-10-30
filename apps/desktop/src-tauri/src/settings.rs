@@ -18,13 +18,14 @@ pub struct SettingsStore {
 impl SettingsStore {
     /// 从磁盘加载（文件不存在则用默认值）。
     pub fn load(path: &Path) -> Result<Self> {
-        let dto = match std::fs::read_to_string(path) {
+        let mut dto = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 tracing::warn!("设置文件损坏，改用默认值: {e}");
                 SettingsDto::default()
             }),
             Err(_) => SettingsDto::default(),
         };
+        migrate_stale_relay(&mut dto, path);
         Ok(Self {
             path: path.to_path_buf(),
             inner: Mutex::new(dto),
@@ -48,14 +49,34 @@ impl SettingsStore {
 
     /// 原子写盘（先写临时文件再 rename，避免断电留半截文件）。
     fn persist(&self, dto: &SettingsDto) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+        persist_to(&self.path, dto)
+    }
+}
+
+/// 原子写盘（先写临时文件再 rename，避免断电留半截文件）。
+fn persist_to(path: &Path, dto: &SettingsDto) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let json = serde_json::to_string_pretty(dto)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).context("写设置临时文件失败")?;
+    std::fs::rename(&tmp, path).context("替换设置文件失败")?;
+    Ok(())
+}
+
+/// 已废弃的中继地址 → 现用默认中继。中继搬家后，老 settings.json 里存着
+/// 旧地址会一直连不上（设置页只有用户主动改才会更新），这里在加载时
+/// 静默搬过来并写回。用户自定义的其它 URL 一律不碰。
+fn migrate_stale_relay(dto: &mut SettingsDto, path: &Path) {
+    const STALE: &str = "https://sync.ashu180.top:8444";
+    if dto.relay_url.as_deref() == Some(STALE) {
+        let new_url = SettingsDto::default().relay_url.unwrap_or_default();
+        tracing::info!("settings.json 里的中继已迁移: {STALE} -> {new_url}");
+        dto.relay_url = SettingsDto::default().relay_url;
+        if let Err(e) = persist_to(path, dto) {
+            tracing::warn!("迁移后的设置写盘失败: {e:#}");
         }
-        let json = serde_json::to_string_pretty(dto)?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).context("写设置临时文件失败")?;
-        std::fs::rename(&tmp, &self.path).context("替换设置文件失败")?;
-        Ok(())
     }
 }
 
@@ -158,6 +179,44 @@ mod tests {
         let s = reloaded.get();
         assert_eq!(s.device_name, "测试机");
         assert_eq!(s.upload_limit_kbps, 1024);
+    }
+
+    #[test]
+    fn stale_relay_url_migrates_to_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        // SettingsDto 反序列化要求全字段（真实 settings.json 由 persist 写出，满足）。
+        // 注意 relay_url 用 null 会被当成 None（= 官方中继），所以这里必须写字符串。
+        let full = SettingsDto {
+            relay_url: Some("https://sync.ashu180.top:8444".into()),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&full).unwrap()).unwrap();
+
+        let store = SettingsStore::load(&path).unwrap();
+        let s = store.get();
+        assert_eq!(
+            s.relay_url,
+            SettingsDto::default().relay_url,
+            "旧中继地址应自动换成新默认值"
+        );
+
+        // 已写回磁盘：重新加载不再含旧地址
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sync.ashu180.top"), "应写回: {text}");
+
+        // 用户自定义的其它 URL 不碰
+        let custom = SettingsDto {
+            relay_url: Some("https://my-own-relay.example:9000".into()),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_string(&custom).unwrap()).unwrap();
+        let store = SettingsStore::load(&path).unwrap();
+        assert_eq!(
+            store.get().relay_url,
+            Some("https://my-own-relay.example:9000".into()),
+            "用户自定义 URL 不应被迁移"
+        );
     }
 
     #[test]

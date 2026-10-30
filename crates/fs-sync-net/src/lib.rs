@@ -45,11 +45,13 @@ pub async fn bind_endpoint() -> Result<Endpoint> {
         .context("iroh Endpoint 绑定失败")
 }
 
-/// 默认中继：自建（66.42.99.110 / sync.ashu180.top）。
+/// 默认中继：自建（36.137.140.126，国内服务器，纯 IP 直连）。
 ///
-/// 443 和 80 被同机的 nginx 占用，所以中继监听 8444，**RelayUrl 必须带端口**。
-/// 想改回 iroh 官方中继就把 `NetConfig::relay_url` 设为 `None`。
-pub const DEFAULT_RELAY_URL: &str = "https://sync.ashu180.top:8444";
+/// 纯 HTTP：没有域名就没有正规证书，iroh 载荷本身端到端加密，
+/// 中继只转发密文，链路层明文不降低安全性。iroh 客户端对 http:// 的
+/// RelayUrl 自动走 ws://。2026-10-30 从 sync.ashu180.top:8444（新加坡，
+/// 跨境链路被干扰导致配对超时）迁来。
+pub const DEFAULT_RELAY_URL: &str = "http://36.137.140.126:8444";
 
 /// 网络配置（提示词 4.x / 设置页）。
 #[derive(Debug, Clone)]
@@ -199,7 +201,7 @@ mod tests {
     /// 两端落到不同中继上就配不上对（诊断日志里抓到的抖动）。
     #[test]
     fn relay_map_has_exactly_the_custom_relay() {
-        let custom: iroh::RelayUrl = "https://sync.ashu180.top:8444".parse().unwrap();
+        let custom: iroh::RelayUrl = crate::DEFAULT_RELAY_URL.parse().unwrap();
         let map = relay_map_with(custom.clone());
         assert!(map.contains(&custom), "自建中继必须在 map 里");
         assert_eq!(map.len(), 1, "relay map 只能有自建中继，否则会来回跳");

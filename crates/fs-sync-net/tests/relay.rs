@@ -15,7 +15,7 @@ use fs_sync_net::{NetConfig, bind_endpoint_with};
 use iroh::{SecretKey, Watcher};
 
 /// 默认中继地址。端口必须写：443/80 被 nginx 占用，中继在 8444。
-const DEFAULT_RELAY: &str = "https://sync.ashu180.top:8444";
+const DEFAULT_RELAY: &str = "http://36.137.140.126:8444";
 
 #[tokio::test]
 #[ignore = "需要外网与已部署的中继，手动跑：cargo test -p fs-sync-net --test relay -- --ignored"]

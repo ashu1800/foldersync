@@ -11,7 +11,7 @@ use fs_sync_net::pairing;
 use fs_sync_net::{ALPN, Echo, NetConfig, bind_endpoint_with, mount};
 use iroh::{Endpoint, SecretKey};
 
-const CUSTOM: &str = "https://sync.ashu180.top:8444";
+const CUSTOM: &str = "http://36.137.140.126:8444";
 
 async fn bind(relay: Option<&str>) -> Endpoint {
     let cfg = NetConfig {

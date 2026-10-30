@@ -362,3 +362,40 @@ certbot 续期后不用重启服务。如果只在启动时读一次（Manual）
 
 **验收**：`tests/relay_only.rs` 用两个只带中继地址（不含任何 IP）的 endpoint
 互连，3.5 秒建立连接，证明中继确实在转发而不只是提供地址发现。
+
+## 2026-10-30 中继迁到国内服务器（36.137.140.126，改纯 HTTP）
+
+用户报「添加设备无法成功配对，一直提示超时」。排查：
+
+- 中继本体健康：healthz 返回 200，进程 active，RSS 7.3MB。
+- 但 journalctl 里两端真实 IP（220.166.213.118 / 110.184.53.144，都是国内家宽/运营商）
+  的中继连接**几分钟一次**反复 `peer closed connection without sending TLS close_notify`
+  和 `Connection reset by peer` —— 建得上连但稳不住，正是跨境链路（国内 ↔ Vultr
+  新加坡）被干扰的典型形态。两端的直连/打洞本来就成，全靠中继兜底的场景
+  （双 NAT 两侧都是国内运营商）被这条不稳的链路卡死 → 配对必超时。
+
+**新机**：36.137.140.126（拓飞云，Debian 13，4C/4G，国内）。用户明确不接域名、纯 IP 直连。
+
+**为什么改成纯 HTTP（去掉 TLS）**：没有域名就没有 Let's Encrypt 正规证书，
+自签证书要么客户端关校验（更糟），要么手动分发（运维灾难）。
+iroh 的传输载荷本身端到端加密，中继只是转发密文，链路层明文不降低安全性。
+客户端对 `http://` 的 RelayUrl 自动降级为 ws://（iroh-relay client.rs 269-272 行）。
+
+**代价**：QUIC 地址发现（QAD）要求 TLS，纯 HTTP 模式下不可用（config 里整个
+`[tls]` 段删掉即可，QAD 端口 7842 也不再监听）。打洞辅助少一项；
+中继转发路径不受影响。以后要恢复 QAD，配个域名 + 证书即可。
+
+**配置**（`/etc/iroh-relay/config.toml`）：`enable_relay = true`、
+`http_bind_addr = "[::]:8444"`、`enable_metrics = false`、`key_cache_capacity = 65536`、
+`access = "everyone"`。systemd unit 原样复用（ProtectSystem=strict 等加固保留）。
+
+**客户端**：`fs_sync_net::DEFAULT_RELAY_URL` 改为 `http://36.137.140.126:8444`。
+老 `settings.json` 里存的旧地址在 `SettingsStore::load` 时自动迁移到新默认值并写回
+（`migrate_stale_relay`，只精确匹配旧 URL，用户自定义的其它地址不碰）。
+
+**验证**：`cargo test -p fs-sync-net --test relay_only -- --ignored` 全绿，
+两个纯中继路径的 endpoint 4.15 秒建立连接，配对码（无 IP 无 DNS）链路也通过。
+healthz 从本地实测 200。
+
+**旧机处置**：66.42.99.110 上的 iroh-relay 先留着（没有 DNS 指过去，客户端
+默认已不再指向它），观察新中继稳定一周后可下线。

@@ -222,8 +222,8 @@ export default function Settings() {
             onBlur={() => void save({ relay_url: s.relay_url })}
           />
           <p className="hint">
-            默认是自建中继 <code>https://sync.ashu180.top:8444</code>。留空则退回 iroh
-            官方中继（公共设施，不保证可用性）。
+            默认是自建中继 <code>http://36.137.140.126:8444</code>（国内服务器，纯 IP
+            直连）。留空则退回 iroh 官方中继（公共设施，不保证可用性）。
           </p>
         </div>
 

@@ -6,7 +6,7 @@ Write-Host ""
 
 # 1. 检查中继服务器连通性
 Write-Host "1. 检查中继服务器连通性..." -ForegroundColor Yellow
-$relayHost = "sync.ashu180.top"
+$relayHost = "36.137.140.126"
 $relayPort = 8444
 
 try {
@@ -106,17 +106,17 @@ foreach ($iface in $activeInterfaces) {
 }
 Write-Host ""
 
-# 6. 测试 HTTPS 连接
-Write-Host "6. 测试 HTTPS 连接到中继服务器..." -ForegroundColor Yellow
+# 6. 测试 HTTP 连接（中继现在是纯 HTTP 模式，见 docs/decisions.md）
+Write-Host "6. 测试 HTTP 连接到中继服务器..." -ForegroundColor Yellow
 try {
-    $response = Invoke-WebRequest -Uri "https://${relayHost}:${relayPort}" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-    Write-Host "   ✓ HTTPS 连接成功 (状态码: $($response.StatusCode))" -ForegroundColor Green
+    $response = Invoke-WebRequest -Uri "http://${relayHost}:${relayPort}/healthz" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    Write-Host "   ✓ 中继健康检查通过 (状态码: $($response.StatusCode))" -ForegroundColor Green
 } catch {
     $errorMsg = $_.Exception.Message
     if ($errorMsg -like "*404*" -or $errorMsg -like "*403*") {
         Write-Host "   ✓ 服务器响应 (非200但服务器在线)" -ForegroundColor Green
     } else {
-        Write-Host "   ✗ HTTPS 连接失败: $errorMsg" -ForegroundColor Red
+        Write-Host "   ✗ 中继连接失败: $errorMsg" -ForegroundColor Red
     }
 }
 Write-Host ""
