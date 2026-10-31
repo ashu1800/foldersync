@@ -44,6 +44,8 @@ pub type CmdResult<T> = Result<T, ErrorDto>;
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "../../src/lib/bindings/")]
 pub enum OverallStatus {
+    /// 尚未配置（没有设备或没有文件夹）
+    NotConfigured,
     /// 全部已同步
     Synced,
     /// 正在同步
@@ -129,6 +131,8 @@ pub struct FolderDto {
     pub file_count: u32,
     /// 分享给的设备 id 列表
     pub shared_with: Vec<String>,
+    /// 最近一次同步失败原因（成功时清空）
+    pub last_error: Option<String>,
 }
 
 /// 概览数据。
@@ -229,6 +233,16 @@ pub struct ConflictDto {
     pub original_mtime: Option<i64>,
     /// 副本来源设备名（从文件名解析）
     pub source_device: String,
+}
+
+/// 冲突文件预览（最多各 64 KiB，避免大文件卡住界面）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "../../src/lib/bindings/")]
+pub struct ConflictPreviewDto {
+    pub original: Option<String>,
+    pub conflict: String,
+    pub truncated: bool,
+    pub binary: bool,
 }
 
 /// 冲突解决方式。

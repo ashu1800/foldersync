@@ -26,6 +26,8 @@ use crate::sftp_fs::FsSftpHandler;
 pub struct RelayServerConfig {
     pub data_dir: PathBuf,
     pub port: u16,
+    /// 空闲房间保留天数，0 表示不清理
+    pub room_retention_days: u64,
 }
 
 /// 运行中的中继服务端；drop 即停止监听。
@@ -60,11 +62,16 @@ pub async fn run_relay_server(config: RelayServerConfig) -> Result<RelayServerHa
         ..Default::default()
     });
     let data_dir = config.data_dir.clone();
+    let rooms_dir = data_dir.join("rooms");
+    let retention_days = config.room_retention_days;
     let (stop_tx, mut stop_rx) = oneshot::channel();
     tokio::spawn(async move {
+        let mut cleanup = tokio::time::interval(Duration::from_secs(6 * 3600));
+        cleanup.tick().await;
         loop {
             tokio::select! {
                 _ = &mut stop_rx => break,
+                _ = cleanup.tick() => cleanup_rooms(&rooms_dir, retention_days),
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, peer)) => {
@@ -91,6 +98,54 @@ pub async fn run_relay_server(config: RelayServerConfig) -> Result<RelayServerHa
         port,
         stop: Some(stop_tx),
     })
+}
+
+/// 删除超过保留期的空闲房间；房间内最新文件时间作为活跃时间。
+fn cleanup_rooms(rooms_dir: &std::path::Path, retention_days: u64) {
+    if retention_days == 0 {
+        return;
+    }
+    let Some(cutoff) = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(rooms_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(newest) = newest_mtime(&path) else {
+            continue;
+        };
+        if newest < cutoff && std::fs::remove_dir_all(&path).is_ok() {
+            info!(room = %path.display(), "已清理过期中继房间");
+        }
+    }
+}
+
+fn newest_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    // 不跟随符号链接，避免房间里的链接把清理逻辑带到数据目录之外。
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    if !meta.is_dir() {
+        return meta.modified().ok();
+    }
+    let mut newest = None;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        if let Some(t) = newest_mtime(&entry.path())
+            && newest.is_none_or(|current| t > current)
+        {
+            newest = Some(t);
+        }
+    }
+    // 空房间用目录自身时间，避免永远不清理。
+    newest.or_else(|| meta.modified().ok())
 }
 
 struct RelaySession {
@@ -179,12 +234,31 @@ mod tests {
         assert!(!room_matches_password("short", &secret));
     }
 
+    #[test]
+    fn cleanup_removes_only_expired_rooms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rooms = tmp.path().join("rooms");
+        let old = rooms.join("old");
+        let new = rooms.join("new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let old_file = old.join("index.json");
+        let file = std::fs::File::create(&old_file).unwrap();
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
+        file.set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        cleanup_rooms(&rooms, 30);
+        assert!(!old.exists());
+        assert!(new.exists());
+    }
+
     #[tokio::test]
     async fn two_clients_share_one_room_over_sftp() {
         let tmp = tempfile::tempdir().unwrap();
         let server = run_relay_server(RelayServerConfig {
             data_dir: tmp.path().join("relay"),
             port: 0,
+            room_retention_days: 30,
         })
         .await
         .unwrap();
@@ -227,6 +301,7 @@ mod tests {
         let server = run_relay_server(RelayServerConfig {
             data_dir: tmp.path().join("relay"),
             port: 0,
+            room_retention_days: 30,
         })
         .await
         .unwrap();

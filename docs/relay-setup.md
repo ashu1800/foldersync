@@ -57,6 +57,8 @@ sudo -u foldersync /usr/local/bin/foldersync-relay \
   --data-dir /var/lib/foldersync-relay
 ```
 
+空闲房间默认保留 30 天；服务端按房间内最新文件时间清理，`--room-retention-days 0` 可关闭。
+
 看到 `FolderSync 中继服务器已启动：0.0.0.0:9443` 即表示监听成功。`Ctrl+C` 停止。
 
 ### 4.3 systemd 服务
@@ -235,6 +237,7 @@ Test-NetConnection -ComputerName <中继IP> -Port 9443
 - 备份整个 `<data-dir>` 即可保留房间与文件。建议用文件系统快照，或先停服务再复制。
 - `ssh_host_ed25519` 建议一并备份；保持服务器主机密钥稳定，便于以后启用固定校验。
 - `rooms/` 中可能有用户文件内容，按敏感数据对待。
+- 空闲房间默认保留 30 天（`--room-retention-days` 可调，0 关闭），清理按房间内最新文件时间计算。
 - 恢复时保持目录路径和权限不变。
 
 ## 9. 安全说明
@@ -267,6 +270,6 @@ foldersync-relay --version
 | 客户端连不上 | 检查服务器 TCP 9443 是否监听、云安全组/系统防火墙/路由器端口转发是否放行 |
 | 启动报 `Address already in use` | 端口被占用，换 `--port` 或在占用进程中释放端口 |
 | 认证失败 / 房间不存在 | 配对码过期或房间信息不一致，重新生成配对码并配对 |
-| 磁盘写满 | 检查 `<data-dir>/rooms` 占用，扩容或清理不再使用的房间（先确认没有设备在使用） |
+| 磁盘写满 | 检查 `<data-dir>/rooms` 占用；空闲房间默认 30 天自动清理，仍不足时扩容或确认无设备使用后手动清理 |
 | 服务启动后退不出 | 前台运行按 `Ctrl+C`；systemd 用 `systemctl stop foldersync-relay` |
 | 升级后客户端连不上 | 检查新二进制版本、数据目录权限、端口和防火墙；`--data-dir` 应保持原路径 |

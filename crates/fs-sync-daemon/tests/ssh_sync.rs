@@ -43,7 +43,7 @@ async fn node() -> Node {
             folder,
             identity.id(),
             store.clone(),
-            blobs,
+            blobs.clone(),
             100,
         )
         .await
@@ -58,6 +58,7 @@ async fn node() -> Node {
         None,
         store.clone(),
     );
+    let sync_root = data.join("FolderSync");
     let shared = Arc::new(SshServerShared {
         identity: identity.clone(),
         host_key: host_key.clone(),
@@ -65,8 +66,14 @@ async fn node() -> Node {
         device_name: "node".into(),
         ssh_port: 0,
         data_dir: data,
+        sync_root,
         trust: trust.clone(),
         pairing,
+        store: store.clone(),
+        blobs,
+        invite_lock: tokio::sync::Mutex::new(()),
+        removing_folders: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         runtimes: Arc::new(std::sync::Mutex::new(vec![runtime.clone()])),
         online: Arc::new(tokio::sync::Mutex::new(Default::default())),
     });
@@ -129,6 +136,10 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_a.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
+        store: a.shared.store.clone(),
+        blobs: a.shared.blobs.clone(),
+        sync_root: a.shared.sync_root.clone(),
+        paused_all: a.shared.paused_all.clone(),
     }));
     let cfg_b = Arc::new(RwLock::new(PeerLoopConfig {
         identity: b.identity.clone(),
@@ -137,6 +148,10 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_b.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
+        store: b.shared.store.clone(),
+        blobs: b.shared.blobs.clone(),
+        sync_root: b.shared.sync_root.clone(),
+        paused_all: b.shared.paused_all.clone(),
     }));
 
     let rt_a = a.shared.runtimes.clone();

@@ -1,7 +1,7 @@
 # FolderSync 协议 v2（SSH + SFTP）
 
-当前协议版本：`PROTOCOL_VERSION = 2`（定义见 `crates/fs-sync-net/src/message.rs`）。
-v1 的 iroh / QUIC 协议已弃用，本文只描述 v2。
+当前协议版本：`PROTOCOL_VERSION = 3`（定义见 `crates/fs-sync-net/src/message.rs`）。
+v1 的 iroh / QUIC 协议已弃用；v2 与 v3 的枚举尾部新增 `IndexChunk`，跨版本连接会由 `Hello` 握手拒绝。
 
 ## 1. 传输层
 
@@ -26,8 +26,8 @@ v1 的 iroh / QUIC 协议已弃用，本文只描述 v2。
 | `length` | `u32`（大端） | postcard 消息体的字节数 |
 | `body` | `bytes` | postcard 编码的 `Message` |
 
-- 单帧上限 `MAX_FRAME = 16 MiB`：索引可能很大，但必须有界，防恶意对端。
-- 帧本身不带版本字段。`Hello` 消息携带 `protocol_version: u16`（当前为 2）；中继模式的 `index.json` 顶层也带同名的 `protocol_version`。
+- 单帧上限 `MAX_FRAME = 64 MiB`：索引可能很大，但必须有界，防恶意对端；超大索引按 4000 条分页为 `IndexChunk`。
+- 帧本身不带版本字段。`Hello` 消息携带 `protocol_version: u16`（当前为 3），双方必须匹配；中继模式的 `index.json` 顶层也带同名的 `protocol_version`。
 - 所有消息定义以 `crates/fs-sync-net/src/message.rs` 为准。
 
 ## 3. 消息
@@ -57,6 +57,12 @@ enum Message {
         code: u32,
         message: String,
     },
+    IndexChunk {
+        folder_id: String,
+        entries: Vec<FileEntry>,
+        chunk_index: u32,
+        done: bool,
+    },
 }
 ```
 
@@ -68,7 +74,8 @@ enum Message {
 | `PairingRequest` | 配对子系统：B → A | `token`、`peer: PeerInfo` |
 | `PairingResponse` | 配对子系统：A → B | `accepted`、`peer: PeerInfo`（拒绝时为空） |
 | `FolderInvite` | 文件夹共享邀请 | `folder_id`、`folder_name`、`from_name` |
-| `FolderInviteResponse` | 邀请响应 | `folder_id`、`accepted` |
+| `FolderInviteResponse` | 邀请响应 | `folder_id`、`accepted`、`reason` |
+| `IndexChunk` | 全量索引分页；`chunk_index` 从 0 连续递增，`done` 标记最后一块 | `folder_id`、`entries`、`chunk_index`、`done` |
 | `Ping` / `Pong` | 保活 | 无 |
 | `Error` | 协议错误 | `code`、`message` |
 
@@ -156,12 +163,13 @@ struct FolderSummary {
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "device_id": "SHA256:...",
   "device_name": "home-pc",
   "folders": [
     {
       "folder_id": "folder-...",
+      "folder_name": "work",
       "entries": []
     }
   ]

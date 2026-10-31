@@ -57,6 +57,8 @@ pub struct Folder {
     /// 墓碑保留天数
     pub tombstone_days: i64,
     pub created_at: i64,
+    /// 分享给哪些设备（空 = 所有已配对设备）
+    pub shared_with: Vec<String>,
 }
 
 /// 活动日志条目。
@@ -69,6 +71,8 @@ pub struct Activity {
     pub kind: String,
     pub folder_id: String,
     pub path: String,
+    /// 文件字节数（删除/信息类为 0）
+    pub size: i64,
     pub detail: String,
 }
 
@@ -124,7 +128,8 @@ impl Store {
                 local_path TEXT NOT NULL,
                 paused INTEGER NOT NULL DEFAULT 0,
                 tombstone_days INTEGER NOT NULL DEFAULT 30,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                shared_with TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS entries (
                 folder_id TEXT NOT NULL,
@@ -145,11 +150,16 @@ impl Store {
                 kind TEXT NOT NULL,
                 folder_id TEXT NOT NULL,
                 path TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
                 detail TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS pairing_tokens (
                 token TEXT PRIMARY KEY,
                 expires_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS declined_folder_invites (
+                folder_id TEXT PRIMARY KEY,
+                declined_at INTEGER NOT NULL
             );
             "#,
         )?;
@@ -167,6 +177,10 @@ impl Store {
         ] {
             ensure_column(conn, "devices", name, ddl)?;
         }
+        // 活动条目补文件大小列（旧库升级）
+        ensure_column(conn, "activity", "size", "INTEGER NOT NULL DEFAULT 0")?;
+        // 文件夹补共享设备列表（旧库升级，空表示所有设备）
+        ensure_column(conn, "folders", "shared_with", "TEXT NOT NULL DEFAULT '[]'")?;
         Ok(())
     }
 
@@ -244,30 +258,48 @@ impl Store {
     // ---- folders ----
 
     pub fn add_folder(&self, f: &Folder) -> Result<()> {
+        self.add_folder_inner(f, true)
+    }
+
+    /// 接受对端邀请建文件夹：不能在并发删除后清掉用户刚写入的 decline 标记。
+    pub fn add_folder_from_invite(&self, f: &Folder) -> Result<()> {
+        self.add_folder_inner(f, false)
+    }
+
+    fn add_folder_inner(&self, f: &Folder, clear_declined: bool) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO folders (id, name, local_path, paused, tombstone_days, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO folders (id, name, local_path, paused, tombstone_days, created_at, shared_with)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 f.id,
                 f.name,
                 f.local_path.to_string_lossy(),
                 f.paused as i64,
                 f.tombstone_days,
-                f.created_at
+                f.created_at,
+                serde_json::to_string(&f.shared_with)?
             ],
         )?;
+        if clear_declined {
+            // 用户主动重新添加同名文件夹时，撤销之前的邀请拒绝标记。
+            conn.execute(
+                "DELETE FROM declined_folder_invites WHERE folder_id = ?1",
+                [&f.id],
+            )?;
+        }
         Ok(())
     }
 
     pub fn list_folders(&self) -> Result<Vec<Folder>> {
         let conn = self.lock();
         let mut st = conn.prepare(
-            "SELECT id, name, local_path, paused, tombstone_days, created_at
+            "SELECT id, name, local_path, paused, tombstone_days, created_at, shared_with
              FROM folders ORDER BY created_at",
         )?;
         let rows = st
             .query_map([], |r| {
+                let shared: Option<String> = r.get(6)?;
                 Ok(Folder {
                     id: r.get(0)?,
                     name: r.get(1)?,
@@ -275,6 +307,17 @@ impl Store {
                     paused: r.get::<_, i64>(3)? != 0,
                     tombstone_days: r.get(4)?,
                     created_at: r.get(5)?,
+                    shared_with: match shared {
+                        Some(s) => serde_json::from_str(&s).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                        // NULL = 旧数据，等价于“所有已配对设备”
+                        None => Vec::new(),
+                    },
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -290,10 +333,66 @@ impl Store {
         Ok(())
     }
 
+    /// 更新文件夹本地路径（外置盘换盘符后重新定位）。
+    pub fn set_folder_path(&self, id: &str, path: &std::path::Path) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE folders SET local_path = ?2 WHERE id = ?1",
+            rusqlite::params![id, path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// 更新文件夹的共享设备列表（空 = 所有已配对设备）。
+    pub fn set_folder_shared_with(&self, id: &str, device_ids: &[String]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE folders SET shared_with = ?2 WHERE id = ?1",
+            rusqlite::params![id, serde_json::to_string(device_ids)?],
+        )?;
+        Ok(())
+    }
+
     pub fn remove_folder(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT OR REPLACE INTO declined_folder_invites (folder_id, declined_at) VALUES (?1, ?2)",
+            rusqlite::params![id, now],
+        )?;
+        conn.execute("DELETE FROM entries WHERE folder_id = ?1", [id])?;
+        conn.execute("DELETE FROM folders WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// 事务回滚/竞态失败时删除邀请记录，但不写“用户已拒绝”标记。
+    pub fn discard_folder_record(&self, id: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM entries WHERE folder_id = ?1", [id])?;
         conn.execute("DELETE FROM folders WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// 已在本机明确移除的文件夹，不再接受同 id 的自动邀请。
+    pub fn is_folder_invite_declined(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM declined_folder_invites WHERE folder_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn clear_folder_invite_declined(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM declined_folder_invites WHERE folder_id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 
@@ -328,6 +427,17 @@ impl Store {
         Ok(())
     }
 
+    /// 只统计存活条目，避免概览页为拿文件数反序列化整棵索引。
+    pub fn count_live_entries(&self, folder_id: &str) -> Result<u32> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE folder_id = ?1 AND deleted = 0",
+            [folder_id],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
     pub fn list_entries(&self, folder_id: &str) -> Result<Vec<FileEntry>> {
         let conn = self.lock();
         let mut st = conn.prepare(
@@ -349,39 +459,80 @@ impl Store {
         path: &str,
         detail: &str,
     ) -> Result<()> {
+        self.log_activity_sized(kind, folder_id, path, 0, detail)
+    }
+
+    /// 记录活动，带文件字节数（列表页展示「大小」列）。
+    pub fn log_activity_sized(
+        &self,
+        kind: &str,
+        folder_id: &str,
+        path: &str,
+        size: i64,
+        detail: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
         conn.execute(
-            "INSERT INTO activity (at, kind, folder_id, path, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![at, kind, folder_id, path, detail],
+            "INSERT INTO activity (at, kind, folder_id, path, size, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![at, kind, folder_id, path, size, detail],
         )?;
         Ok(())
     }
 
     /// 按时间倒序列出活动（limit 上限防止一次拉爆）。
     pub fn list_activity(&self, folder_id: Option<&str>, limit: u32) -> Result<Vec<Activity>> {
+        self.list_activity_filtered(folder_id, None, limit, None)
+    }
+
+    /// 活动列表（文件夹 + 类型 + 游标过滤）。
+    pub fn list_activity_filtered(
+        &self,
+        folder_id: Option<&str>,
+        kind: Option<&str>,
+        limit: u32,
+        before_id: Option<i64>,
+    ) -> Result<Vec<Activity>> {
         let conn = self.lock();
         let mut st = conn.prepare(
-            "SELECT id, at, kind, folder_id, path, detail FROM activity
+            "SELECT id, at, kind, folder_id, path, size, detail FROM activity
              WHERE (?1 IS NULL OR folder_id = ?1)
-             ORDER BY id DESC LIMIT ?2",
+               AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL OR id < ?3)
+             ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = st
-            .query_map(rusqlite::params![folder_id, limit], |r| {
-                Ok(Activity {
-                    id: r.get(0)?,
-                    at: r.get(1)?,
-                    kind: r.get(2)?,
-                    folder_id: r.get(3)?,
-                    path: r.get(4)?,
-                    detail: r.get(5)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![folder_id, kind, before_id, limit.clamp(1, 500)],
+                |r| {
+                    Ok(Activity {
+                        id: r.get(0)?,
+                        at: r.get(1)?,
+                        kind: r.get(2)?,
+                        folder_id: r.get(3)?,
+                        path: r.get(4)?,
+                        size: r.get(5)?,
+                        detail: r.get(6)?,
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 只保留最近 `max_rows` 条活动，防止数据库无限增长。
+    pub fn prune_activity(&self, max_rows: i64) -> Result<usize> {
+        let conn = self.lock();
+        let deleted = conn.execute(
+            "DELETE FROM activity WHERE id NOT IN (
+                SELECT id FROM activity ORDER BY id DESC LIMIT ?1
+             )",
+            [max_rows.max(1)],
+        )?;
+        Ok(deleted)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -546,13 +697,16 @@ mod tests {
             paused: false,
             tombstone_days: 30,
             created_at: 1,
+            shared_with: vec!["dev-b".into()],
         })
         .unwrap();
         s.set_folder_paused("f1", true).unwrap();
         let fs = s.list_folders().unwrap();
         assert!(fs[0].paused);
+        assert_eq!(fs[0].shared_with, vec!["dev-b".to_string()]);
         s.remove_folder("f1").unwrap();
         assert!(s.list_folders().unwrap().is_empty());
+        assert!(s.is_folder_invite_declined("f1").unwrap());
     }
 
     #[test]
@@ -565,6 +719,7 @@ mod tests {
         s.replace_entries("f1", &[e1.clone(), e2.clone()]).unwrap();
         let got = s.list_entries("f1").unwrap();
         assert_eq!(got.len(), 2);
+        assert_eq!(s.count_live_entries("f1").unwrap(), 2);
         assert_eq!(got[0], e1);
         assert_eq!(got[1], e2);
 
@@ -574,6 +729,7 @@ mod tests {
         s.upsert_entry("f1", &t).unwrap();
         let got = s.list_entries("f1").unwrap();
         assert_eq!(got.len(), 3);
+        assert_eq!(s.count_live_entries("f1").unwrap(), 2);
         assert!(got.iter().find(|e| e.path == "old.txt").unwrap().deleted);
     }
 
@@ -592,14 +748,59 @@ mod tests {
     #[test]
     fn activity_log_and_filter() {
         let s = Store::open_in_memory().unwrap();
-        s.log_activity("upload", "f1", "a.txt", "1024B").unwrap();
+        s.log_activity_sized("upload", "f1", "a.txt", 1024, "上传完成")
+            .unwrap();
         s.log_activity("download", "f2", "b.txt", "2048B").unwrap();
         assert_eq!(s.list_activity(None, 10).unwrap().len(), 2);
         let only_f1 = s.list_activity(Some("f1"), 10).unwrap();
         assert_eq!(only_f1.len(), 1);
         assert_eq!(only_f1[0].kind, "upload");
+        assert_eq!(only_f1[0].size, 1024);
         // 倒序：最新在前
         assert_eq!(s.list_activity(None, 1).unwrap()[0].path, "b.txt");
+        // 类型过滤
+        let only_upload = s
+            .list_activity_filtered(None, Some("upload"), 10, None)
+            .unwrap();
+        assert_eq!(only_upload.len(), 1);
+        assert_eq!(only_upload[0].path, "a.txt");
+        // 游标分页：取到第二新的条目
+        let newest = s.list_activity(None, 1).unwrap()[0].id;
+        let older = s
+            .list_activity_filtered(None, None, 10, Some(newest))
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].path, "a.txt");
+        // pruning 只保留最近 N 条
+        assert_eq!(s.prune_activity(1).unwrap(), 1);
+        let left = s.list_activity(None, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "b.txt");
+    }
+
+    #[test]
+    fn invalid_shared_with_fails_closed() {
+        let s = Store::open_in_memory().unwrap();
+        s.add_folder(&Folder {
+            id: "f1".into(),
+            name: "F".into(),
+            local_path: std::path::PathBuf::from("C:/f1"),
+            paused: false,
+            tombstone_days: 30,
+            created_at: 1,
+            shared_with: vec!["devA".into()],
+        })
+        .unwrap();
+        s.lock()
+            .execute(
+                "UPDATE folders SET shared_with = '{broken' WHERE id = 'f1'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            s.list_folders().is_err(),
+            "损坏的共享列表必须报错，不能静默变成“全部设备”"
+        );
     }
 
     #[test]

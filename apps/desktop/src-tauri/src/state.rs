@@ -3,7 +3,7 @@
 //! 一个进程内只有一份（`tauri::State<AppState>`），所有 command 通过它访问
 //! SSH 服务端、存储、信任列表、运行时与设置。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -51,6 +51,10 @@ pub struct AppState {
     pub device_name: String,
     /// 已启动的同步文件夹运行时
     pub runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    /// 正在做首次扫描的文件夹（扫描完成后进入 runtimes）
+    pub starting_folders: Arc<Mutex<HashSet<String>>>,
+    /// 正在删除的文件夹：阻止首扫完成后把 runtime 又挂回来
+    pub removing_folders: Arc<std::sync::Mutex<HashSet<String>>>,
     /// 连接状态：设备 id → (连接方式, rtt)
     pub conns: ConnMap,
     /// SSH 服务端观察到的在线设备
@@ -74,6 +78,8 @@ impl AppState {
     pub async fn init(data_dir: PathBuf) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir).context("创建数据目录失败")?;
         let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
+        // 活动表只保留最近 2 万条，避免长期使用后数据库无限膨胀
+        let _ = store.prune_activity(20_000);
 
         let settings = Arc::new(SettingsStore::load(&data_dir.join("settings.json"))?);
         let snapshot = settings.get();
@@ -95,6 +101,12 @@ impl AppState {
             snapshot.device_name.clone()
         };
 
+        let sync_root = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir.clone())
+            .join("FolderSync");
+
         let trust = Trust::new(store.clone());
         let pairing = PairingManager::new(
             trust.clone(),
@@ -107,6 +119,9 @@ impl AppState {
         );
         let runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
+        let removing_folders: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let paused_all = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let online: Arc<Mutex<fs_sync_net::conn::Presence>> =
             Arc::new(Mutex::new(Default::default()));
@@ -117,8 +132,14 @@ impl AppState {
             device_name: device_name.clone(),
             ssh_port: env.ssh_port,
             data_dir: data_dir.clone(),
+            sync_root: sync_root.clone(),
             trust: trust.clone(),
             pairing: pairing.clone(),
+            store: store.clone(),
+            blobs: blobs.clone(),
+            invite_lock: tokio::sync::Mutex::new(()),
+            removing_folders: removing_folders.clone(),
+            paused_all: paused_all.clone(),
             runtimes: runtimes.clone(),
             online: online.clone(),
         });
@@ -136,6 +157,10 @@ impl AppState {
             ssh_port: actual_port,
             mode: snapshot.network_mode.into(),
             relay_url: snapshot.relay_url.clone(),
+            store: store.clone(),
+            blobs: blobs.clone(),
+            sync_root: sync_root.clone(),
+            paused_all: paused_all.clone(),
         }));
 
         let state = Arc::new(Self {
@@ -150,11 +175,13 @@ impl AppState {
             pairing,
             device_name,
             runtimes,
+            starting_folders: Arc::new(Mutex::new(HashSet::new())),
+            removing_folders,
             conns: Arc::new(Mutex::new(HashMap::new())),
             online,
             pending_pairings: Arc::new(Mutex::new(HashMap::new())),
             settings,
-            paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused_all,
             limits: Arc::new(std::sync::RwLock::new(crate::limits::Limits::new(
                 snapshot.upload_limit_kbps,
                 snapshot.download_limit_kbps,
@@ -181,30 +208,113 @@ impl AppState {
         folder_id: String,
         path: PathBuf,
     ) -> Result<Arc<FolderRuntime>> {
-        let rt = FolderRuntime::start(
+        // 首次扫描可能几十秒（大目录）：先登记「扫描中」，避免界面误报“错误”
+        self.starting_folders.lock().await.insert(folder_id.clone());
+        let started = FolderRuntime::start(
             folder_id.clone(),
-            path,
+            path.clone(),
             self.device_id.clone(),
             self.store.clone(),
             self.blobs.clone(),
             400,
         )
-        .await?;
+        .await;
+        self.starting_folders.lock().await.remove(&folder_id);
+        let rt = started?;
+        // 首扫期间用户可能已暂停/删除文件夹：不要把手动停止后的 runtime 又挂回去
+        let current = self
+            .store
+            .list_folders()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|f| f.id == folder_id);
+        let paused_all = self.paused_all.load(std::sync::atomic::Ordering::Relaxed);
+        match current {
+            Some(f) if !f.paused && !paused_all => {
+                rt.set_shared_with(f.shared_with);
+            }
+            _ => {
+                rt.cancel();
+                return Err(anyhow::anyhow!("文件夹已暂停或删除，放弃启动"));
+            }
+        }
+        // 注入桌面端限速器：每次传输后按当前设置结算，改设置无需重启同步
+        let upload_limits = self.limits.clone();
+        let download_limits = self.limits.clone();
+        let upload: fs_sync_daemon::runtime::ThrottleFn = Arc::new(move |bytes| {
+            let limiter = upload_limits
+                .read()
+                .map(|l| l.upload.clone())
+                .unwrap_or_else(|e| e.into_inner().upload.clone());
+            Box::pin(async move { limiter.consume(bytes).await })
+        });
+        let download: fs_sync_daemon::runtime::ThrottleFn = Arc::new(move |bytes| {
+            let limiter = download_limits
+                .read()
+                .map(|l| l.download.clone())
+                .unwrap_or_else(|e| e.into_inner().download.clone());
+            Box::pin(async move { limiter.consume(bytes).await })
+        });
+        if let Ok(mut guard) = rt.session.throttle.write() {
+            *guard = fs_sync_daemon::runtime::TransferThrottle {
+                upload: Some(upload),
+                download: Some(download),
+            };
+        }
         let rt = Arc::new(rt);
-        {
+        let old = {
+            // 锁顺序与 remove_folder 一致：removing -> runtimes
+            let removing = self.removing_folders.lock().unwrap();
+            if removing.contains(&folder_id) {
+                drop(removing);
+                rt.cancel();
+                return Err(anyhow::anyhow!("文件夹正在删除，放弃启动"));
+            }
             let mut guard = self.runtimes.lock().unwrap();
+            let current = self
+                .store
+                .list_folders()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|f| f.id == folder_id);
+            let still_valid = current
+                .map(|f| !f.paused && f.local_path == path)
+                .unwrap_or(false)
+                && !self.paused_all.load(std::sync::atomic::Ordering::Relaxed);
+            if !still_valid {
+                drop(guard);
+                drop(removing);
+                rt.cancel();
+                return Err(anyhow::anyhow!("文件夹已暂停、删除或路径已变化，放弃启动"));
+            }
+            let old = guard
+                .iter()
+                .find(|r| r.session.folder_id == folder_id)
+                .cloned();
             guard.retain(|r| r.session.folder_id != folder_id);
             guard.push(rt.clone());
+            old
+        };
+        if let Some(old) = old {
+            old.cancel();
         }
         Ok(rt)
     }
 
     /// 停止并移除某个文件夹的运行时。
     pub async fn stop_folder(&self, folder_id: &str) {
-        self.runtimes
-            .lock()
-            .unwrap()
-            .retain(|r| r.session.folder_id != folder_id);
+        let removed = {
+            let mut guard = self.runtimes.lock().unwrap();
+            let found = guard
+                .iter()
+                .find(|r| r.session.folder_id == folder_id)
+                .cloned();
+            guard.retain(|r| r.session.folder_id != folder_id);
+            found
+        };
+        if let Some(rt) = removed {
+            rt.cancel();
+        }
     }
 
     /// 已配对设备列表（含在线状态）。
@@ -221,9 +331,13 @@ impl AppState {
                         .get(&d.id)
                         .copied()
                         .unwrap_or_else(|| match online.get(&d.id) {
-                            Some(fs_sync_net::ConnType::Tailscale) => (ConnKind::Tailscale, None),
-                            Some(fs_sync_net::ConnType::Relay) => (ConnKind::Relay, None),
-                            None => (ConnKind::Unknown, None),
+                            Some(fs_sync_net::ConnType::Tailscale) => {
+                                (ConnKind::Tailscale, online.rtt(&d.id))
+                            }
+                            Some(fs_sync_net::ConnType::Relay) => {
+                                (ConnKind::Relay, online.rtt(&d.id))
+                            }
+                            None => (ConnKind::Unknown, online.rtt(&d.id)),
                         });
                 DeviceDto {
                     fingerprint: fs_sync_net::identity::fingerprint_text(&d.id),
@@ -243,33 +357,85 @@ impl AppState {
     /// 各文件夹状态。
     pub async fn folders(&self) -> Vec<crate::dto::FolderDto> {
         let paused_all = self.paused_all.load(std::sync::atomic::Ordering::Relaxed);
-        let runtimes = self.runtimes.lock().unwrap();
-        self.store
+        let runtimes: Vec<Arc<FolderRuntime>> = self.runtimes.lock().unwrap().clone();
+        let starting = self.starting_folders.lock().await.clone();
+        let mut out = Vec::new();
+        for f in self.store.list_folders().unwrap_or_default() {
+            let runtime = runtimes
+                .iter()
+                .find(|r| r.session.folder_id == f.id)
+                .cloned();
+            let pending = match &runtime {
+                Some(rt) => rt.pending_count().await,
+                None => 0,
+            };
+            let paused = f.paused || paused_all;
+            let missing_path = if f.local_path.is_dir() {
+                None
+            } else {
+                Some("本地文件夹不存在，请恢复路径或移除该同步项".to_string())
+            };
+            let last_error = runtime
+                .as_ref()
+                .and_then(|rt| rt.last_error())
+                .or(missing_path);
+            let status = if paused {
+                FolderStatus::Paused
+            } else if starting.contains(&f.id) {
+                FolderStatus::Scanning
+            } else if last_error.is_some() {
+                FolderStatus::Error
+            } else if let Some(_rt) = runtime {
+                if pending > 0 {
+                    FolderStatus::Syncing
+                } else {
+                    FolderStatus::Idle
+                }
+            } else {
+                FolderStatus::Error
+            };
+            let live = self.store.count_live_entries(&f.id).unwrap_or(0);
+            out.push(crate::dto::FolderDto {
+                id: f.id.clone(),
+                name: f.name,
+                path: f.local_path.to_string_lossy().to_string(),
+                status,
+                paused,
+                last_sync_at: self.last_sync_at(&f.id),
+                pending,
+                file_count: live,
+                shared_with: f.shared_with.clone(),
+                last_error,
+            });
+        }
+        out
+    }
+
+    /// 暂停全部文件夹（托盘与命令共用）。
+    pub async fn pause_all_sync(&self) {
+        self.paused_all
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let ids: Vec<String> = self
+            .store
             .list_folders()
             .unwrap_or_default()
             .into_iter()
-            .map(|f| {
-                let entries = self.store.list_entries(&f.id).unwrap_or_default();
-                let live = entries.iter().filter(|e| !e.deleted).count() as u32;
-                crate::dto::FolderDto {
-                    id: f.id.clone(),
-                    name: f.name,
-                    path: f.local_path.to_string_lossy().to_string(),
-                    status: if f.paused || paused_all {
-                        FolderStatus::Paused
-                    } else if runtimes.iter().any(|r| r.session.folder_id == f.id) {
-                        FolderStatus::Idle
-                    } else {
-                        FolderStatus::Error
-                    },
-                    paused: f.paused || paused_all,
-                    last_sync_at: self.last_sync_at(&f.id),
-                    pending: 0,
-                    file_count: live,
-                    shared_with: Vec::new(),
-                }
-            })
-            .collect()
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            self.stop_folder(&id).await;
+        }
+    }
+
+    /// 恢复全部文件夹（托盘与命令共用）。
+    pub async fn resume_all_sync(&self) {
+        self.paused_all
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        for f in self.store.list_folders().unwrap_or_default() {
+            if !f.paused {
+                let _ = self.start_folder(f.id, f.local_path).await;
+            }
+        }
     }
 
     fn last_sync_at(&self, folder_id: &str) -> Option<i64> {
@@ -313,8 +479,27 @@ impl AppState {
     /// 本机环境状态。
     pub fn env_status(&self) -> EnvStatusDto {
         let settings = self.settings.get();
-        fs_sync_net::env::detect_env(&self.data_dir, self.ssh_port, settings.relay_url.as_deref())
-            .into()
+        let mut env: EnvStatusDto = fs_sync_net::env::detect_env(
+            &self.data_dir,
+            self.ssh_port,
+            settings.relay_url.as_deref(),
+        )
+        .into();
+        // 就绪与否必须结合当前网络模式判断：只配了中继但模式=tailscale 时不能算可用
+        env.ready = match settings.network_mode {
+            crate::dto::NetworkMode::Tailscale => {
+                env.ssh_ready && env.tailscale_installed && env.tailscale_running
+            }
+            crate::dto::NetworkMode::Relay => {
+                env.ssh_ready && env.relay_configured && env.relay_reachable
+            }
+            crate::dto::NetworkMode::Auto => {
+                env.ssh_ready
+                    && ((env.tailscale_installed && env.tailscale_running)
+                        || (env.relay_configured && env.relay_reachable))
+            }
+        };
+        env
     }
 
     /// 替换限速器。

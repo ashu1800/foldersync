@@ -23,7 +23,15 @@ interface State {
   conflicts: ConflictDto[];
 
   loading: boolean;
-  error: string | null;
+  overviewLoaded: boolean;
+  devicesLoaded: boolean;
+  foldersLoaded: boolean;
+  conflictsLoaded: boolean;
+  overviewError: string | null;
+  devicesError: string | null;
+  foldersError: string | null;
+  settingsError: string | null;
+  conflictsError: string | null;
 
   refreshOverview: () => Promise<void>;
   refreshDevices: () => Promise<void>;
@@ -48,37 +56,57 @@ export const useStore = create<State>((set, get) => ({
   pendingPairings: [],
   conflicts: [],
   loading: false,
-  error: null,
+  overviewLoaded: false,
+  devicesLoaded: false,
+  foldersLoaded: false,
+  conflictsLoaded: false,
+  overviewError: null,
+  devicesError: null,
+  foldersError: null,
+  settingsError: null,
+  conflictsError: null,
 
   refreshOverview: async () => {
     try {
-      set({ overview: await api.getOverview(), error: null });
+      set({
+        overview: await api.getOverview(),
+        overviewLoaded: true,
+        overviewError: null,
+      });
     } catch (e) {
-      set({ error: api.asCmdError(e).message });
+      set({ overviewError: api.asCmdError(e).message, overviewLoaded: true });
     }
   },
 
   refreshDevices: async () => {
     try {
-      set({ devices: await api.listDevices() });
+      set({
+        devices: await api.listDevices(),
+        devicesLoaded: true,
+        devicesError: null,
+      });
     } catch (e) {
-      set({ error: api.asCmdError(e).message });
+      set({ devicesError: api.asCmdError(e).message, devicesLoaded: true });
     }
   },
 
   refreshFolders: async () => {
     try {
-      set({ folders: await api.listFolders() });
+      set({
+        folders: await api.listFolders(),
+        foldersLoaded: true,
+        foldersError: null,
+      });
     } catch (e) {
-      set({ error: api.asCmdError(e).message });
+      set({ foldersError: api.asCmdError(e).message, foldersLoaded: true });
     }
   },
 
   refreshSettings: async () => {
     try {
-      set({ settings: await api.getSettings() });
+      set({ settings: await api.getSettings(), settingsError: null });
     } catch (e) {
-      set({ error: api.asCmdError(e).message });
+      set({ settingsError: api.asCmdError(e).message });
     }
   },
 
@@ -92,9 +120,13 @@ export const useStore = create<State>((set, get) => ({
 
   refreshConflicts: async () => {
     try {
-      set({ conflicts: await api.listConflicts() });
+      set({
+        conflicts: await api.listConflicts(),
+        conflictsLoaded: true,
+        conflictsError: null,
+      });
     } catch (e) {
-      set({ error: api.asCmdError(e).message });
+      set({ conflictsError: api.asCmdError(e).message });
     }
   },
 

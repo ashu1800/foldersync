@@ -98,7 +98,15 @@ impl BlobStore {
                 .await
                 .context("创建目标目录失败")?;
         }
-        let tmp = dest.with_extension(format!(".foldersync-tmp-{}", std::process::id()));
+        let name = dest
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "blob".into());
+        let tmp = dest.with_file_name(format!(
+            ".foldersync-tmp-{name}-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         let mut src = tokio::fs::File::open(self.blob_path(hash))
             .await
             .context("读取 blob 失败")?;

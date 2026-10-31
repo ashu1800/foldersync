@@ -23,10 +23,20 @@ pub struct FsSftpHandler {
     root: PathBuf,
     handles: HashMap<String, HandleState>,
     next_handle: u64,
+    /// 每次操作前的访问检查（设备取消配对后立即拒绝）
+    access: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl FsSftpHandler {
     pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::new_guarded(root, None)
+    }
+
+    /// 带访问检查的构造器：`access` 返回 false 时所有请求被拒绝。
+    pub fn new_guarded(
+        root: impl Into<PathBuf>,
+        access: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    ) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
@@ -34,10 +44,12 @@ impl FsSftpHandler {
             root,
             handles: HashMap::new(),
             next_handle: 1,
+            access,
         })
     }
 
     fn resolve(&self, path: &str) -> Result<PathBuf, StatusReply> {
+        self.check_access()?;
         let rel = path.trim().replace('\\', "/");
         let rel = rel.trim_start_matches('/');
         let candidate = Path::new(rel);
@@ -63,6 +75,17 @@ impl FsSftpHandler {
             );
         }
         Ok(full)
+    }
+
+    fn check_access(&self) -> Result<(), StatusReply> {
+        if let Some(access) = &self.access
+            && !access()
+        {
+            return Err(
+                StatusReply::new(StatusCode::PermissionDenied).with_message("设备已取消配对")
+            );
+        }
+        Ok(())
     }
 
     fn alloc_handle(&mut self, state: HandleState) -> String {
@@ -143,6 +166,7 @@ impl Handler for FsSftpHandler {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
+        self.check_access()?;
         let Some(HandleState::File(file)) = self.handles.get_mut(&handle) else {
             return Err(StatusReply::new(StatusCode::Failure).with_message("句柄无效"));
         };
@@ -165,6 +189,7 @@ impl Handler for FsSftpHandler {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        self.check_access()?;
         let Some(HandleState::File(file)) = self.handles.get_mut(&handle) else {
             return Err(StatusReply::new(StatusCode::Failure).with_message("句柄无效"));
         };
@@ -189,6 +214,7 @@ impl Handler for FsSftpHandler {
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        self.check_access()?;
         let Some(HandleState::File(file)) = self.handles.get(&handle) else {
             return Err(StatusReply::new(StatusCode::Failure).with_message("句柄无效"));
         };
@@ -254,6 +280,7 @@ impl Handler for FsSftpHandler {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        self.check_access()?;
         let Some(HandleState::Dir(files)) = self.handles.get_mut(&handle) else {
             return Err(StatusReply::new(StatusCode::Failure).with_message("目录句柄无效"));
         };
@@ -340,6 +367,39 @@ mod tests {
         assert_eq!(data.data, b"hello");
         let attrs = h.stat(4, "blobs/abc".into()).await.unwrap();
         assert_eq!(attrs.attrs.size, Some(5));
+    }
+
+    #[tokio::test]
+    async fn revoked_access_blocks_existing_handle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = std::sync::Arc::new(AtomicBool::new(true));
+        let access_gate = gate.clone();
+        let mut h = FsSftpHandler::new_guarded(
+            tmp.path().join("root"),
+            Some(Box::new(move || access_gate.load(Ordering::Relaxed))),
+        )
+        .unwrap();
+        let handle = h
+            .open(
+                1,
+                "blobs/abc".into(),
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::READ,
+                FileAttributes::empty(),
+            )
+            .await
+            .unwrap();
+        h.write(2, handle.handle.clone(), 0, b"hello".to_vec())
+            .await
+            .unwrap();
+        gate.store(false, Ordering::Relaxed);
+        assert!(h.read(3, handle.handle.clone(), 0, 16).await.is_err());
+        assert!(
+            h.write(4, handle.handle.clone(), 0, b"x".to_vec())
+                .await
+                .is_err()
+        );
+        assert!(h.fstat(5, handle.handle).await.is_err());
     }
 
     #[tokio::test]

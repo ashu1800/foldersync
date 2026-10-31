@@ -118,12 +118,23 @@ impl RelaySftp {
         &self.host_key
     }
 
-    /// 读一个小文件；不存在返回 None。
+    /// 读一个小文件；不存在返回 None，其他读取错误照实返回。
     pub async fn read_text(&self, path: &str) -> Result<Option<String>> {
         match self.sftp.read(path).await {
             Ok(data) => Ok(Some(String::from_utf8(data).context("中继文件不是 UTF-8")?)),
-            Err(_) => Ok(None),
+            Err(russh_sftp::client::error::Error::Status(s))
+                if s.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::anyhow!("读取中继文件失败: {path}: {e}")),
         }
+    }
+
+    /// 远端文件的 (大小, 修改时间)，用于“变了才读”。
+    pub async fn stamp(&self, path: &str) -> Option<(u64, std::time::SystemTime)> {
+        let meta = self.sftp.metadata(path).await.ok()?;
+        meta.modified().ok().map(|m| (meta.len(), m))
     }
 
     /// 确保远程文件的父目录存在（SFTP 没有 mkdir -p，逐级创建）。

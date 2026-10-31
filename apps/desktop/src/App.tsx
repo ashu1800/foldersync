@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import * as api from "./lib/tauri";
 import { useStore } from "./stores/app";
-import { OverallBadge } from "./components/ui";
+import { OverallBadge, Icon } from "./components/ui";
 import UpdatePrompt from "./components/UpdatePrompt";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
@@ -15,12 +15,12 @@ import Conflicts from "./pages/Conflicts";
 import Settings from "./pages/Settings";
 
 const NAV = [
-  { to: "/", key: "overview", icon: "◱", end: true },
-  { to: "/folders", key: "folders", icon: "▤" },
-  { to: "/devices", key: "devices", icon: "◍" },
-  { to: "/activity", key: "activity", icon: "◷" },
-  { to: "/conflicts", key: "conflicts", icon: "⚠" },
-  { to: "/settings", key: "settings", icon: "⚙" },
+  { to: "/", key: "overview", icon: "overview", end: true },
+  { to: "/folders", key: "folders", icon: "folder" },
+  { to: "/devices", key: "devices", icon: "device" },
+  { to: "/activity", key: "activity", icon: "activity" },
+  { to: "/conflicts", key: "conflicts", icon: "conflict" },
+  { to: "/settings", key: "settings", icon: "settings" },
 ] as const;
 
 export default function App() {
@@ -31,6 +31,9 @@ export default function App() {
     conflicts,
     pendingPairings,
     refreshOverview,
+    refreshDevices,
+    refreshFolders,
+    refreshConflicts,
     refreshPendingPairings,
     addPendingPairing,
     addConflict,
@@ -77,11 +80,30 @@ export default function App() {
   // 周期性拉概览：RTT / 在线状态靠事件推不全，低频兜底
   useEffect(() => {
     const id = window.setInterval(() => {
+      if (document.hidden) return;
       void refreshOverview();
       void refreshPendingPairings();
     }, 5000);
     return () => window.clearInterval(id);
   }, [refreshOverview, refreshPendingPairings]);
+
+  // 设备在线状态与冲突数量：列表页停留期间也要保持最新
+  useEffect(() => {
+    const devices = window.setInterval(() => {
+      if (!document.hidden) void refreshDevices();
+    }, 8000);
+    const folders = window.setInterval(() => {
+      if (!document.hidden) void refreshFolders();
+    }, 10000);
+    const conflicts = window.setInterval(() => {
+      if (!document.hidden) void refreshConflicts();
+    }, 15000);
+    return () => {
+      window.clearInterval(devices);
+      window.clearInterval(folders);
+      window.clearInterval(conflicts);
+    };
+  }, [refreshDevices, refreshFolders, refreshConflicts]);
 
   const conflictCount = conflicts.length;
   const pendingCount = pendingPairings.length;
@@ -90,7 +112,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="sidebar-brand">
-          <span aria-hidden>🔄</span>
+          <Icon name="sync" size={20} />
           {t("app.name")}
         </div>
 
@@ -111,7 +133,7 @@ export default function App() {
               end={"end" in n ? n.end : false}
               className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}
             >
-              <span aria-hidden>{n.icon}</span>
+              <Icon name={n.icon} size={17} />
               {t(`nav.${n.key}`)}
               {n.key === "conflicts" && conflictCount > 0 && (
                 <span className="nav-badge">{conflictCount}</span>
@@ -124,7 +146,7 @@ export default function App() {
         </nav>
       </aside>
 
-      <main className="main" key={location.pathname}>
+      <main className="main page-enter" key={location.pathname}>
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/folders" element={<Folders />} />

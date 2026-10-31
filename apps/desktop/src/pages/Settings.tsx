@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { relaunch } from "@tauri-apps/plugin-process";
 import type {
   EnvStatusDto,
   NetworkMode,
@@ -22,6 +23,7 @@ export default function Settings() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [savingField, setSavingField] = useState<string | null>(null);
   const [version, setVersion] = useState("");
   const [deviceId, setDeviceId] = useState("");
   const [diagPath, setDiagPath] = useState<string | null>(null);
@@ -29,6 +31,7 @@ export default function Settings() {
   const [envBusy, setEnvBusy] = useState(false);
   const [envError, setEnvError] = useState<string | null>(null);
   const [showRelayGuide, setShowRelayGuide] = useState(false);
+  const [sshPortRestart, setSshPortRestart] = useState(false);
   // 手动检查更新（Basic 版本更新服务）；下载安装与弹窗共用 useUpdateInstall
   const [updateState, setUpdateState] = useState<
     "idle" | "checking" | "found" | "latest" | "error"
@@ -47,23 +50,28 @@ export default function Settings() {
     }
   }, []);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const [settings, info] = await Promise.all([
-          api.getSettings(),
-          api.getLocalInfo(),
-        ]);
-        setS(settings);
-        setVersion(String(info.version ?? ""));
-        setDeviceId(String(info.device_id ?? ""));
-      } catch (e) {
-        setError(api.asCmdError(e).message);
-      } finally {
-        setLoading(false);
-      }
-    })();
+  const loadSettings = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [settings, info] = await Promise.all([
+        api.getSettings(),
+        api.getLocalInfo(),
+      ]);
+      setS(settings);
+      setVersion(String(info.version ?? ""));
+      setDeviceId(String(info.device_id ?? ""));
+      setError(null);
+    } catch (e) {
+      setError(api.asCmdError(e).message);
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadSettings(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadSettings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -82,20 +90,45 @@ export default function Settings() {
 
   const save = async (patch: SettingsPatch) => {
     if (!s) return;
-    // 乐观更新：先改界面，失败再回滚
-    const prev = s;
-    setS({ ...s, ...patchToPreview(patch) } as SettingsDto);
+    const portChanged = patch.ssh_port !== undefined && patch.ssh_port !== s.ssh_port;
+    const preview = patchToPreview(patch) as Partial<SettingsDto>;
+    const previous: Partial<SettingsDto> = {};
+    for (const key of Object.keys(preview) as Array<keyof SettingsDto>) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (previous as any)[key] = s[key];
+    }
+    const field = Object.keys(patch)[0] ?? "settings";
+    setSavingField(field);
+    // 乐观更新：只回滚本次 patch 涉及的字段，避免并发保存互相覆盖
+    setS((prev) => (prev ? { ...prev, ...preview } : prev));
     try {
       const next = await api.updateSettings(patch);
-      setS(next);
+      // 只合并本次 patch 的字段；若用户在请求期间又改了该字段，不要覆盖新输入
+      const keys = Object.keys(preview) as Array<keyof SettingsDto>;
+      setS((prev) => {
+        if (!prev) return next;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if (keys.some((k) => (prev as any)[k] !== (preview as any)[k])) return prev;
+        return { ...prev, ...Object.fromEntries(keys.map((k) => [k, next[k]])) };
+      });
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
+      setError(null);
+      if (portChanged) setSshPortRestart(true);
       if (patch.ssh_port !== undefined || patch.relay_url !== undefined) {
         void refreshEnv();
       }
     } catch (e) {
-      setS(prev);
+      const keys = Object.keys(preview) as Array<keyof SettingsDto>;
+      setS((prev) => {
+        if (!prev) return prev;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if (keys.some((k) => (prev as any)[k] !== (preview as any)[k])) return prev;
+        return { ...prev, ...previous };
+      });
       setError(api.asCmdError(e).message);
+    } finally {
+      setSavingField(null);
     }
   };
 
@@ -121,7 +154,12 @@ export default function Settings() {
 
   if (loading) return <Loading />;
   if (!s) {
-    return <ErrorBanner message={error ?? t("common.loadFailed")} />;
+    return (
+      <ErrorBanner
+        message={error ?? t("common.loadFailed")}
+        onRetry={() => void loadSettings()}
+      />
+    );
   }
 
   return (
@@ -129,6 +167,7 @@ export default function Settings() {
       <div className="page-header">
         <h1 className="page-title">{t("settings.title")}</h1>
         {saved && <span className="badge badge-success">{t("settings.saved")}</span>}
+        {savingField && <span className="badge badge-muted">{t("common.saving")}</span>}
       </div>
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
@@ -146,6 +185,7 @@ export default function Settings() {
             onBlur={() => void save({ device_name: s.device_name })}
             aria-label={t("settings.deviceName")}
           />
+          <p className="hint">{t("settings.deviceNameHint")}</p>
         </div>
         <div className="card-meta mono truncate" title={deviceId}>
           {deviceId}
@@ -155,7 +195,7 @@ export default function Settings() {
       {/* 界面语言 */}
       <div className="card">
         <h2 className="card-title" style={{ marginBottom: 14 }}>
-          界面语言 / Language
+          {t("settings.languageTitle")}
         </h2>
         <div className="btn-row">
           <button
@@ -176,7 +216,7 @@ export default function Settings() {
       {/* 行为 */}
       <div className="card">
         <h2 className="card-title" style={{ marginBottom: 14 }}>
-          行为
+          {t("settings.behaviorTitle")}
         </h2>
         <div className="checkbox-row">
           <input
@@ -196,12 +236,32 @@ export default function Settings() {
           />
           <label htmlFor="close-to-tray">{t("settings.closeToTray")}</label>
         </div>
+        <div className="field" style={{ marginTop: 14 }}>
+          <label className="label" htmlFor="default-ignore">
+            {t("settings.defaultIgnore")}
+          </label>
+          <textarea
+            id="default-ignore"
+            className="textarea"
+            value={(s.default_ignore ?? []).join("\n")}
+            onChange={(e) => setS({ ...s, default_ignore: e.target.value.split("\n") })}
+            onBlur={() =>
+              void save({
+                default_ignore: s.default_ignore
+                  .map((l) => l.trim())
+                  .filter((l) => l && !l.startsWith("#")),
+              })
+            }
+            placeholder={"*.tmp\nnode_modules/\n.git/"}
+          />
+          <p className="hint">{t("settings.defaultIgnoreHint")}</p>
+        </div>
       </div>
 
       {/* 限速 */}
       <div className="card">
         <h2 className="card-title" style={{ marginBottom: 14 }}>
-          带宽
+          {t("settings.bandwidthTitle")}
         </h2>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
           <div className="field">
@@ -412,11 +472,15 @@ export default function Settings() {
           </label>
           <input
             id="ssh-port"
-            className="input"
+            className={`input ${!Number.isInteger(s.ssh_port) || s.ssh_port < 1 || s.ssh_port > 65535 ? "input-invalid" : ""}`}
             type="number"
             min={1}
             max={65535}
             value={s.ssh_port}
+            aria-invalid={
+              !Number.isInteger(s.ssh_port) || s.ssh_port < 1 || s.ssh_port > 65535
+            }
+            aria-describedby="ssh-port-hint"
             onChange={(e) =>
               setS({
                 ...s,
@@ -424,12 +488,34 @@ export default function Settings() {
               })
             }
             onBlur={() => {
-              if (s.ssh_port >= 1 && s.ssh_port <= 65535) {
+              if (
+                Number.isInteger(s.ssh_port) &&
+                s.ssh_port >= 1 &&
+                s.ssh_port <= 65535
+              ) {
                 void save({ ssh_port: s.ssh_port });
               }
             }}
           />
-          <p className="hint">{t("settings.sshPortHint")}</p>
+          <p
+            id="ssh-port-hint"
+            className={`hint ${!Number.isInteger(s.ssh_port) || s.ssh_port < 1 || s.ssh_port > 65535 ? "hint-error" : ""}`}
+          >
+            {!Number.isInteger(s.ssh_port) || s.ssh_port < 1 || s.ssh_port > 65535
+              ? t("settings.sshPortInvalid")
+              : t("settings.sshPortHint")}
+          </p>
+          {sshPortRestart && (
+            <div className="notice" style={{ marginTop: 8 }}>
+              <span>{t("settings.sshPortRestartNeeded")}</span>
+              <button
+                className="btn btn-sm"
+                onClick={() => void relaunch().catch((e) => setError(String(e)))}
+              >
+                {t("settings.restartNow")}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -438,7 +524,7 @@ export default function Settings() {
       {/* 诊断 */}
       <div className="card">
         <h2 className="card-title" style={{ marginBottom: 14 }}>
-          诊断
+          {t("settings.diagnosticsTitle")}
         </h2>
         <div className="field">
           <label className="label" htmlFor="log-level">
@@ -456,6 +542,7 @@ export default function Settings() {
               </option>
             ))}
           </select>
+          <p className="hint">{t("settings.logLevelHint")}</p>
         </div>
         <div className="btn-row">
           <button
@@ -483,12 +570,12 @@ export default function Settings() {
               }
             }}
           >
-            导出诊断包
+            {t("settings.exportDiagnostics")}
           </button>
         </div>
         {/* 检查更新（Basic 版本更新服务；后台每 6 小时也会自动检测） */}
         <div className="field" style={{ marginTop: 18 }}>
-          <label className="label">检查更新</label>
+          <label className="label">{t("settings.checkUpdate")}</label>
           <div className="btn-row">
             <button
               className="btn"
@@ -507,7 +594,9 @@ export default function Settings() {
                 }
               }}
             >
-              {updateState === "checking" ? "检查中…" : "检查更新"}
+              {updateState === "checking"
+                ? t("settings.checking")
+                : t("settings.checkUpdate")}
             </button>
             {updateState === "found" && (
               <button
@@ -515,15 +604,19 @@ export default function Settings() {
                 disabled={installer.installing}
                 onClick={installer.install}
               >
-                {installer.installing ? "更新中…" : "下载并安装"}
+                {installer.installing
+                  ? t("settings.updating")
+                  : t("settings.updateNow")}
               </button>
             )}
           </div>
           {updateState === "latest" && (
             <p className="hint" style={{ marginTop: 8 }}>
               {update?.disabled
-                ? `最新版本 ${update.latest_version ?? ""} 已被发布方停用，暂无可用更新。`
-                : `已是最新版本（当前 ${version}）。`}
+                ? t("settings.latestDisabled", {
+                    version: update.latest_version ?? "",
+                  })
+                : t("settings.latestVersion", { version })}
             </p>
           )}
           {updateState === "found" && update && (
@@ -535,17 +628,15 @@ export default function Settings() {
             />
           )}
           {updateState === "error" && (
-            <p
-              className="hint"
-              style={{ marginTop: 8, color: "var(--danger, #e5484d)" }}
-            >
-              检查更新失败：{checkError}
+            <p className="hint" style={{ marginTop: 8, color: "var(--danger)" }}>
+              {t("settings.checkFailed", { error: checkError })}
             </p>
           )}
         </div>
         {diagPath && (
           <p className="hint" style={{ marginTop: 10 }}>
-            已导出（路径已复制到剪贴板）：<span className="mono">{diagPath}</span>
+            {t("settings.diagExported")}
+            <span className="mono">{diagPath}</span>
           </p>
         )}
         <p className="card-meta" style={{ marginTop: 12 }}>
@@ -569,5 +660,6 @@ function patchToPreview(p: SettingsPatch): Partial<SettingsDto> {
   if (p.log_level !== undefined) out.log_level = p.log_level;
   if (p.relay_url !== undefined) out.relay_url = p.relay_url;
   if (p.ssh_port !== undefined) out.ssh_port = p.ssh_port;
+  if (p.default_ignore !== undefined) out.default_ignore = p.default_ignore;
   return out;
 }

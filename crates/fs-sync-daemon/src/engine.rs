@@ -148,6 +148,17 @@ impl SyncEngine {
         self.suppression.insert(&rel, blob_hash).await;
         self.mark_applied(entry).await?;
 
+        // 活动日志：只记文件，不记目录；下载完成即记录，大小用于界面展示
+        if !entry.is_dir {
+            let _ = self.store.log_activity_sized(
+                "download",
+                &self.folder_id,
+                &entry.path,
+                entry.size as i64,
+                "已从对端下载",
+            );
+        }
+
         info!(path = %rel, size = entry.size, "文件已落盘");
         Ok(())
     }
@@ -168,6 +179,9 @@ impl SyncEngine {
                 .await
                 .with_context(|| format!("删除文件失败: {}", dest.display()))?;
             self.suppression.insert(&rel, "").await;
+            let _ = self
+                .store
+                .log_activity("delete", &self.folder_id, rel_path, "已同步对端删除");
             info!(path = %rel, "文件已删除");
         }
         Ok(())
@@ -343,6 +357,21 @@ mod tests {
         // 自写抑制已登记，且一次性
         assert!(eng.suppression.take_if_hit("dir/a.txt", Some(&hash)).await);
         assert!(!eng.suppression.take_if_hit("dir/a.txt", Some(&hash)).await);
+    }
+
+    #[tokio::test]
+    async fn pulled_file_logs_download_activity_with_size() {
+        let (eng, _tmp) = engine().await;
+        let hash = eng.blobs.add_bytes(b"hello".to_vec()).await.unwrap();
+        let mut e = entry("a.txt", &hash);
+        e.size = 5;
+        eng.apply_pulled(&e, &hash).await.unwrap();
+
+        let rows = eng.store.list_activity(Some("f1"), 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "download");
+        assert_eq!(rows[0].path, "a.txt");
+        assert_eq!(rows[0].size, 5);
     }
 
     #[tokio::test]

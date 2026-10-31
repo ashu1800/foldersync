@@ -18,6 +18,8 @@ pub const DEFAULT_RULES: &[&str] = &[
     ".DS_Store",
     "Thumbs.db",
     ".foldersync-tmp-*",
+    // 忽略规则本身不参与同步：否则 .syncignore 会被当作普通文件传到对端
+    ".syncignore",
     // .git 默认忽略：两端同时写 .git 易损坏仓库，由 git 自己管理
     ".git/",
 ];
@@ -85,23 +87,39 @@ impl IgnoreMatcher {
     }
 }
 
+/// `.syncignore` 里关闭内置默认规则的指令行。
+pub const DEFAULTS_OFF: &str = "# foldersync: defaults=off";
+
+/// 读取文件夹的忽略配置：是否启用内置默认规则 + 自定义规则。
+pub fn read_syncignore_config(root: &Path) -> (bool, Vec<String>) {
+    let text = std::fs::read_to_string(root.join(".syncignore")).unwrap_or_default();
+    let use_defaults = !text.lines().any(|l| l.trim() == DEFAULTS_OFF);
+    let rules = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    (use_defaults, rules)
+}
+
 /// 读取文件夹根目录的 `.syncignore`（不存在则空）。
 pub fn read_syncignore(root: &Path) -> Vec<String> {
-    let f = root.join(".syncignore");
-    match std::fs::read_to_string(f) {
-        Ok(s) => s
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    read_syncignore_config(root).1
 }
+
+/// 无论是否启用默认规则都必须忽略的基础设施文件：
+/// `.syncignore` 自己一旦被同步，对端会读到 `defaults=off`，默认保护全部失效；
+/// `.git/` 双端同时写会损坏仓库；临时文件不应跨端传播。
+pub const MANDATORY_RULES: &[&str] = &[".syncignore", ".foldersync-tmp-*", ".git/"];
 
 /// 默认规则 + .syncignore 合并后的完整匹配器（daemon 扫描入口）。
 pub fn matcher_for_folder(root: &Path) -> IgnoreMatcher {
-    let mut rules: Vec<String> = DEFAULT_RULES.iter().map(|s| s.to_string()).collect();
-    rules.extend(read_syncignore(root));
+    let (use_defaults, custom) = read_syncignore_config(root);
+    let mut rules: Vec<String> = MANDATORY_RULES.iter().map(|s| s.to_string()).collect();
+    if use_defaults {
+        rules.extend(DEFAULT_RULES.iter().map(|s| s.to_string()));
+    }
+    rules.extend(custom);
     IgnoreMatcher::new(root, &rules)
 }
 
@@ -146,5 +164,30 @@ mod tests {
         assert_eq!(rules, vec!["*.tmp".to_string(), "build_out/".to_string()]);
         let m = IgnoreMatcher::new(tmp.path(), &rules);
         assert!(m.matched("a.tmp", false));
+    }
+
+    #[test]
+    fn defaults_can_be_disabled_via_syncignore_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".syncignore"),
+            format!("{DEFAULTS_OFF}\n*.log\n"),
+        )
+        .unwrap();
+        let (use_defaults, rules) = read_syncignore_config(tmp.path());
+        assert!(!use_defaults);
+        assert_eq!(rules, vec!["*.log".to_string()]);
+        let m = matcher_for_folder(tmp.path());
+        assert!(m.matched("a.log", false), "自定义规则仍生效");
+        assert!(
+            !m.matched("node_modules/x.js", false),
+            "关闭默认规则后 node_modules 不应被忽略"
+        );
+        assert!(m.matched(".syncignore", false), "配置文件本身必须始终忽略");
+        assert!(m.matched(".git/HEAD", false), ".git 必须始终忽略");
+        assert!(
+            m.matched(".foldersync-tmp-a", false),
+            "临时文件必须始终忽略"
+        );
     }
 }

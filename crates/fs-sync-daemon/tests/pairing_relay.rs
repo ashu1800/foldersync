@@ -30,6 +30,7 @@ async fn relay_pairing_exchanges_ssh_keys() {
     let relay = run_relay_server(RelayServerConfig {
         data_dir: relay_dir.path().join("relay"),
         port: 0,
+        room_retention_days: 30,
     })
     .await
     .unwrap();

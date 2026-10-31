@@ -24,6 +24,9 @@ struct Cli {
     /// 数据目录（房间文件与主机密钥）
     #[arg(long, default_value = "./foldersync-relay-data")]
     data_dir: PathBuf,
+    /// 空闲房间保留天数（0 = 不清理）
+    #[arg(long, default_value_t = 30)]
+    room_retention_days: u64,
 }
 
 #[tokio::main]
@@ -39,6 +42,7 @@ async fn main() -> Result<()> {
         fs_sync_net::relay_server::run_relay_server(fs_sync_net::relay_server::RelayServerConfig {
             data_dir: cli.data_dir,
             port: cli.port,
+            room_retention_days: cli.room_retention_days,
         })
         .await?;
     println!(

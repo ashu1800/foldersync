@@ -47,12 +47,16 @@ impl SettingsStore {
 
     /// 应用补丁并立即落盘。
     pub fn update(&self, patch: SettingsPatch) -> Result<SettingsDto> {
+        if patch.ssh_port == Some(0) {
+            anyhow::bail!("SSH 端口必须在 1-65535 之间");
+        }
+        // 持锁完成“修改 → 落盘 → 提交内存”，避免并发保存时旧快照覆盖新字段。
         let mut guard = self.inner.lock().unwrap();
-        apply_patch(&mut guard, patch);
-        let dto = guard.clone();
-        drop(guard);
-        self.persist(&dto)?;
-        Ok(dto)
+        let mut next = guard.clone();
+        apply_patch(&mut next, patch);
+        self.persist(&next)?;
+        *guard = next.clone();
+        Ok(next)
     }
 
     fn persist(&self, dto: &SettingsDto) -> Result<()> {
@@ -66,8 +70,21 @@ fn persist_to(path: &Path, dto: &SettingsDto) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let json = serde_json::to_string_pretty(dto)?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     std::fs::write(&tmp, json).context("写设置临时文件失败")?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .context("打开设置临时文件失败")?;
+    file.sync_all().context("刷盘设置文件失败")?;
+    drop(file);
     std::fs::rename(&tmp, path).context("替换设置文件失败")?;
     Ok(())
 }

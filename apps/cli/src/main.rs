@@ -68,11 +68,18 @@ fn default_data_dir() -> PathBuf {
         .join(".foldersync")
 }
 
-fn relay_of(cli: &Cli) -> Option<String> {
+fn relay_of(cli: &Cli, settings: &serde_json::Value) -> Option<String> {
     cli.relay
         .clone()
         .or_else(|| std::env::var("FOLDERSYNC_RELAY").ok())
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            settings["relay_url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
         .or_else(|| Some(fs_sync_net::DEFAULT_RELAY_URL.to_string()))
 }
 
@@ -80,6 +87,39 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "foldersync-cli".into())
+}
+
+/// 把设置里的全局默认忽略规则追加到文件夹 `.syncignore`（不覆盖已有内容）。
+fn apply_default_ignore(data_dir: &std::path::Path, root: &std::path::Path) -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(data_dir.join("settings.json")) else {
+        return Ok(());
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    let rules: Vec<String> = settings["default_ignore"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+        .map(str::to_string)
+        .collect();
+    if rules.is_empty() {
+        return Ok(());
+    }
+    let ignore_path = root.join(".syncignore");
+    let mut existing = std::fs::read_to_string(&ignore_path).unwrap_or_default();
+    for rule in rules {
+        if !existing.lines().any(|line| line.trim() == rule) {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(&rule);
+            existing.push('\n');
+        }
+    }
+    std::fs::write(ignore_path, existing)?;
+    Ok(())
 }
 
 struct Context2 {
@@ -91,13 +131,34 @@ struct Context2 {
     pairing: PairingManager,
     blobs: Arc<BlobStore>,
     relay: Option<String>,
+    device_name: String,
+    network_mode: NetworkMode,
+    ssh_port: u16,
 }
 
 async fn build_context(cli: &Cli) -> Result<Context2> {
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
-    let settings_relay = relay_of(cli);
-    let env = fs_sync_net::env::ensure_ssh_env(&data_dir, fs_sync_net::env::default_ssh_port());
+    let file_settings: serde_json::Value = std::fs::read_to_string(data_dir.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let settings_relay = relay_of(cli, &file_settings);
+    let device_name = file_settings["device_name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(hostname);
+    let network_mode = match file_settings["network_mode"].as_str() {
+        Some("tailscale") => NetworkMode::Tailscale,
+        Some("relay") => NetworkMode::Relay,
+        _ => NetworkMode::Auto,
+    };
+    let ssh_port = file_settings["ssh_port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or_else(fs_sync_net::env::default_ssh_port);
+    let env = fs_sync_net::env::ensure_ssh_env(&data_dir, ssh_port);
     let identity = SshIdentity::load_or_create(&data_dir)?;
     let host_key = load_or_create_host_key(&data_dir)?;
     let store = Arc::new(Store::open(&data_dir.join("state.sqlite3"))?);
@@ -107,7 +168,7 @@ async fn build_context(cli: &Cli) -> Result<Context2> {
         identity.clone(),
         public_key_line(host_key.public_key())?,
         env.ssh_port,
-        hostname(),
+        device_name.clone(),
         settings_relay.clone(),
         store.clone(),
     );
@@ -121,6 +182,9 @@ async fn build_context(cli: &Cli) -> Result<Context2> {
         pairing,
         blobs,
         relay: settings_relay,
+        device_name,
+        network_mode,
+        ssh_port: env.ssh_port,
     })
 }
 
@@ -149,6 +213,37 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn start_sync_server(
+    ctx: &Context2,
+    runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+) -> Result<fs_sync_daemon::SshServerHandle> {
+    let shared = Arc::new(SshServerShared {
+        identity: ctx.identity.clone(),
+        host_key: ctx.host_key.clone(),
+        device_id: ctx.identity.id(),
+        device_name: ctx.device_name.clone(),
+        ssh_port: ctx.ssh_port,
+        data_dir: ctx.data_dir.clone(),
+        sync_root: std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.data_dir.clone())
+            .join("FolderSync"),
+        trust: ctx.trust.clone(),
+        pairing: ctx.pairing.clone(),
+        store: ctx.store.clone(),
+        blobs: ctx.blobs.clone(),
+        invite_lock: tokio::sync::Mutex::new(()),
+        removing_folders: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        runtimes,
+        online: Arc::new(tokio::sync::Mutex::new(Default::default())),
+    });
+    let server = run_ssh_server(shared).await?;
+    ctx.pairing.set_ssh_port(server.port);
+    Ok(server)
+}
+
 async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()> {
     let ctx = build_context(cli).await?;
     let runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>> =
@@ -158,6 +253,7 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
         if !root.is_dir() {
             anyhow::bail!("不是文件夹: {folder}");
         }
+        apply_default_ignore(&ctx.data_dir, &root)?;
         let name = root
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -171,8 +267,18 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
                 paused: false,
                 tombstone_days: 30,
                 created_at: pc::now_secs() as i64,
+                shared_with: Vec::new(),
             })?;
         }
+        let stored = ctx
+            .store
+            .list_folders()?
+            .into_iter()
+            .find(|f| f.id == folder_id);
+        let shared_with = stored
+            .as_ref()
+            .map(|f| f.shared_with.clone())
+            .unwrap_or_default();
         let rt = FolderRuntime::start(
             folder_id,
             root,
@@ -182,32 +288,28 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
             400,
         )
         .await?;
+        rt.set_shared_with(shared_with);
         runtimes.lock().unwrap().push(Arc::new(rt));
     }
 
-    let shared = Arc::new(SshServerShared {
-        identity: ctx.identity.clone(),
-        host_key: ctx.host_key.clone(),
-        device_id: ctx.identity.id(),
-        device_name: hostname(),
-        ssh_port: fs_sync_net::env::default_ssh_port(),
-        data_dir: ctx.data_dir.clone(),
-        trust: ctx.trust.clone(),
-        pairing: ctx.pairing.clone(),
-        runtimes: runtimes.clone(),
-        online: Arc::new(tokio::sync::Mutex::new(Default::default())),
-    });
-    let server = run_ssh_server(shared).await?;
+    let server = start_sync_server(&ctx, runtimes.clone()).await?;
     let actual_port = server.port;
-    ctx.pairing.set_ssh_port(actual_port);
 
     let peer_cfg = Arc::new(RwLock::new(PeerLoopConfig {
         identity: ctx.identity.clone(),
         device_id: ctx.identity.id(),
-        device_name: hostname(),
+        device_name: ctx.device_name.clone(),
         ssh_port: actual_port,
-        mode: NetworkMode::Auto,
+        mode: ctx.network_mode,
         relay_url: ctx.relay.clone(),
+        store: ctx.store.clone(),
+        blobs: ctx.blobs.clone(),
+        sync_root: std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.data_dir.clone())
+            .join("FolderSync"),
+        paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }));
     let rt2 = runtimes.clone();
     let trust2 = ctx.trust.clone();
@@ -340,9 +442,14 @@ async fn sync_once(cli: &Cli, path: String, peer: String) -> Result<()> {
     let ctx = build_context(cli).await?;
     let device = ctx.trust.get(&peer)?.context("设备未配对（先 join）")?;
     let root = PathBuf::from(&path);
+    let folder_name = root
+        .file_name()
+        .context("同步路径没有文件夹名")?
+        .to_string_lossy();
+    // 与桌面端一致：folder_id 由文件夹名生成（两端必须同名才能匹配）
     let folder_id = format!(
         "folder-{}",
-        &blake3::hash(root.to_string_lossy().as_bytes()).to_hex()[..16]
+        &blake3::hash(folder_name.as_bytes()).to_hex()[..16]
     );
     let rt = Arc::new(
         FolderRuntime::start(
@@ -355,6 +462,11 @@ async fn sync_once(cli: &Cli, path: String, peer: String) -> Result<()> {
         )
         .await?,
     );
+    // 一次性同步只针对指定设备，避免把文件夹暴露给其他已配对设备
+    rt.set_shared_with(vec![device.id.clone()]);
+    // 必须同时起 SSH/SFTP 服务端：对端收到索引后会回连拉 blob
+    let runtimes = Arc::new(std::sync::Mutex::new(vec![rt.clone()]));
+    let _server = start_sync_server(&ctx, runtimes).await?;
     let target = fs_sync_net::ssh_client::SshTarget {
         host: device
             .addresses

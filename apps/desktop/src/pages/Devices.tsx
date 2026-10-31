@@ -6,28 +6,36 @@ import type { DeviceDto, PairingCodeDto } from "../lib/bindings";
 import * as api from "../lib/tauri";
 import { useStore } from "../stores/app";
 import {
+  ConfirmDialog,
   ConnBadge,
   Empty,
   ErrorBanner,
+  Icon,
   Loading,
   Modal,
+  OnlineBadge,
   copyText,
+  shortFingerprint,
 } from "../components/ui";
 
 export default function Devices() {
   const { t } = useTranslation();
   const {
     devices,
+    devicesLoaded,
     pendingPairings,
-    loading,
     refreshDevices,
     refreshPendingPairings,
     removePendingPairing,
+    devicesError,
   } = useStore();
 
   const [showAdd, setShowAdd] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState<DeviceDto | null>(null);
+  const [renameTarget, setRenameTarget] = useState<DeviceDto | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   useEffect(() => {
     void refreshDevices();
@@ -49,10 +57,10 @@ export default function Devices() {
 
   const handleRemove = useCallback(
     async (d: DeviceDto) => {
-      if (!window.confirm(t("devices.removeConfirm"))) return;
       setBusy(true);
       try {
         await api.removeDevice(d.id);
+        setConfirmRemove(null);
         await refreshDevices();
       } catch (e) {
         setError(api.asCmdError(e).message);
@@ -60,16 +68,20 @@ export default function Devices() {
         setBusy(false);
       }
     },
-    [refreshDevices, t],
+    [refreshDevices],
   );
 
   const handleRename = useCallback(
     async (d: DeviceDto) => {
-      const name = window.prompt(t("devices.rename"), d.name);
-      if (!name || name === d.name) return;
+      const name = renameValue.trim();
+      if (!name || name === d.name) {
+        setRenameTarget(null);
+        return;
+      }
       setBusy(true);
       try {
         await api.renameDevice(d.id, name);
+        setRenameTarget(null);
         await refreshDevices();
       } catch (e) {
         setError(api.asCmdError(e).message);
@@ -77,7 +89,7 @@ export default function Devices() {
         setBusy(false);
       }
     },
-    [refreshDevices, t],
+    [refreshDevices, renameValue],
   );
 
   return (
@@ -93,7 +105,13 @@ export default function Devices() {
         </button>
       </div>
 
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {(error ?? devicesError) && (
+        <ErrorBanner
+          message={error ?? devicesError ?? ""}
+          onRetry={() => void refreshDevices()}
+          onDismiss={() => setError(null)}
+        />
+      )}
 
       {/* 待确认的配对请求：这是安全关键路径，必须显式展示指纹供核对 */}
       {pendingPairings.map((p) => (
@@ -119,12 +137,12 @@ export default function Devices() {
         </div>
       ))}
 
-      {loading && devices.length === 0 ? (
+      {!devicesLoaded && devices.length === 0 ? (
         <Loading />
       ) : devices.length === 0 ? (
         <div className="card">
           <Empty
-            icon="◍"
+            icon={<Icon name="device" size={30} />}
             title={t("devices.empty")}
             action={
               <button className="btn btn-primary" onClick={() => setShowAdd(true)}>
@@ -134,30 +152,34 @@ export default function Devices() {
           />
         </div>
       ) : (
-        <div className="card" style={{ padding: 0 }}>
+        <div className="card table-scroll" style={{ padding: 0 }}>
           <table className="table">
             <thead>
               <tr>
-                <th>{t("devices.title")}</th>
-                <th>{t("devices.fingerprint")}</th>
-                <th>{t("devices.online")}</th>
-                <th style={{ width: 200 }} />
+                <th>{t("devices.name")}</th>
+                <th style={{ width: 150 }}>{t("devices.fingerprint")}</th>
+                <th style={{ width: 90 }}>{t("devices.online")}</th>
+                <th style={{ width: 110 }}>{t("devices.connection")}</th>
+                <th style={{ width: 156 }}>{t("common.actions")}</th>
               </tr>
             </thead>
             <tbody>
               {devices.map((d) => (
                 <tr key={d.id}>
                   <td>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span
-                        className={`dot ${d.online ? "dot-success" : "dot-muted"}`}
-                        aria-hidden
-                      />
-                      {d.name}
-                    </div>
+                    <strong>{d.name}</strong>
                   </td>
                   <td>
-                    <span className="mono">{d.fingerprint}</span>
+                    <button
+                      className="fp-copy mono"
+                      title={`${d.fingerprint}\n${t("devices.copy")}`}
+                      onClick={() => void copyText(d.fingerprint)}
+                    >
+                      {shortFingerprint(d.fingerprint)}
+                    </button>
+                  </td>
+                  <td>
+                    <OnlineBadge online={d.online} />
                   </td>
                   <td>
                     <ConnBadge conn={d.conn} rtt={d.rtt_ms} />
@@ -166,14 +188,17 @@ export default function Devices() {
                     <div className="btn-row">
                       <button
                         className="btn btn-sm"
-                        onClick={() => void handleRename(d)}
+                        onClick={() => {
+                          setRenameTarget(d);
+                          setRenameValue(d.name);
+                        }}
                         disabled={busy}
                       >
                         {t("devices.rename")}
                       </button>
                       <button
                         className="btn btn-sm btn-danger"
-                        onClick={() => void handleRemove(d)}
+                        onClick={() => setConfirmRemove(d)}
                         disabled={busy}
                       >
                         {t("devices.remove")}
@@ -196,6 +221,52 @@ export default function Devices() {
           }}
         />
       )}
+
+      {confirmRemove && (
+        <ConfirmDialog
+          title={t("devices.remove")}
+          message={t("devices.removeConfirm")}
+          confirmLabel={t("devices.remove")}
+          danger
+          busy={busy}
+          onConfirm={() => void handleRemove(confirmRemove)}
+          onCancel={() => setConfirmRemove(null)}
+        />
+      )}
+
+      {renameTarget && (
+        <Modal
+          title={t("devices.rename")}
+          onClose={() => setRenameTarget(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setRenameTarget(null)}>
+                {t("common.cancel")}
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={busy || !renameValue.trim()}
+                onClick={() => void handleRename(renameTarget)}
+              >
+                {t("settings.save")}
+              </button>
+            </>
+          }
+        >
+          <div className="field">
+            <label className="label" htmlFor="rename-device">
+              {t("devices.name")}
+            </label>
+            <input
+              id="rename-device"
+              className="input"
+              value={renameValue}
+              maxLength={64}
+              onChange={(e) => setRenameValue(e.target.value)}
+            />
+          </div>
+        </Modal>
+      )}
     </>
   );
 }
@@ -209,12 +280,25 @@ function AddDeviceModal({
   onDone: () => void;
 }) {
   const { t } = useTranslation();
+  const pendingCount = useStore((s) => s.pendingPairings.length);
+  const refreshPendingPairings = useStore((s) => s.refreshPendingPairings);
   const [tab, setTab] = useState<"generate" | "input">("generate");
   const [code, setCode] = useState<PairingCodeDto | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [paired, setPaired] = useState<DeviceDto | null>(null);
+
+  // 有设备请求配对时关闭弹窗，让用户看到页面上的指纹核对/接受按钮
+  useEffect(() => {
+    if (pendingCount > 0) onClose();
+  }, [pendingCount, onClose]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => void refreshPendingPairings(), 1500);
+    return () => window.clearInterval(id);
+  }, [refreshPendingPairings]);
 
   // 倒计时：让用户知道还有多久过期
   const [remaining, setRemaining] = useState(0);
@@ -246,8 +330,7 @@ function AddDeviceModal({
     setBusy(true);
     setError(null);
     try {
-      await api.acceptPairingCode(input.trim());
-      onDone();
+      setPaired(await api.acceptPairingCode(input.trim()));
     } catch (e) {
       setError(api.asCmdError(e).message);
     } finally {
@@ -264,7 +347,11 @@ function AddDeviceModal({
           <button className="btn" onClick={onClose}>
             {t("common.close")}
           </button>
-          {tab === "generate" ? (
+          {paired ? (
+            <button className="btn btn-primary" onClick={onDone}>
+              {t("common.confirm")}
+            </button>
+          ) : tab === "generate" ? (
             <button
               className="btn btn-primary"
               onClick={() => void generate()}
@@ -284,14 +371,35 @@ function AddDeviceModal({
         </>
       }
     >
-      <div className="tabs">
+      <div
+        className="tabs"
+        role="tablist"
+        aria-label={t("devices.add")}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+          e.preventDefault();
+          const next = tab === "generate" ? "input" : "generate";
+          setTab(next);
+          document.getElementById(`device-tab-${next}`)?.focus();
+        }}
+      >
         <button
+          id="device-tab-generate"
+          role="tab"
+          aria-selected={tab === "generate"}
+          aria-controls="device-panel"
+          tabIndex={tab === "generate" ? 0 : -1}
           className={`tab ${tab === "generate" ? "active" : ""}`}
           onClick={() => setTab("generate")}
         >
           {t("devices.generateCode")}
         </button>
         <button
+          id="device-tab-input"
+          role="tab"
+          aria-selected={tab === "input"}
+          aria-controls="device-panel"
+          tabIndex={tab === "input" ? 0 : -1}
           className={`tab ${tab === "input" ? "active" : ""}`}
           onClick={() => setTab("input")}
         >
@@ -301,54 +409,69 @@ function AddDeviceModal({
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      {tab === "generate" ? (
-        code ? (
-          <>
-            <div className="pairing-code">{code.code}</div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                marginTop: 12,
-              }}
-            >
-              <span className="hint">
-                {t("devices.codeExpires")}: {formatDuration(remaining)}
-              </span>
-              <button
-                className="btn btn-sm"
-                onClick={async () => {
-                  const ok = await copyText(code.code);
-                  setCopied(ok);
-                  window.setTimeout(() => setCopied(false), 1500);
+      <div role="tabpanel" id="device-panel" aria-labelledby={`device-tab-${tab}`}>
+        {paired ? (
+          <div
+            className="notice"
+            style={{ flexDirection: "column", alignItems: "stretch" }}
+          >
+            <strong>{t("devices.pairedTitle")}</strong>
+            <div className="card-meta" style={{ marginTop: 4 }}>
+              {t("devices.pairedHint")}
+            </div>
+            <div className="pairing-code mono" style={{ marginTop: 10 }}>
+              {paired.fingerprint}
+            </div>
+          </div>
+        ) : tab === "generate" ? (
+          code ? (
+            <>
+              <div className="pairing-code">{code.code}</div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  marginTop: 12,
                 }}
               >
-                {copied ? t("devices.copied") : t("devices.copy")}
-              </button>
-            </div>
-            <p className="hint" style={{ marginTop: 12 }}>
-              在另一台设备上打开 FolderSync → 设备 → 输入配对码，粘贴上面这串字符。
-            </p>
-          </>
+                <span className="hint">
+                  {t("devices.codeExpires")}: {formatDuration(remaining)}
+                </span>
+                <button
+                  className="btn btn-sm"
+                  onClick={async () => {
+                    const ok = await copyText(code.code);
+                    setCopied(ok);
+                    window.setTimeout(() => setCopied(false), 1500);
+                  }}
+                >
+                  {copied ? t("devices.copied") : t("devices.copy")}
+                </button>
+              </div>
+              <p className="hint" style={{ marginTop: 12 }}>
+                {t("devices.pairingOtherHint")}
+              </p>
+            </>
+          ) : (
+            <p className="hint">{t("devices.generateHint")}</p>
+          )
         ) : (
-          <p className="hint">点击下方按钮生成一次性配对码，5 分钟内有效。</p>
-        )
-      ) : (
-        <div className="field">
-          <label className="label" htmlFor="pairing-input">
-            {t("devices.inputCode")}
-          </label>
-          <textarea
-            id="pairing-input"
-            className="textarea"
-            placeholder={t("devices.codePlaceholder")}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            autoFocus
-          />
-        </div>
-      )}
+          <div className="field">
+            <label className="label" htmlFor="pairing-input">
+              {t("devices.inputCode")}
+            </label>
+            <textarea
+              id="pairing-input"
+              className="textarea"
+              placeholder={t("devices.codePlaceholder")}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              autoFocus
+            />
+          </div>
+        )}
+      </div>
     </Modal>
   );
 }

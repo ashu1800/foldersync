@@ -74,6 +74,7 @@ async fn two_nodes_sync_through_relay() {
     let relay = run_relay_server(RelayServerConfig {
         data_dir: relay_dir.path().join("relay"),
         port: 0,
+        room_retention_days: 30,
     })
     .await
     .unwrap();
@@ -104,6 +105,10 @@ async fn two_nodes_sync_through_relay() {
             ssh_port: 2222,
             mode: NetworkMode::Relay,
             relay_url: Some(url.clone()),
+            store: node.runtime.session.engine.store.clone(),
+            blobs: node.runtime.session.blobs.clone(),
+            sync_root: node._dir.path().join("FolderSync"),
+            paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }))
     };
     let cfg_a = cfg(&a);

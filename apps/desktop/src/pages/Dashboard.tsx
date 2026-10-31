@@ -11,15 +11,29 @@ import {
   Empty,
   ErrorBanner,
   FolderBadge,
+  Icon,
   Loading,
+  OnlineBadge,
   OverallBadge,
   RelayGuideModal,
   formatTime,
+  shortFingerprint,
 } from "../components/ui";
 
 export default function Dashboard() {
-  const { t } = useTranslation();
-  const { overview, devices, folders, loading, error, refreshAll } = useStore();
+  const { t, i18n } = useTranslation();
+  const {
+    overview,
+    overviewLoaded,
+    devices,
+    devicesLoaded,
+    folders,
+    foldersLoaded,
+    overviewError,
+    devicesError,
+    foldersError,
+    refreshAll,
+  } = useStore();
   const [env, setEnv] = useState<EnvStatusDto | null>(null);
   const [envLoading, setEnvLoading] = useState(false);
   const [envError, setEnvError] = useState<string | null>(null);
@@ -69,43 +83,67 @@ export default function Dashboard() {
     }
   };
 
-  if (!overview && loading) return <Loading />;
+  if (!overview && !overviewLoaded) return <Loading />;
 
   return (
     <>
       <div className="page-header">
         <div>
           <h1 className="page-title">{t("overview.title")}</h1>
-          <div className="page-subtitle">
+          <div className="page-subtitle truncate" title={overview?.fingerprint}>
             {overview?.device_name} ·{" "}
-            <span className="mono">{overview?.fingerprint}</span>
+            <span className="mono">
+              {overview?.fingerprint ? shortFingerprint(overview.fingerprint) : ""}
+            </span>
           </div>
         </div>
         {overview && <OverallBadge status={overview.status} />}
       </div>
 
-      {error && <ErrorBanner message={error} onRetry={() => void refreshAll()} />}
+      {(overviewError || devicesError || foldersError) && (
+        <ErrorBanner
+          message={overviewError ?? devicesError ?? foldersError ?? ""}
+          onRetry={() => void refreshAll()}
+        />
+      )}
+
+      {overview?.status === "syncing" && (
+        <div
+          className="sync-progress"
+          role="progressbar"
+          aria-label={t("overview.syncingProgress", {
+            syncing: overview.syncing_files,
+            remaining: overview.remaining_files,
+          })}
+        >
+          <span />
+        </div>
+      )}
 
       {env && !env.ready && (
-        <div
-          className="notice"
-          role="status"
-          style={{ alignItems: "flex-start", flexWrap: "wrap" }}
-        >
+        <div className="notice" role="status" style={{ flexWrap: "wrap" }}>
           <div className="notice-content">
             <strong>{t("overview.envTitle")}</strong>
             <div className="card-meta" style={{ marginTop: 4 }}>
               {t("overview.envHint")}
             </div>
+            {i18n.language.startsWith("zh") &&
+              env.notes.slice(0, 2).map((n) => (
+                <div className="card-meta" key={n}>
+                  {n}
+                </div>
+              ))}
           </div>
           <div className="btn-row">
-            <button
-              className="btn btn-primary"
-              onClick={() => void installTailscale()}
-              aria-label={t("overview.envInstallTailscale")}
-            >
-              {t("overview.envInstallTailscale")}
-            </button>
+            {!env.tailscale_installed && (
+              <button
+                className="btn btn-primary"
+                onClick={() => void installTailscale()}
+                aria-label={t("overview.envInstallTailscale")}
+              >
+                {t("overview.envInstallTailscale")}
+              </button>
+            )}
             <button
               className="btn"
               onClick={() => setShowRelayGuide(true)}
@@ -155,10 +193,10 @@ export default function Dashboard() {
       <h2 className="card-title" style={{ fontSize: 15, marginBottom: 10 }}>
         {t("overview.devices")}
       </h2>
-      {devices.length === 0 ? (
+      {devicesLoaded && devices.length === 0 ? (
         <div className="card">
           <Empty
-            icon="◍"
+            icon={<Icon name="device" size={30} />}
             title={t("overview.noDevices")}
             action={
               <Link className="btn btn-primary" to="/devices">
@@ -167,22 +205,30 @@ export default function Dashboard() {
             }
           />
         </div>
+      ) : !devicesLoaded ? (
+        <Loading />
       ) : (
         <div className="card-grid">
           {devices.map((d) => (
             <div className="card" key={d.id}>
               <div
                 className="card-title"
-                style={{ display: "flex", alignItems: "center", gap: 8 }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                }}
               >
-                <span
-                  className={`dot ${d.online ? "dot-success" : "dot-muted"}`}
-                  aria-hidden
-                />
-                {d.name}
+                <span className="truncate">{d.name}</span>
+                <OnlineBadge online={d.online} />
               </div>
-              <div className="card-meta" style={{ marginBottom: 8 }}>
-                <span className="mono">{d.fingerprint}</span>
+              <div
+                className="card-meta truncate"
+                style={{ marginBottom: 8 }}
+                title={d.fingerprint}
+              >
+                <span className="mono">{shortFingerprint(d.fingerprint)}</span>
               </div>
               <ConnBadge conn={d.conn} rtt={d.rtt_ms} />
             </div>
@@ -193,10 +239,10 @@ export default function Dashboard() {
       <h2 className="card-title" style={{ fontSize: 15, margin: "24px 0 10px" }}>
         {t("overview.folders")}
       </h2>
-      {folders.length === 0 ? (
+      {foldersLoaded && folders.length === 0 ? (
         <div className="card">
           <Empty
-            icon="▤"
+            icon={<Icon name="folder" size={30} />}
             title={t("overview.noFolders")}
             action={
               <Link className="btn btn-primary" to="/folders">
@@ -205,6 +251,8 @@ export default function Dashboard() {
             }
           />
         </div>
+      ) : !foldersLoaded ? (
+        <Loading />
       ) : (
         <div className="card-grid">
           {folders.map((f) => (

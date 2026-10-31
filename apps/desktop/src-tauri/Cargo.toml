@@ -41,5 +41,8 @@ ed25519-dalek = "3"
 md-5 = "0.10"
 hex = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -55,6 +55,7 @@ cargo run -p foldersync-cli -- sync <本地路径> <对端设备ID>  # 单向推
 
 # 中继服务器（独立 binary）
 cargo run -p foldersync-relay -- --port 9443 --data-dir ./foldersync-relay-data
+# 空闲房间默认保留 30 天，--room-retention-days 0 可关闭清理
 
 # 桌面应用
 cd apps/desktop && pnpm install && pnpm tauri dev
@@ -208,8 +209,9 @@ cargo build --release -p foldersync-relay
 |------|------|----------|
 | `folder_id` 由文件夹名派生 | 两台机器上同名文件夹自动配对；不同名文件夹不会同步 | 引入邀请码 + UUID，替换 `folder_id` 的生成方式 |
 | 限速是“传输后结算” | 用户感知准确，网络统计不精确 | 在 `limits.rs` 加流包装器，调用点不动 |
-| 文件树超过 1000 行截断 | 大文件夹只看得到前 1000 项 | 换成 react-window 虚拟滚动 |
+| 文件树初始渲染 1000 行 | 大文件夹需要点「显示更多」继续加载 | 换成 react-window 虚拟滚动 |
 | 活动列表最多 500 条 | 更早的记录要从数据库查 | 加分页游标（DTO 里已有 `before_id`） |
+| 协议 v3 与 0.2.5 及更早不兼容 | 旧版对端无法建立同步 | 两端一起升级 |
 | 不跟随符号链接 | 链接目标不会同步 | 初版有意为之，见设计决策 |
 | 中继落盘文件未做应用层加密 | 中继管理员/入侵者可读取文件内容 | 自建可信服务器 + 磁盘加密；需要更强隔离时做客户端加密 |
 | macOS/Linux 未实机验证 | 主要在 Windows 上验证 | Tauri bundler 已配好，需在对应平台构建 |

@@ -5,6 +5,7 @@
 // - 更新说明（notice）必须展示给用户。
 
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import * as api from "../lib/tauri";
 import type { UpdateDto } from "../lib/bindings";
 import { Modal } from "./ui";
@@ -58,11 +59,17 @@ export function UpdateDetails({
   progress: number;
   error: string | null;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="hint" style={{ marginTop: 8 }}>
       <p>
-        发现新版本 <b>{update.latest_version}</b>（当前 {update.current_version}）
-        {update.force && <b style={{ color: "var(--danger, #e5484d)" }}> · 必须更新</b>}
+        {t("update.found", {
+          latest: update.latest_version,
+          current: update.current_version,
+        })}
+        {update.force && (
+          <b style={{ color: "var(--danger)" }}> · {t("update.forceBadge")}</b>
+        )}
       </p>
       <pre
         style={{
@@ -73,12 +80,25 @@ export function UpdateDetails({
           marginTop: 6,
         }}
       >
-        {update.notice || "（无更新说明）"}
+        {update.notice || t("update.notesEmpty")}
       </pre>
-      {installing && <p style={{ marginTop: 8 }}>正在下载并校验… {progress}%</p>}
+      {installing && (
+        <>
+          <p style={{ marginTop: 8 }}>{t("update.installingProgress", { progress })}</p>
+          <div
+            className="update-progress"
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress}
+          >
+            <span style={{ width: `${progress}%` }} />
+          </div>
+        </>
+      )}
       {error && (
-        <p style={{ marginTop: 8, color: "var(--danger, #e5484d)" }}>
-          更新失败：{error}
+        <p style={{ marginTop: 8, color: "var(--danger)" }}>
+          {t("update.installFailed", { error })}
         </p>
       )}
     </div>
@@ -86,6 +106,7 @@ export function UpdateDetails({
 }
 
 export default function UpdatePrompt() {
+  const { t } = useTranslation();
   const [update, setUpdate] = useState<UpdateDto | null>(null);
   // 用户点过「稍后」的版本：本次运行内不再弹（强制更新除外）
   const [dismissed, setDismissed] = useState<string | null>(null);
@@ -113,17 +134,22 @@ export default function UpdatePrompt() {
 
   return (
     <Modal
-      title={update.force ? "必须更新" : "发现新版本"}
+      title={update.force ? t("update.requiredTitle") : t("update.availableTitle")}
       onClose={close}
+      dismissible={!update.force}
       footer={
         <div className="btn-row">
           {!update.force && (
             <button className="btn" disabled={installing} onClick={close}>
-              稍后
+              {t("update.later")}
             </button>
           )}
           <button className="btn btn-primary" disabled={installing} onClick={install}>
-            {installing ? "更新中…" : error ? "重试" : "立即更新"}
+            {installing
+              ? t("update.installing")
+              : error
+                ? t("update.retry")
+                : t("update.installNow")}
           </button>
         </div>
       }
@@ -136,7 +162,7 @@ export default function UpdatePrompt() {
       />
       {update.force && (
         <p className="hint" style={{ marginTop: 8 }}>
-          当前版本已不再支持，升级后才能继续使用。
+          {t("update.requiredHint")}
         </p>
       )}
     </Modal>

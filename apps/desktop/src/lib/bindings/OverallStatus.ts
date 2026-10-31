@@ -3,4 +3,4 @@
 /**
  * 全局总状态（概览页顶部）。
  */
-export type OverallStatus = "synced" | "syncing" | "error" | "paused";
+export type OverallStatus = "not_configured" | "synced" | "syncing" | "error" | "paused";

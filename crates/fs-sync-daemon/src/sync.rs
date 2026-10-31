@@ -73,6 +73,11 @@ pub fn scan_and_index(
         if out.contains_key(path) {
             continue;
         }
+        // 刚刚被忽略规则排除的路径：从索引移除，但绝不能生成墓碑，
+        // 否则对端收到删除会真的删掉用户文件。
+        if matcher.matched(path, old.is_dir) {
+            continue;
+        }
         // 读不了的路径：原样保留旧条目，读失败 ≠ 已删除
         // 已有墓碑：原样保留，否则 replace_entries 会把它抹掉，对端就收不到删除
         if old.deleted || scan.is_unreadable(path) {
@@ -328,6 +333,34 @@ mod tests {
         assert!(!e.deleted);
         // 已落库
         assert_eq!(store.list_entries("f1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newly_ignored_file_is_removed_without_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(tmp.path().join("secret.log"), b"secret").unwrap();
+        let store = Store::open_in_memory().unwrap();
+
+        let first = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+        assert!(first.contains_key("secret.log"));
+
+        std::fs::write(tmp.path().join(".syncignore"), "*.log\n").unwrap();
+        let second = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+        assert!(second.contains_key("keep.txt"));
+        assert!(
+            !second.contains_key("secret.log"),
+            "被忽略的文件不应保留在索引"
+        );
+        let stored = store.list_entries("f1").unwrap();
+        assert!(
+            stored.iter().all(|e| e.path != "secret.log"),
+            "更不应生成墓碑，否则对端会删除真实文件: {stored:?}"
+        );
+        assert!(
+            stored.iter().all(|e| e.path != ".syncignore"),
+            ".syncignore 自己不应被同步"
+        );
     }
 
     #[test]

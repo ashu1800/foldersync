@@ -33,6 +33,8 @@ pub enum ConnType {
 #[derive(Debug, Default)]
 pub struct Presence {
     conns: std::collections::HashMap<String, Vec<ConnType>>,
+    /// 最近一次成功连接测得的往返延迟（毫秒）
+    rtt_ms: std::collections::HashMap<String, u64>,
 }
 
 impl Presence {
@@ -60,6 +62,16 @@ impl Presence {
             .copied()
             .find(|t| *t == ConnType::Tailscale)
             .or_else(|| v.first().copied())
+    }
+
+    /// 记录最近一次连接的 RTT。
+    pub fn set_rtt(&mut self, id: &str, rtt_ms: u64) {
+        self.rtt_ms.insert(id.to_string(), rtt_ms);
+    }
+
+    /// 读取最近一次连接的 RTT（离线后保留，便于界面显示历史延迟）。
+    pub fn rtt(&self, id: &str) -> Option<u64> {
+        self.rtt_ms.get(id).copied()
     }
 }
 
@@ -95,6 +107,9 @@ mod tests {
         assert_eq!(p.get("a"), None);
         p.leave("a", ConnType::Relay); // 多余的 leave 不出错
         assert_eq!(p.get("b"), None);
+        p.set_rtt("a", 23);
+        assert_eq!(p.rtt("a"), Some(23));
+        assert_eq!(p.rtt("b"), None);
     }
 
     #[test]

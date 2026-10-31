@@ -8,6 +8,7 @@ use crate::message::{MAX_FRAME, Message, decode_frame, encode_frame};
 /// 写一帧（长度前缀 + 体），并 flush。
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {
     let buf = encode_frame(msg)?;
+    anyhow::ensure!(buf.len() <= MAX_FRAME, "发送帧超长: {}", buf.len());
     w.write_all(&buf).await.context("写帧失败")?;
     w.flush().await.context("flush 失败")?;
     Ok(())

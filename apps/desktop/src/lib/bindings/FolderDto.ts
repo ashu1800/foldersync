@@ -28,4 +28,8 @@ file_count: number,
 /**
  * 分享给的设备 id 列表
  */
-shared_with: Array<string>, };
+shared_with: Array<string>,
+/**
+ * 最近一次同步失败原因（成功时清空）
+ */
+last_error: string | null, };

@@ -9,6 +9,7 @@ export type { ActivityKind } from "./ActivityKind";
 export type { ActivityDto } from "./ActivityDto";
 export type { ActivityFilter } from "./ActivityFilter";
 export type { ConflictDto } from "./ConflictDto";
+export type { ConflictPreviewDto } from "./ConflictPreviewDto";
 export type { ConflictResolution } from "./ConflictResolution";
 export type { TreeNodeDto } from "./TreeNodeDto";
 export type { FileState } from "./FileState";

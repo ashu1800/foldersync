@@ -8,7 +8,7 @@ use fs_sync_daemon::{EventKind, FileEvent};
 use fs_sync_net::message::{PairingRequest, PeerInfo};
 use fs_sync_store::Folder;
 use tauri::State;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dto::*;
 use crate::state::{AppState, fingerprint_of, hostname};
@@ -20,6 +20,33 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 原子替换目标文件：Windows 用 MoveFileEx(REPLACE_EXISTING)，
+/// 其他平台 rename 本身就是原子替换。调用方先把内容完整写到同目录临时文件。
+#[cfg(windows)]
+fn atomic_replace_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let from: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(src, dst)
+}
+
 /// 概览：顶部总状态 + 设备/文件夹聚合。
 #[tauri::command]
 pub async fn get_overview(state: State<'_, Arc<AppState>>) -> CmdResult<OverviewDto> {
@@ -29,14 +56,27 @@ pub async fn get_overview(state: State<'_, Arc<AppState>>) -> CmdResult<Overview
     let online = devices.iter().filter(|d| d.online).count() as u32;
     let paused_all = state.paused_all.load(std::sync::atomic::Ordering::Relaxed);
     let any_paused = paused_all || folders.iter().any(|f| f.paused);
-    let any_error = folders.iter().any(|f| f.status == FolderStatus::Error);
+    let error_count = folders
+        .iter()
+        .filter(|f| f.status == FolderStatus::Error)
+        .count() as u32;
     let remaining: u32 = folders.iter().map(|f| f.pending).sum();
+    let syncing: u32 = folders
+        .iter()
+        .filter(|f| f.status == FolderStatus::Syncing)
+        .map(|f| f.pending)
+        .sum();
+    let busy = folders
+        .iter()
+        .any(|f| matches!(f.status, FolderStatus::Scanning | FolderStatus::Syncing));
 
-    let status = if any_error {
+    let status = if folders.is_empty() || devices.is_empty() {
+        OverallStatus::NotConfigured
+    } else if error_count > 0 {
         OverallStatus::Error
     } else if any_paused {
         OverallStatus::Paused
-    } else if remaining > 0 {
+    } else if remaining > 0 || busy {
         OverallStatus::Syncing
     } else {
         OverallStatus::Synced
@@ -55,9 +95,9 @@ pub async fn get_overview(state: State<'_, Arc<AppState>>) -> CmdResult<Overview
         fingerprint: fingerprint_of(&state.device_id),
         tailscale: ts_desc,
         online_devices: online,
-        syncing_files: 0,
+        syncing_files: syncing,
         remaining_files: remaining,
-        error_count: if any_error { 1 } else { 0 },
+        error_count,
     })
 }
 
@@ -99,7 +139,8 @@ pub async fn get_relay_guide() -> CmdResult<String> {
         "3. 在服务器防火墙放行 TCP 9443（云厂商安全组也要放行）。\n",
         "4. 回到 FolderSync 设置页，把中继地址填成 `tcp://服务器IP:9443`。\n",
         "5. 两台电脑填同一个地址，然后在设备页重新配对/同步。\n\n",
-        "中继只中转加密后的 SSH/SFTP 流量，不保存文件内容；房间之间互相隔离。"
+        "安全提示：中继是自建可信服务器。SSH/SFTP 只保护传输链路，文件会以普通文件落在中继服务器磁盘上，",
+        "请用磁盘加密、文件权限和防火墙保护服务器；不要使用不受信任的公共中继。"
     )
     .to_string())
 }
@@ -366,9 +407,17 @@ pub async fn add_folder(
         return Err(ErrorDto::new("duplicate", "该文件夹已在同步列表中"));
     }
 
-    if !req.ignore.custom.is_empty() {
+    let mut ignore_rules = state.settings_dto().default_ignore;
+    ignore_rules.extend(req.ignore.custom.clone());
+    if !ignore_rules.is_empty() || !req.ignore.use_defaults {
         let ignore_path = path.join(".syncignore");
-        let _ = std::fs::write(&ignore_path, req.ignore.custom.join("\n"));
+        let mut text = String::new();
+        if !req.ignore.use_defaults {
+            text.push_str(fs_sync_core::DEFAULTS_OFF);
+            text.push('\n');
+        }
+        text.push_str(&ignore_rules.join("\n"));
+        let _ = std::fs::write(&ignore_path, text);
     }
 
     state
@@ -380,13 +429,24 @@ pub async fn add_folder(
             paused: false,
             tombstone_days: 30,
             created_at: now_secs(),
+            shared_with: req.device_ids.clone(),
         })
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
 
+    // 首扫大文件夹可能要几十秒：先返回，后台启动，界面显示「扫描中」
     state
-        .start_folder(folder_id.clone(), path.clone())
+        .starting_folders
+        .lock()
         .await
-        .map_err(|e| ErrorDto::new("runtime", format!("启动同步失败: {e:#}")))?;
+        .insert(folder_id.clone());
+    let st = state.inner().clone();
+    let start_id = folder_id.clone();
+    let start_path = path.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = st.start_folder(start_id, start_path).await {
+            warn!("启动同步失败: {e:#}");
+        }
+    });
 
     state
         .log_activity("info", &folder_id, "", "文件夹已加入同步")
@@ -396,23 +456,60 @@ pub async fn add_folder(
         id: folder_id,
         name,
         path: req.path,
-        status: FolderStatus::Idle,
+        status: FolderStatus::Scanning,
         paused: false,
         last_sync_at: None,
         pending: 0,
         file_count: 0,
         shared_with: req.device_ids,
+        last_error: None,
     })
 }
 
 /// 移除文件夹同步（不删本地文件）。
 #[tauri::command]
 pub async fn remove_folder(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+    // 先标记删除，再停 runtime、最后删库：避免首扫恰好完成时把 runtime 挂回来
+    state.removing_folders.lock().unwrap().insert(id.clone());
+    state.stop_folder(&id).await;
+    let result = state
+        .store
+        .remove_folder(&id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()));
+    state.removing_folders.lock().unwrap().remove(&id);
+    result
+}
+
+/// 重新定位文件夹（外置盘/网络盘路径变化后）。
+#[tauri::command]
+pub async fn relocate_folder(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path: String,
+) -> CmdResult<()> {
+    let new_path = std::path::PathBuf::from(&path);
+    if !new_path.is_dir() {
+        return Err(ErrorDto::new("bad_path", "目标目录不存在或不是文件夹"));
+    }
+    if state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .iter()
+        .all(|f| f.id != id)
+    {
+        return Err(ErrorDto::new("not_found", "文件夹不存在"));
+    }
     state.stop_folder(&id).await;
     state
         .store
-        .remove_folder(&id)
+        .set_folder_path(&id, &new_path)
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    let st = state.inner().clone();
+    let folder_id = id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = st.start_folder(folder_id, new_path).await;
+    });
     Ok(())
 }
 
@@ -460,34 +557,17 @@ pub async fn resume_folder(
 
 /// 暂停全部。
 #[tauri::command]
-pub async fn pause_all(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
-    state
-        .paused_all
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    let ids: Vec<String> = state
-        .store
-        .list_folders()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|f| f.id)
-        .collect();
-    for id in ids {
-        state.stop_folder(&id).await;
-    }
+pub async fn pause_all(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    state.pause_all_sync().await;
+    crate::update_tray_tooltip(&app, true);
     Ok(())
 }
 
 /// 恢复全部。
 #[tauri::command]
-pub async fn resume_all(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
-    state
-        .paused_all
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    for f in state.store.list_folders().unwrap_or_default() {
-        if !f.paused {
-            let _ = state.start_folder(f.id, f.local_path).await;
-        }
-    }
+pub async fn resume_all(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    state.resume_all_sync().await;
+    crate::update_tray_tooltip(&app, false);
     Ok(())
 }
 
@@ -516,6 +596,7 @@ pub async fn get_folder_tree(
 
     Ok(entries
         .into_iter()
+        .filter(|e| !e.deleted)
         .filter(|e| {
             if prefix.is_empty() {
                 !e.path.contains('/')
@@ -554,12 +635,10 @@ pub async fn get_ignore_rules(
         .find(|f| f.id == folder_id)
         .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
 
-    let custom = std::fs::read_to_string(folder.local_path.join(".syncignore"))
-        .map(|t| t.lines().map(|s| s.to_string()).collect())
-        .unwrap_or_default();
+    let (use_defaults, custom) = fs_sync_core::read_syncignore_config(&folder.local_path);
 
     Ok(IgnoreRulesDto {
-        use_defaults: true,
+        use_defaults,
         custom,
         defaults: fs_sync_core::default_rules(),
     })
@@ -579,11 +658,37 @@ pub async fn set_ignore_rules(
         .into_iter()
         .find(|f| f.id == folder_id)
         .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
-    std::fs::write(
-        folder.local_path.join(".syncignore"),
-        rules.custom.join("\n"),
-    )
+    let custom: Vec<String> = rules
+        .custom
+        .iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    std::fs::write(folder.local_path.join(".syncignore"), {
+        let mut text = String::new();
+        if !rules.use_defaults {
+            text.push_str(fs_sync_core::DEFAULTS_OFF);
+            text.push('\n');
+        }
+        text.push_str(&custom.join("\n"));
+        text
+    })
     .map_err(|e| ErrorDto::new("io", format!("写入忽略规则失败: {e}")))?;
+
+    // 规则变化后重启该文件夹运行时：新 matcher 立即生效，
+    // 且重扫会把刚被忽略的路径从索引中移除（不生成墓碑、不删对端文件）。
+    let running = state
+        .runtimes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.session.folder_id == folder_id);
+    if running {
+        state.stop_folder(&folder_id).await;
+        let _ = state
+            .start_folder(folder_id.clone(), folder.local_path.clone())
+            .await;
+    }
     Ok(())
 }
 
@@ -597,7 +702,12 @@ pub async fn list_activity(
 ) -> CmdResult<Vec<ActivityDto>> {
     let rows = state
         .store
-        .list_activity(filter.folder_id.as_deref(), filter.limit.unwrap_or(200))
+        .list_activity_filtered(
+            filter.folder_id.as_deref(),
+            filter.kind.map(activity_kind_str),
+            filter.limit.unwrap_or(200),
+            filter.before_id,
+        )
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
 
     Ok(rows
@@ -616,10 +726,21 @@ pub async fn list_activity(
             },
             folder_id: a.folder_id,
             path: a.path,
-            size: 0,
+            size: a.size,
             message: a.detail,
         })
         .collect())
+}
+
+fn activity_kind_str(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::Upload => "upload",
+        ActivityKind::Download => "download",
+        ActivityKind::Delete => "delete",
+        ActivityKind::Conflict => "conflict",
+        ActivityKind::Error => "error",
+        ActivityKind::Info => "info",
+    }
 }
 
 // ---------- 冲突 ----------
@@ -665,6 +786,60 @@ pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<Con
     out
 }
 
+const PREVIEW_LIMIT: u64 = 64 * 1024;
+
+fn read_text_preview(path: &std::path::Path) -> std::io::Result<(String, bool, bool)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let mut buf = vec![0u8; PREVIEW_LIMIT as usize];
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+    let binary = buf.contains(&0);
+    Ok((
+        String::from_utf8_lossy(&buf).to_string(),
+        metadata.len() > n as u64,
+        binary,
+    ))
+}
+
+/// 读取冲突两侧的文本预览，供用户判断保留哪一版。
+#[tauri::command]
+pub async fn get_conflict_preview(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    original_path: String,
+    conflict_path: String,
+) -> CmdResult<ConflictPreviewDto> {
+    let folder = state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
+    let conflict = resolve_inside_folder(&folder, &conflict_path)?;
+    let (conflict_text, conflict_truncated, conflict_binary) = read_text_preview(&conflict)
+        .map_err(|e| ErrorDto::new("io", format!("读取冲突副本失败: {e}")))?;
+    let (original, original_truncated, original_binary) =
+        match resolve_inside_folder(&folder, &original_path)
+            .ok()
+            .filter(|p| p.is_file())
+        {
+            Some(path) => match read_text_preview(&path) {
+                Ok((text, truncated, binary)) => (Some(text), truncated, binary),
+                Err(_) => (None, false, false),
+            },
+            None => (None, false, false),
+        };
+    Ok(ConflictPreviewDto {
+        original,
+        conflict: conflict_text,
+        truncated: conflict_truncated || original_truncated,
+        binary: conflict_binary || original_binary,
+    })
+}
+
 /// 列出所有冲突副本文件。
 #[tauri::command]
 pub async fn list_conflicts(
@@ -695,12 +870,18 @@ pub async fn resolve_conflict(
     state: State<'_, Arc<AppState>>,
     conflict_id: String,
     resolution: ConflictResolution,
+    folder_id: Option<String>,
 ) -> CmdResult<()> {
     if !conflict_id.contains(".sync-conflict-") {
         return Err(ErrorDto::new("invalid", "不是冲突副本"));
     }
     let mut found = None;
     for f in state.store.list_folders().unwrap_or_default() {
+        if let Some(ref want) = folder_id
+            && &f.id != want
+        {
+            continue;
+        }
         let entries = state.store.list_entries(&f.id).unwrap_or_default();
         if entries.iter().any(|e| e.path == conflict_id) {
             found = Some(f);
@@ -724,11 +905,41 @@ pub async fn resolve_conflict(
     if conflict_abs.is_file() {
         match resolution {
             ConflictResolution::KeepConflict => {
-                std::fs::rename(&conflict_abs, &original_abs)
-                    .map_err(|e| ErrorDto::new("io", format!("替换失败: {e}")))?;
+                // 先把副本完整写到同目录临时文件并 fsync，再原子替换原文件；
+                // 任何一步失败原文件都保持原样，不会出现“写了一半”的损坏。
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp = folder.local_path.join(format!(
+                    ".foldersync-tmp-replace-{}-{nanos}.tmp",
+                    std::process::id()
+                ));
+                std::fs::copy(&conflict_abs, &tmp)
+                    .map_err(|e| ErrorDto::new("io", format!("准备替换失败: {e}")))?;
+                let sync_ok = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&tmp)
+                    .and_then(|f| f.sync_all());
+                if let Err(e) = sync_ok {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(ErrorDto::new("io", format!("刷盘失败: {e}")));
+                }
+                if let Err(e) = atomic_replace_file(&tmp, &original_abs) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(ErrorDto::new("io", format!("替换失败: {e}")));
+                }
+                std::fs::remove_file(&conflict_abs)
+                    .map_err(|e| ErrorDto::new("io", format!("删除副本失败: {e}")))?;
                 touched.push(original_rel);
             }
             ConflictResolution::KeepOriginal => {
+                if !original_abs.is_file() {
+                    return Err(ErrorDto::new(
+                        "original_missing",
+                        "原文件已不存在，不能只保留原文件；请改选「保留副本」或「两者都保留」",
+                    ));
+                }
                 std::fs::remove_file(&conflict_abs)
                     .map_err(|e| ErrorDto::new("io", format!("删除副本失败: {e}")))?;
             }
@@ -788,14 +999,136 @@ pub async fn get_settings(state: State<'_, Arc<AppState>>) -> CmdResult<Settings
 /// 更新设置（只改提供的字段）。
 #[tauri::command]
 pub async fn update_settings(
+    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     patch: SettingsPatch,
 ) -> CmdResult<SettingsDto> {
+    let auto_start = patch.auto_start;
     let next = state
         .update_settings(patch)
         .map_err(|e| ErrorDto::new("settings", format!("保存设置失败: {e}")))?;
     state.replace_limits(next.upload_limit_kbps, next.download_limit_kbps);
+    if let Some(enabled) = auto_start {
+        crate::apply_autostart(&app, enabled);
+    }
     Ok(next)
+}
+
+/// 更新文件夹共享给哪些设备（空列表 = 所有已配对设备）。
+#[tauri::command]
+pub async fn set_folder_sharing(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    device_ids: Vec<String>,
+) -> CmdResult<()> {
+    if state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .iter()
+        .all(|f| f.id != folder_id)
+    {
+        return Err(ErrorDto::new("not_found", "文件夹不存在"));
+    }
+    state
+        .store
+        .set_folder_shared_with(&folder_id, &device_ids)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    if let Some(rt) = state
+        .runtimes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.session.folder_id == folder_id)
+    {
+        rt.set_shared_with(device_ids);
+    }
+    Ok(())
+}
+
+/// 打开文件夹内某个文件所在目录（冲突定位用）。
+#[tauri::command]
+pub async fn open_folder_item(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    path: String,
+) -> CmdResult<()> {
+    let folder = state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
+    let abs = resolve_inside_folder(&folder, &path)?;
+    if !abs.exists() {
+        return Err(ErrorDto::new("not_found", "文件不存在"));
+    }
+    let dir = if abs.is_dir() {
+        abs
+    } else {
+        abs.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| folder.local_path.clone())
+    };
+    tauri_plugin_opener::open_path(&dir, None::<&str>)
+        .map_err(|e| ErrorDto::new("open_failed", format!("打开目录失败: {e}")))
+}
+
+fn resolve_inside_folder(
+    folder: &fs_sync_store::Folder,
+    path: &str,
+) -> Result<std::path::PathBuf, ErrorDto> {
+    let rel = fs_sync_core::validate_path(path)
+        .map_err(|e| ErrorDto::new("bad_path", format!("路径无效: {e}")))?;
+    let base = folder
+        .local_path
+        .canonicalize()
+        .map_err(|e| ErrorDto::new("bad_path", format!("文件夹不存在: {e}")))?;
+    let abs = folder.local_path.join(rel);
+    let real = abs
+        .canonicalize()
+        .map_err(|e| ErrorDto::new("not_found", format!("文件不存在: {e}")))?;
+    if !real.starts_with(&base) {
+        return Err(ErrorDto::new("bad_path", "路径指向同步目录之外"));
+    }
+    Ok(real)
+}
+
+/// 用系统默认程序打开文件夹中的单个文件（冲突对比用）。
+#[tauri::command]
+pub async fn open_file(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    path: String,
+) -> CmdResult<()> {
+    let folder = state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
+    let abs = resolve_inside_folder(&folder, &path)?;
+    if !abs.is_file() {
+        return Err(ErrorDto::new("not_found", "文件不存在"));
+    }
+    tauri_plugin_opener::open_path(&abs, None::<&str>)
+        .map_err(|e| ErrorDto::new("open_failed", format!("打开文件失败: {e}")))
+}
+
+/// 用系统文件管理器打开文件夹。
+#[tauri::command]
+pub async fn open_folder(state: State<'_, Arc<AppState>>, folder_id: String) -> CmdResult<()> {
+    let folder = state
+        .store
+        .list_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|f| f.id == folder_id)
+        .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
+    tauri_plugin_opener::open_path(&folder.local_path, None::<&str>)
+        .map_err(|e| ErrorDto::new("open_failed", format!("打开文件夹失败: {e}")))
 }
 
 /// 打开日志目录。

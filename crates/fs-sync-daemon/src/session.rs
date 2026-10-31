@@ -1,6 +1,6 @@
 //! 实时同步会话（M4）：监听本地变更 + 接收对端增量 + 墓碑 + 周期兜底扫描。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,10 @@ pub struct SyncSession {
     pending: Arc<Mutex<Vec<FileEntry>>>,
     /// 缓存的 blob 存储
     pub blobs: Arc<BlobStore>,
+    /// 已提示过的大小写冲突路径：避免每秒全量索引时刷爆日志与活动表
+    case_clash_notified: Arc<Mutex<HashSet<String>>>,
+    /// 传输限速（桌面端注入；CLI/测试为空实现）
+    pub throttle: Arc<std::sync::RwLock<crate::runtime::TransferThrottle>>,
 }
 
 impl SyncSession {
@@ -73,6 +77,10 @@ impl SyncSession {
             index: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
             blobs,
+            case_clash_notified: Arc::new(Mutex::new(HashSet::new())),
+            throttle: Arc::new(std::sync::RwLock::new(
+                crate::runtime::TransferThrottle::default(),
+            )),
         }
     }
 
@@ -218,6 +226,11 @@ impl SyncSession {
         std::mem::take(&mut *self.pending.lock().await)
     }
 
+    /// 当前待发送的增量条数（概览页「待同步」用）。
+    pub async fn pending_len(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
     /// 当前索引快照。
     pub async fn snapshot(&self) -> HashMap<String, FileEntry> {
         self.index.lock().await.clone()
@@ -251,6 +264,27 @@ impl SyncSession {
         Fut: std::future::Future<Output = Result<()>>,
     {
         self.apply_inner(remote, pull_blob, true).await
+    }
+
+    async fn pull_with_retry<F, Fut>(&self, pull_blob: &mut F, hash: &str) -> Result<()>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 0..3 {
+            match pull_blob(hash.to_string()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last = Some(e);
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt)))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("拉取失败")))
     }
 
     async fn apply_inner<F, Fut>(
@@ -327,24 +361,42 @@ impl SyncSession {
                     }
                     // 命中就跳过，等用户手动改名（目录不检查：落进同一个目录不丢数据）
                     if let Some(existing) = case_idx.as_ref().and_then(|ci| ci.clash(path)) {
-                        warn!(%path, %existing, "对端文件与本地文件仅大小写不同，跳过以免覆盖，请手动改名");
+                        // 中继/全量索引每轮都会重新看到同一条，只提示一次
+                        let first = self.case_clash_notified.lock().await.insert(path.clone());
+                        if first {
+                            warn!(%path, %existing, "对端文件与本地文件仅大小写不同，跳过以免覆盖，请手动改名");
+                            let _ = self.engine.store.log_activity(
+                                "conflict",
+                                &self.folder_id,
+                                path,
+                                "对端文件与本机文件仅大小写不同，已跳过；请手动改名后重新同步",
+                            );
+                        } else {
+                            debug!(%path, %existing, "大小写冲突仍在，已跳过");
+                        }
                         stats.failed += 1;
                         continue;
                     }
-                    match pull_blob(entry.hash.clone()).await {
-                        Ok(()) => match self.engine.apply_pulled(entry, &entry.hash).await {
-                            Ok(()) => {
-                                if let Some(ci) = &mut case_idx {
-                                    ci.insert(path);
+                    match self.pull_with_retry(&mut pull_blob, &entry.hash).await {
+                        Ok(()) => {
+                            // 传输后结算限速（不阻塞小文件；大文件按配额等待）
+                            let throttle =
+                                self.throttle.read().map(|t| t.clone()).unwrap_or_default();
+                            throttle.consume_download(entry.size).await;
+                            match self.engine.apply_pulled(entry, &entry.hash).await {
+                                Ok(()) => {
+                                    if let Some(ci) = &mut case_idx {
+                                        ci.insert(path);
+                                    }
+                                    self.set_index_entry(entry.clone()).await;
+                                    stats.pulled += 1;
                                 }
-                                self.set_index_entry(entry.clone()).await;
-                                stats.pulled += 1;
+                                Err(e) => {
+                                    warn!(%path, "落盘失败: {e}");
+                                    stats.failed += 1;
+                                }
                             }
-                            Err(e) => {
-                                warn!(%path, "落盘失败: {e}");
-                                stats.failed += 1;
-                            }
-                        },
+                        }
                         Err(e) => {
                             warn!(%path, "拉取失败: {e}");
                             stats.failed += 1;
@@ -388,11 +440,11 @@ impl SyncSession {
                     let (win_got, lose_got) = if win_local {
                         (
                             self.engine.ensure_blob(win).await.map(|_| ()),
-                            pull_blob(lose.hash.clone()).await,
+                            self.pull_with_retry(&mut pull_blob, &lose.hash).await,
                         )
                     } else {
                         (
-                            pull_blob(win.hash.clone()).await,
+                            self.pull_with_retry(&mut pull_blob, &win.hash).await,
                             self.engine.ensure_blob(lose).await.map(|_| ()),
                         )
                     };
@@ -477,6 +529,7 @@ impl SyncSession {
     pub async fn full_scan(&self) -> Result<Vec<FileEntry>> {
         let root = self.root.clone();
         let matcher = fs_sync_core::matcher_for_folder(&root);
+        let matcher_for_gone = matcher.clone();
         let mut scan = tokio::task::spawn_blocking(move || scan_folder(&root, &matcher))
             .await
             .context("兜底扫描任务失败")??;
@@ -545,7 +598,21 @@ impl SyncSession {
         }
         let mut idx = self.index.lock().await;
 
-        // 扫描中消失的 → 墓碑
+        // 扫描中消失的 → 墓碑；但被忽略规则排除的不算删除，直接移除索引
+        let ignored_gone: Vec<String> = idx
+            .iter()
+            .filter(|(p, e)| {
+                !e.deleted
+                    && !seen.contains(*p)
+                    && !scan.is_unreadable(p)
+                    && matcher_for_gone.matched(p, e.is_dir)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in ignored_gone {
+            idx.remove(&path);
+            let _ = self.engine.store.delete_entry(&self.folder_id, &path);
+        }
         let gone: Vec<String> = idx
             .iter()
             // 读不了的路径不算消失：读失败 ≠ 已删除
@@ -941,6 +1008,55 @@ mod tests {
         let changed = s.full_scan().await.unwrap();
         let tomb = changed.iter().find(|e| e.path == "gone.txt").unwrap();
         assert!(tomb.deleted);
+    }
+
+    #[tokio::test]
+    async fn full_scan_drops_newly_ignored_without_tombstone() {
+        let (s, _t) = session().await;
+        std::fs::write(s.root.join("secret.log"), b"x").unwrap();
+        s.initial_scan().await.unwrap();
+        assert!(s.snapshot().await.contains_key("secret.log"));
+
+        std::fs::write(s.root.join(".syncignore"), "*.log\n").unwrap();
+        let changed = s.full_scan().await.unwrap();
+        assert!(
+            changed.iter().all(|e| e.path != "secret.log"),
+            "被忽略的文件不能进墓碑队列: {changed:?}"
+        );
+        assert!(!s.snapshot().await.contains_key("secret.log"));
+        assert!(
+            s.engine
+                .store
+                .list_entries(&s.folder_id)
+                .unwrap()
+                .iter()
+                .all(|e| e.path != "secret.log")
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_failure_retries_before_giving_up() {
+        let (s, _t) = session().await;
+        let hash = s.blobs.add_bytes(b"retry-me".to_vec()).await.unwrap();
+        let remote = HashMap::from([("r.txt".to_string(), entry("r.txt", &hash, "devB", 1))]);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let stats = s
+            .apply_remote(&remote, move |_h| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    if n < 3 {
+                        Err(anyhow::anyhow!("模拟网络抖动"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(stats.pulled, 1);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(s.root.join("r.txt")).unwrap(), b"retry-me");
     }
 
     #[tokio::test]

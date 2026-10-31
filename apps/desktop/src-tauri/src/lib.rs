@@ -12,14 +12,17 @@ pub mod settings;
 pub mod state;
 pub mod updater;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 use tracing::{info, warn};
 
 use state::AppState;
+
+static TRAY_PAUSE: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
+static TRAY_RESUME: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
 
 /// 默认数据目录：`~/.foldersync`。
 fn default_data_dir() -> std::path::PathBuf {
@@ -33,7 +36,11 @@ fn default_data_dir() -> std::path::PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = default_data_dir();
-    let log_guard = diagnostics::init(&data_dir.join("logs"), "info")
+    // 日志级别在初始化日志系统前就要读出来，否则设置页改了也不生效
+    let initial_log_level = settings::SettingsStore::load(&data_dir.join("settings.json"))
+        .map(|s| s.get().log_level)
+        .unwrap_or_else(|_| "info".into());
+    let log_guard = diagnostics::init(&data_dir.join("logs"), &initial_log_level)
         .unwrap_or_else(|e| panic!("日志初始化失败: {e:#}"));
 
     tauri::Builder::default()
@@ -50,15 +57,18 @@ pub fn run() {
 
             // 必须在窗口加载前完成 manage()：前端挂载后会立刻调用命令，
             // 异步 spawn 初始化会出现短暂的 "state not managed" 报错。
-            let initialized = tauri::async_runtime::block_on(async {
-                let st = AppState::init(data_dir.clone()).await?;
-                state::restore_folders(st.clone()).await;
-                Ok::<_, anyhow::Error>(st)
-            });
+            // 但恢复文件夹（可能要扫描几万文件）放到 manage 之后后台执行，
+            // 否则窗口会等到首扫结束才显示。
+            let initialized =
+                tauri::async_runtime::block_on(async { AppState::init(data_dir.clone()).await });
             match initialized {
                 Ok(st) => {
                     let want_auto_start = st.settings_dto().auto_start;
+                    let restore = st.clone();
                     app.manage(st);
+                    tauri::async_runtime::spawn(async move {
+                        state::restore_folders(restore).await;
+                    });
                     apply_autostart(app.handle(), want_auto_start);
                     info!("daemon 就绪（SSH 服务端已启动）");
                 }
@@ -102,15 +112,21 @@ pub fn run() {
             commands::list_folders,
             commands::add_folder,
             commands::remove_folder,
+            commands::relocate_folder,
             commands::pause_folder,
             commands::resume_folder,
             commands::pause_all,
             commands::resume_all,
             commands::get_folder_tree,
+            commands::open_folder,
+            commands::open_folder_item,
+            commands::open_file,
+            commands::set_folder_sharing,
             commands::get_ignore_rules,
             commands::set_ignore_rules,
             commands::list_activity,
             commands::list_conflicts,
+            commands::get_conflict_preview,
             commands::resolve_conflict,
             commands::get_settings,
             commands::update_settings,
@@ -147,7 +163,7 @@ fn spawn_update_checker(app: tauri::AppHandle) {
 }
 
 /// 按设置启用/关闭开机自启（必须在 AppState 就绪后调用）。
-fn apply_autostart(app: &tauri::AppHandle, want: bool) {
+pub(crate) fn apply_autostart(app: &tauri::AppHandle, want: bool) {
     use tauri_plugin_autostart::ManagerExt;
     let mgr = app.autolaunch();
     let currently = mgr.is_enabled().unwrap_or(false);
@@ -164,11 +180,32 @@ fn apply_autostart(app: &tauri::AppHandle, want: bool) {
     }
 }
 
+pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, paused: bool) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let text = if paused {
+            "FolderSync — 已暂停"
+        } else {
+            "FolderSync — 全部已同步"
+        };
+        let _ = tray.set_tooltip(Some(text));
+    }
+    if let Some(item) = TRAY_PAUSE.get() {
+        let _ = item.set_checked(paused);
+    }
+    if let Some(item) = TRAY_RESUME.get() {
+        let _ = item.set_checked(!paused);
+    }
+}
+
 /// 系统托盘：状态图标 + 菜单（打开主窗口 / 暂停全部 / 退出）。
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
-    let pause_all = MenuItem::with_id(app, "pause_all", "暂停全部", true, None::<&str>)?;
-    let resume_all = MenuItem::with_id(app, "resume_all", "恢复全部", true, None::<&str>)?;
+    let pause_all =
+        CheckMenuItem::with_id(app, "pause_all", "暂停全部", true, false, None::<&str>)?;
+    let resume_all =
+        CheckMenuItem::with_id(app, "resume_all", "恢复全部", true, true, None::<&str>)?;
+    let _ = TRAY_PAUSE.set(pause_all.clone());
+    let _ = TRAY_RESUME.set(resume_all.clone());
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
 
@@ -188,16 +225,24 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             }
             "pause_all" => {
                 if let Some(st) = app.try_state::<Arc<AppState>>() {
-                    st.paused_all
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    info!("托盘：已暂停全部同步");
+                    let st = st.inner().clone();
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        st.pause_all_sync().await;
+                        update_tray_tooltip(&app_handle, true);
+                        info!("托盘：已暂停全部同步");
+                    });
                 }
             }
             "resume_all" => {
                 if let Some(st) = app.try_state::<Arc<AppState>>() {
-                    st.paused_all
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                    info!("托盘：已恢复全部同步");
+                    let st = st.inner().clone();
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        st.resume_all_sync().await;
+                        update_tray_tooltip(&app_handle, false);
+                        info!("托盘：已恢复全部同步");
+                    });
                 }
             }
             "quit" => {

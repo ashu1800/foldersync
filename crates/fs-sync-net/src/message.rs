@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use fs_sync_core::FileEntry;
 
 /// 当前协议版本。
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// 文件夹摘要（Hello 中交换）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +78,9 @@ pub struct FolderInvite {
 pub struct FolderInviteResponse {
     pub folder_id: String,
     pub accepted: bool,
+    /// 拒绝原因（供邀请方展示；旧版本对端不填）。
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// FolderSync 控制消息（SSH 子系统 `foldersync`）。
@@ -107,6 +110,14 @@ pub enum Message {
     Error {
         code: u32,
         message: String,
+    },
+    /// 大文件夹全量索引分页（chunk_index 从 0 开始，done 为最后一块）。
+    /// 必须放在枚举末尾：postcard 按 variant 序号编码，插在中间会让旧版本错位。
+    IndexChunk {
+        folder_id: String,
+        entries: Vec<FileEntry>,
+        chunk_index: u32,
+        done: bool,
     },
 }
 
@@ -138,8 +149,9 @@ pub fn decode_frame(buf: &[u8]) -> anyhow::Result<Message> {
     Ok(msg)
 }
 
-/// 帧长度上限（16 MiB）：索引可能大，但要有界防恶意对端。
-pub const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// 帧长度上限（64 MiB）：索引可能大，但要有界防恶意对端。
+/// 超大索引由 `IndexChunk` 按 4000 条分页发送，单块通常远小于此上限。
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -185,6 +197,12 @@ mod tests {
                 folder_id: "f1".into(),
                 entries: entries.clone(),
             },
+            Message::IndexChunk {
+                folder_id: "f1".into(),
+                entries: entries.clone(),
+                chunk_index: 0,
+                done: true,
+            },
             Message::IndexUpdate {
                 folder_id: "f1".into(),
                 entries,
@@ -205,6 +223,7 @@ mod tests {
             Message::FolderInviteResponse(FolderInviteResponse {
                 folder_id: "f1".into(),
                 accepted: false,
+                reason: Some("paused".into()),
             }),
             Message::Ping,
             Message::Pong,

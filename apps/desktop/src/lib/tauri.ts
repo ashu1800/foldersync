@@ -10,6 +10,7 @@ import type {
   ActivityFilter,
   AddFolderRequest,
   ConflictDto,
+  ConflictPreviewDto,
   ConflictResolution,
   DeviceDto,
   EnvStatusDto,
@@ -80,12 +81,21 @@ export const listFolders = () => call<FolderDto[]>("list_folders");
 export const addFolder = (req: AddFolderRequest) =>
   call<FolderDto>("add_folder", { req });
 export const removeFolder = (id: string) => call<void>("remove_folder", { id });
+export const relocateFolder = (id: string, path: string) =>
+  call<void>("relocate_folder", { id, path });
 export const pauseFolder = (id: string) => call<void>("pause_folder", { id });
 export const resumeFolder = (id: string) => call<void>("resume_folder", { id });
 export const pauseAll = () => call<void>("pause_all");
 export const resumeAll = () => call<void>("resume_all");
 export const getFolderTree = (folderId: string, subpath?: string) =>
   call<TreeNodeDto[]>("get_folder_tree", { folderId, subpath: subpath ?? null });
+export const openFolder = (folderId: string) => call<void>("open_folder", { folderId });
+export const openFolderItem = (folderId: string, path: string) =>
+  call<void>("open_folder_item", { folderId, path });
+export const openFile = (folderId: string, path: string) =>
+  call<void>("open_file", { folderId, path });
+export const setFolderSharing = (folderId: string, deviceIds: string[]) =>
+  call<void>("set_folder_sharing", { folderId, deviceIds });
 export const getIgnoreRules = (folderId: string) =>
   call<IgnoreRulesDto>("get_ignore_rules", { folderId });
 export const setIgnoreRules = (folderId: string, rules: IgnoreRulesDto) =>
@@ -100,8 +110,26 @@ export const listActivity = (filter: ActivityFilter = {}) =>
 
 export const listConflicts = (folderId?: string) =>
   call<ConflictDto[]>("list_conflicts", { folderId: folderId ?? null });
-export const resolveConflict = (conflictId: string, resolution: ConflictResolution) =>
-  call<void>("resolve_conflict", { conflictId, resolution });
+export const getConflictPreview = (
+  folderId: string,
+  originalPath: string,
+  conflictPath: string,
+) =>
+  call<ConflictPreviewDto>("get_conflict_preview", {
+    folderId,
+    originalPath,
+    conflictPath,
+  });
+export const resolveConflict = (
+  conflictId: string,
+  resolution: ConflictResolution,
+  folderId?: string,
+) =>
+  call<void>("resolve_conflict", {
+    conflictId,
+    resolution,
+    folderId: folderId ?? null,
+  });
 
 // ---------- 设置 ----------
 

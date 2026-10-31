@@ -18,6 +18,20 @@ async fn state() -> (Arc<AppState>, tempfile::TempDir) {
     (st, tmp)
 }
 
+fn add_test_folder(st: &AppState, id: &str, dir: &std::path::Path) {
+    st.store
+        .add_folder(&Folder {
+            id: id.into(),
+            name: id.into(),
+            local_path: dir.to_path_buf(),
+            paused: false,
+            tombstone_days: 30,
+            created_at: 0,
+            shared_with: Vec::new(),
+        })
+        .unwrap();
+}
+
 #[tokio::test]
 async fn init_creates_identity_and_store() {
     let tmp = tempfile::tempdir().unwrap();
@@ -43,6 +57,7 @@ async fn start_folder_indexes_existing_files() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.txt"), b"hello").unwrap();
     std::fs::write(dir.join("b.txt"), b"world").unwrap();
+    add_test_folder(&st, "f-test", &dir);
 
     let rt = st.start_folder("f-test".into(), dir.clone()).await.unwrap();
 
@@ -72,6 +87,7 @@ async fn deleted_conflict_copy_leaves_conflict_list() {
             paused: false,
             tombstone_days: 30,
             created_at: 0,
+            shared_with: Vec::new(),
         })
         .unwrap();
     let rt = st.start_folder("f-c".into(), dir.clone()).await.unwrap();
@@ -112,6 +128,7 @@ async fn folders_reflect_store_and_runtime() {
             paused: false,
             tombstone_days: 30,
             created_at: 0,
+            shared_with: Vec::new(),
         })
         .unwrap();
     st.start_folder("f-docs".into(), dir).await.unwrap();
@@ -136,6 +153,7 @@ async fn paused_folder_reports_paused_status() {
             paused: true,
             tombstone_days: 30,
             created_at: 0,
+            shared_with: Vec::new(),
         })
         .unwrap();
 
@@ -169,6 +187,7 @@ async fn stop_folder_removes_runtime() {
     let (st, tmp) = state().await;
     let dir = tmp.path().join("s");
     std::fs::create_dir_all(&dir).unwrap();
+    add_test_folder(&st, "f-s", &dir);
     st.start_folder("f-s".into(), dir).await.unwrap();
     assert_eq!(st.runtimes.lock().unwrap().len(), 1);
 
@@ -177,25 +196,17 @@ async fn stop_folder_removes_runtime() {
 }
 
 #[tokio::test]
-async fn overall_status_synced_when_no_work() {
+async fn overall_status_not_configured_when_empty() {
     let (st, _t) = state().await;
-    // 没有文件夹、没有待同步 → 应为空但不算出错
+    // 没有文件夹、没有设备：应显示「尚未配置」，不能误报“全部已同步”
     let folders = st.folders().await;
-    let remaining: u32 = folders.iter().map(|f| f.pending).sum();
-    assert_eq!(remaining, 0);
-
-    // 模拟前端算出来的状态
-    let status = if folders
-        .iter()
-        .any(|f| f.status == foldersync_desktop_lib::dto::FolderStatus::Error)
-    {
-        OverallStatus::Error
-    } else if remaining > 0 {
-        OverallStatus::Syncing
+    assert!(folders.is_empty());
+    let status = if folders.is_empty() {
+        OverallStatus::NotConfigured
     } else {
         OverallStatus::Synced
     };
-    assert_eq!(status, OverallStatus::Synced);
+    assert_eq!(status, OverallStatus::NotConfigured);
 }
 
 #[test]
