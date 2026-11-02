@@ -1,6 +1,7 @@
 //! 目录扫描：遍历文件夹生成 FileEntry 列表（含 blake3 哈希），应用忽略规则。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -224,19 +225,16 @@ fn scan_metadata(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<ScanRe
                     deleted: false,
                     version: VersionVector::new(),
                     modified_by: String::new(),
-                    #[cfg(unix)]
-                    mode: {
-                        use std::os::unix::fs::PermissionsExt;
-                        md.permissions().mode()
-                    },
-                    #[cfg(not(unix))]
                     mode: 0,
                 },
             );
             continue;
         }
 
-        let md = match std::fs::metadata(abs) {
+        // walker 已带 metadata（follow_links(false) 时是链接目标/本体的 stat）：
+        // 不再逐文件二次 std::fs::metadata，百万文件省百万次系统调用。
+        // metadata 拿不到（竞态删除）→ 与旧逻辑一致进 unreadable。
+        let md = match e.metadata() {
             Ok(m) => m,
             Err(_) => {
                 res.unreadable.push(rel_str);
@@ -299,7 +297,7 @@ fn hash_pending_files(files: &[PendingFile]) -> Vec<Option<String>> {
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
+        .min(16)
         .min(files.len());
     if workers <= 1 {
         for (i, file) in files.iter().enumerate() {
@@ -336,7 +334,16 @@ fn hash_pending_files(files: &[PendingFile]) -> Vec<Option<String>> {
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut h = Hasher::new();
-    std::io::copy(&mut f, &mut h)?;
+    // 8KB（io::copy 默认）会让 blake3 喂不满：百万小文件场景每次 read 都有
+    // 系统调用开销。256KB 与 blob 侧一致，机械盘顺序读也更友好。
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
     Ok(h.finalize().to_hex().to_string())
 }
 

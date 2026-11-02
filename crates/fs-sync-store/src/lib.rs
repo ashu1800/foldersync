@@ -509,12 +509,41 @@ impl Store {
     // ---- entries（文件索引 + 墓碑）----
 
     /// 全量替换某文件夹的索引（初始扫描 / 兜底扫描后调用）。
+    ///
+    /// 前置：调用方刚执行过 `DELETE FROM entries WHERE folder_id = ?`，
+    /// 表内没有本文件夹的旧行，所以每行都是纯 INSERT，deleted_at 语义：
+    /// 墓碑记当前时间、普通条目记 0。
     pub fn replace_entries(&self, folder_id: &str, entries: &[FileEntry]) -> Result<()> {
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM entries WHERE folder_id = ?1", [folder_id])?;
-        for e in entries {
-            insert_entry(&tx, folder_id, e)?;
+        // 百万级条目逐条 execute 会重复编译 159 万次 SQL；
+        // 一条 prepared statement 循环绑定 + 单事务，落库从分钟级降到秒级。
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO entries (folder_id, path, size, mtime, hash, is_dir, deleted, version_json, modified_by, deleted_at, mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for e in entries {
+                let version_json = serde_json::to_string(&e.version)?;
+                stmt.execute(rusqlite::params![
+                    folder_id,
+                    e.path,
+                    e.size,
+                    e.mtime,
+                    e.hash,
+                    e.is_dir as i64,
+                    e.deleted as i64,
+                    version_json,
+                    e.modified_by,
+                    if e.deleted { now } else { 0 },
+                    e.mode
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())

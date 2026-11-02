@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder, validate_path};
+use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder_known, validate_path};
 use fs_sync_net::blobstore::BlobStore;
 use fs_sync_store::Store;
 use tracing::{info, warn};
@@ -41,12 +41,14 @@ pub fn scan_and_index(
     store: &Store,
 ) -> Result<HashMap<String, FileEntry>> {
     let matcher = fs_sync_core::matcher_for_folder(root);
-    let mut scan = scan_folder(root, &matcher)?;
     let existing: HashMap<String, FileEntry> = store
         .list_entries(folder_id)?
         .into_iter()
         .map(|e| (e.path.clone(), e))
         .collect();
+    // 走 scan_folder_known：size+mtime 一致的文件复用库里的 hash 不重读盘。
+    // 之前用 scan_folder 全量重哈希，应用重启（对端不重启）后几百 GB 再读一遍。
+    let mut scan = scan_folder_known(root, &matcher, &existing)?;
 
     let mut out = HashMap::new();
     for (path, mut entry) in std::mem::take(&mut scan.entries) {

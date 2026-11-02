@@ -210,17 +210,40 @@ impl FolderRuntime {
         ));
         session.initial_scan().await?;
 
-        // 初始扫描后把既有文件加入 blob 存储，否则对端拉不到内容
-        let initial = session.snapshot().await;
-        let mut added = 0;
-        for e in initial.values().filter(|e| !e.is_dir && !e.deleted) {
-            match session.engine.ensure_blob(e).await {
-                Ok(_) => added += 1,
-                Err(err) => warn!(path = %e.path, "初始加入 blob 失败: {err}"),
+        // 初始扫描后把既有文件加入 blob 存储，否则对端拉不到内容。
+        // 逐个 await 是纯串行磁盘 I/O：百万文件要 hours。有界并行（8 路）
+        // 吞吐受磁盘限制而不是 await 次数；has() 命中的秒回，重启后近零成本。
+        {
+            let initial = session.snapshot().await;
+            let files: Vec<FileEntry> = initial
+                .into_values()
+                .filter(|e| !e.is_dir && !e.deleted)
+                .collect();
+            const BLOB_CONCURRENCY: usize = 8;
+            let mut added: usize = 0;
+            let mut failed: usize = 0;
+            let started = std::time::Instant::now();
+            for chunk in files.chunks(BLOB_CONCURRENCY) {
+                let eng = &session.engine;
+                let results = futures::future::join_all(
+                    chunk
+                        .iter()
+                        .map(|e| async move { eng.ensure_blob(e).await }),
+                )
+                .await;
+                for r in results {
+                    match r {
+                        Ok(_) => added += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
             }
-        }
-        if added > 0 {
-            info!(added, "初始文件已加入 blob 存储");
+            if failed > 0 {
+                warn!(failed, "初始加入 blob 部分失败");
+            }
+            if added > 0 {
+                info!(added, elapsed = ?started.elapsed(), "初始文件已加入 blob 存储");
+            }
         }
 
         let peers: Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>> =
