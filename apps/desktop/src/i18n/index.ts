@@ -377,7 +377,7 @@ const en: typeof zh = {
   },
   invites: {
     title: "Folder share invitation",
-    message: "{{device}} wants to share the folder \"{{name}}\" with you.",
+    message: '{{device}} wants to share the folder "{{name}}" with you.',
     pathLabel: "Storage location (a subfolder will be created)",
     browse: "Browse…",
     accept: "Accept & sync",
