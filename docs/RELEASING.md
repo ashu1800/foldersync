@@ -2,6 +2,13 @@
 
 面向维护者。客户端行为见 [README](../README.md#自动更新与版本发布)。
 
+> **标准发布路径（以此为准）**：推 `v*` tag → 复用 CI 做门禁 → Windows 打包 →
+> 上传 GitHub Release + latest.json → `publish-basic` 签名并上传 Basic 更新服务。
+> 全部由 `release.yml` 自动完成，本地只负责改版本号、写 CHANGELOG、打 tag。
+>
+> `scripts/release_local.py` 只是备用手段（CI 不可用、或紧急热修时本机直发）；
+> 它绕过 CI 门禁，用之前想清楚。
+
 ## 一次发版的完整步骤
 
 ### 1. 确认当前状态干净
