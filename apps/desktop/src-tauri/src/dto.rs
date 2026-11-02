@@ -235,7 +235,7 @@ pub struct ConflictDto {
     pub source_device: String,
 }
 
-/// 冲突文件预览（最多各 64 KiB，避免大文件卡住界面）。
+/// 冲突文件预览（单次最多 256 KiB，可按 next_offset 继续读取）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export_to = "../../src/lib/bindings/")]
 pub struct ConflictPreviewDto {
@@ -243,6 +243,7 @@ pub struct ConflictPreviewDto {
     pub conflict: String,
     pub truncated: bool,
     pub binary: bool,
+    pub next_offset: u64,
 }
 
 /// 冲突解决方式。
@@ -443,6 +444,11 @@ pub struct SettingsDto {
     pub default_ignore: Vec<String>,
     /// 日志级别：error/warn/info/debug/trace
     pub log_level: String,
+    /// 中继 host key 固定表（relay_url → openssh 公钥行）。
+    /// 首次连接时记录（TOFU），之后每次重连严格校验，防中继链路 MITM。
+    #[serde(default)]
+    #[ts(type = "Record<string, string>")]
+    pub relay_host_keys: std::collections::HashMap<String, String>,
 }
 
 impl Default for SettingsDto {
@@ -459,6 +465,7 @@ impl Default for SettingsDto {
             ssh_port: fs_sync_net::env::default_ssh_port(),
             default_ignore: Vec::new(),
             log_level: "info".into(),
+            relay_host_keys: Default::default(),
         }
     }
 }

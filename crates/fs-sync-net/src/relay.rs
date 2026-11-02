@@ -184,28 +184,48 @@ impl RelaySftp {
         Ok(())
     }
 
-    /// 下载文件到本地（流式，不占内存）。
+    /// 下载文件到本地（流式，支持断点续传）。
+    ///
+    /// `dest` 是调用方的临时文件：已有部分内容且不大于远端时从断点续传，
+    /// 下载完成后原子 rename 到最终位置由调用方负责（或 dest 本身就是临时名）。
+    /// 内容哈希由调用方（adopt_downloaded）强校验，续传错位不可能落库。
     pub async fn download_to(&self, remote: &str, dest: &Path) -> Result<()> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let tmp = dest.with_extension(format!(".relay-tmp-{}", std::process::id()));
         let mut src = self
             .sftp
             .open(remote)
             .await
             .with_context(|| format!("中继文件不存在: {remote}"))?;
-        let mut out = tokio::fs::File::create(&tmp)
+        let remote_len = src.metadata().await.map(|m| m.len()).unwrap_or(0);
+        let mut have = tokio::fs::metadata(dest)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if have > remote_len {
+            have = 0;
+        }
+        let mut out = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dest)
             .await
             .context("创建下载临时文件失败")?;
+        if have > 0 {
+            out.seek(std::io::SeekFrom::Start(have)).await.ok();
+            src.seek(std::io::SeekFrom::Start(have))
+                .await
+                .context("中继文件不支持偏移读取")?;
+        } else {
+            out.set_len(0).await.ok();
+        }
         tokio::io::copy(&mut src, &mut out)
             .await
             .context("下载中继文件失败")?;
         out.flush().await.ok();
-        drop(out);
-        tokio::fs::rename(&tmp, dest)
-            .await
-            .context("落盘下载文件失败")?;
         Ok(())
     }
 

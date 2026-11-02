@@ -38,6 +38,19 @@ export function asCmdError(e: unknown): CmdError {
   return { code: "unknown", message: String(e) };
 }
 
+/**
+ * 后端错误本地化：按 code 查 i18n 词条；未收录的 code 回退后端 message 原文
+ * （后端 message 含排障细节，不该吞掉）。所有页面展示错误都应走这里，
+ * 否则英文界面会漏出中文报错。
+ */
+export function localizedError(e: unknown, t: (k: string) => string): string {
+  const err = asCmdError(e);
+  const key = `errors.${err.code}`;
+  const localized = t(key);
+  // i18next 查不到时返回 key 本身——用它判断有没有词条
+  return localized === key ? err.message : localized;
+}
+
 /** 命令调用：失败时抛出 CmdError。 */
 async function call<T>(
   cmd: string,
@@ -119,6 +132,18 @@ export const getConflictPreview = (
     folderId,
     originalPath,
     conflictPath,
+  });
+export const getConflictPreviewPage = (
+  folderId: string,
+  originalPath: string,
+  conflictPath: string,
+  offset: number,
+) =>
+  call<ConflictPreviewDto>("get_conflict_preview_page", {
+    folderId,
+    originalPath,
+    conflictPath,
+    offset,
   });
 export const resolveConflict = (
   conflictId: string,

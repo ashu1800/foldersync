@@ -31,7 +31,7 @@ export default function Devices() {
   } = useStore();
 
   const [showAdd, setShowAdd] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<DeviceDto | null>(null);
   const [renameTarget, setRenameTarget] = useState<DeviceDto | null>(null);
@@ -49,7 +49,7 @@ export default function Devices() {
         removePendingPairing(requestId);
         await refreshDevices();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       }
     },
     [refreshDevices, removePendingPairing],
@@ -63,7 +63,7 @@ export default function Devices() {
         setConfirmRemove(null);
         await refreshDevices();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setBusy(false);
       }
@@ -84,7 +84,7 @@ export default function Devices() {
         setRenameTarget(null);
         await refreshDevices();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setBusy(false);
       }
@@ -107,7 +107,7 @@ export default function Devices() {
 
       {(error ?? devicesError) && (
         <ErrorBanner
-          message={error ?? devicesError ?? ""}
+          error={error ?? devicesError}
           onRetry={() => void refreshDevices()}
           onDismiss={() => setError(null)}
         />
@@ -286,7 +286,7 @@ function AddDeviceModal({
   const [code, setCode] = useState<PairingCodeDto | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [copied, setCopied] = useState(false);
   const [paired, setPaired] = useState<DeviceDto | null>(null);
 
@@ -319,7 +319,7 @@ function AddDeviceModal({
     try {
       setCode(await api.createPairingCode());
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setBusy(false);
     }
@@ -332,7 +332,7 @@ function AddDeviceModal({
     try {
       setPaired(await api.acceptPairingCode(input.trim()));
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setBusy(false);
     }
@@ -407,7 +407,7 @@ function AddDeviceModal({
         </button>
       </div>
 
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error != null && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
 
       <div role="tabpanel" id="device-panel" aria-labelledby={`device-tab-${tab}`}>
         {paired ? (

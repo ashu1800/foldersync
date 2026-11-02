@@ -2,8 +2,23 @@
 //!
 //! 规则：拒绝绝对路径、`..`、空组件、Windows 保留名与非法字符；
 //! 调用方负责最终落盘时确认规范化路径仍位于文件夹根内。
+//! [`long_path`] 处理 Windows MAX_PATH 限制。
 
 use crate::error::{PathError, Result};
+use std::path::{Path, PathBuf};
+
+/// [`long_path`] 的行为（全部平台可测，逻辑一致）。
+pub(crate) fn long_path_impl(raw: &str) -> String {
+    if raw.starts_with(r"\\?\") {
+        return raw.to_string();
+    }
+    // \\?\ 前缀形态下 NT 层不接受 '/'，必须全部归一为 '\'
+    let normalized = raw.replace('/', "\\");
+    if let Some(rest) = normalized.strip_prefix(r"\\") {
+        return format!(r"\\?\UNC\{rest}");
+    }
+    format!(r"\\?\{normalized}")
+}
 
 /// Windows 保留设备名（不含扩展名也算）。
 const RESERVED: &[&str] = &[
@@ -13,6 +28,40 @@ const RESERVED: &[&str] = &[
 
 /// Windows 文件名非法字符（不含路径分隔符本身）。
 const ILLEGAL_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// 给绝对路径加 Windows 长路径前缀 `\\?\`（超过 MAX_PATH 260 时必需）。
+///
+/// Windows API 默认限制整条路径 260 字符；现代同步场景（node_modules、
+/// 深层照片库）很容易超。`\\?\` 前缀让 NT 层跳过该限制。已有前缀、非
+/// Windows、UNC 与相对路径原样返回。支持路径最长 32767 字符（NT 上限）。
+pub fn long_path(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if p.is_absolute() || s.starts_with(r"\\") {
+            PathBuf::from(long_path_impl(&s))
+        } else {
+            p.to_path_buf()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_path_buf()
+    }
+}
+
+/// [`long_path`] 的逆运算：剥掉 `\\?\` / `\\?\UNC\` 前缀，得到用户可读形态。
+/// 非前缀路径原样返回。给需要「正常形态路径」做字符串拼接/展示的调用方用。
+pub fn strip_long_path(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    p.to_path_buf()
+}
 
 /// 校验对端发来的相对路径，通过则原样返回（统一 `/` 分隔）。
 pub fn validate_path(path: &str) -> Result<String> {
@@ -37,7 +86,6 @@ pub fn validate_path(path: &str) -> Result<String> {
             return Err(PathError::Absolute(p.to_string()));
         }
     }
-    // Windows 的 \\?\ 与 \\.\ 前缀在归一后已被 // 拦截
 
     for comp in normalized.split('/') {
         if comp.is_empty() {
@@ -121,6 +169,22 @@ impl CaseIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_path_prefixes_correctly() {
+        assert_eq!(long_path_impl(r"C:\data\deep"), r"\\?\C:\data\deep");
+        // 正斜杠归一：\\?\ 形态下 NT 层不接受 '/'
+        assert_eq!(
+            long_path_impl(r"C:\data/dir/x.txt"),
+            r"\\?\C:\data\dir\x.txt"
+        );
+        assert_eq!(
+            long_path_impl(r"\\server\share\f.txt"),
+            r"\\?\UNC\server\share\f.txt"
+        );
+        // 已有前缀不动（重复加会坏掉）
+        assert_eq!(long_path_impl(r"\\?\C:\data"), r"\\?\C:\data");
+    }
 
     #[test]
     fn case_index_policy() {

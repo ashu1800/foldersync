@@ -27,6 +27,13 @@ struct Cli {
     /// 空闲房间保留天数（0 = 不清理）
     #[arg(long, default_value_t = 30)]
     room_retention_days: u64,
+    /// 单房间磁盘上限（MB，0 = 不限额）。公网部署建议设置，防磁盘填充滥用。
+    #[arg(long, default_value_t = 0)]
+    room_quota_mb: u64,
+    /// healthz/指标监听地址（如 127.0.0.1:9444，空 = 关闭）。
+    /// GET 任意路径返回 {"status","rooms","disk_bytes"}。
+    #[arg(long)]
+    health_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -38,11 +45,19 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let health_addr = cli
+        .health_addr
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().expect("health-addr 格式应为 IP:PORT"));
     let handle =
         fs_sync_net::relay_server::run_relay_server(fs_sync_net::relay_server::RelayServerConfig {
             data_dir: cli.data_dir,
             port: cli.port,
             room_retention_days: cli.room_retention_days,
+            room_quota_bytes: cli.room_quota_mb.saturating_mul(1024 * 1024),
+            health_addr,
         })
         .await?;
     println!(

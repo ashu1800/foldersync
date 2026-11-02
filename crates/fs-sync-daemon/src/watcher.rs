@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -30,12 +31,37 @@ pub enum EventKind {
     Removed,
 }
 
-/// 启动监听器，返回事件接收端。调用方需保持 `debouncer` 存活（drop 即停止监听）。
+/// 监听是否发生过「事件丢失」：溢出或监听错误。
+///
+/// 之前事件通道满（try_send 失败）或 notify 报错只记 debug 日志就丢，
+/// 最长要等 10 分钟快扫才对账——git checkout/解压万级文件时整段时间不同步。
+/// 现在置脏标记，事件循环下一拍先跑一次 full_scan 兜住，把感知窗口从
+/// 10 分钟缩到秒级。
+#[derive(Default)]
+pub struct DirtyFlag(std::sync::atomic::AtomicBool);
+
+impl DirtyFlag {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    fn raise(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// 取走脏标记（true = 需要重扫）并复位。
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// 启动监听器，返回事件接收端与脏标记。调用方需保持 `debouncer` 存活（drop 即停止监听）。
 pub fn watch_folder(
     root: &Path,
     matcher: fs_sync_core::IgnoreMatcher,
     suppression: std::sync::Arc<WriteSuppression>,
     debounce_ms: u64,
+    dirty: std::sync::Arc<DirtyFlag>,
 ) -> Result<(
     mpsc::Receiver<FileEvent>,
     notify_debouncer_full::Debouncer<
@@ -57,6 +83,8 @@ pub fn watch_folder(
                     for e in errors {
                         warn!("监听错误: {e}");
                     }
+                    // 监听出错 = 这批事件丢了：置脏标记，事件循环马上重扫对账
+                    dirty.raise();
                     return;
                 }
             };
@@ -93,7 +121,9 @@ pub fn watch_folder(
                         })
                         .is_err()
                     {
-                        debug!("事件通道已满或已关闭，丢弃事件");
+                        // 通道满 = 事件要丢：置脏标记，事件循环下一拍先 full_scan 对账
+                        dirty.raise();
+                        debug!("事件通道已满或已关闭，丢弃事件（已置脏标记）");
                     }
                 }
             }
@@ -155,7 +185,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let matcher = fs_sync_core::IgnoreMatcher::with_defaults(&root);
         let sup = std::sync::Arc::new(WriteSuppression::new());
-        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100).unwrap();
+        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100, DirtyFlag::new()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::fs::write(root.join("new.txt"), b"hi").unwrap();
@@ -174,7 +204,8 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let matcher = fs_sync_core::IgnoreMatcher::with_defaults(&root);
         let sup = std::sync::Arc::new(WriteSuppression::new());
-        let (mut rx, _deb) = watch_folder(&root, matcher, sup.clone(), 100).unwrap();
+        let (mut rx, _deb) =
+            watch_folder(&root, matcher, sup.clone(), 100, DirtyFlag::new()).unwrap();
 
         // 等 watcher 真正就绪：慢速 CI 上 inotify/ReadDirectoryChangesW 注册需要时间，
         // 立刻写文件会漏事件，导致"没收到事件"被误判成"抑制成功"或者反之。
@@ -203,7 +234,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let matcher = fs_sync_core::IgnoreMatcher::with_defaults(&root);
         let sup = std::sync::Arc::new(WriteSuppression::new());
-        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100).unwrap();
+        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100, DirtyFlag::new()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
@@ -221,7 +252,7 @@ mod tests {
         let matcher = fs_sync_core::IgnoreMatcher::with_defaults(&root);
         let sup = std::sync::Arc::new(WriteSuppression::new());
         std::fs::write(root.join("gone.txt"), b"x").unwrap();
-        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100).unwrap();
+        let (mut rx, _deb) = watch_folder(&root, matcher, sup, 100, DirtyFlag::new()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         std::fs::remove_file(root.join("gone.txt")).unwrap();

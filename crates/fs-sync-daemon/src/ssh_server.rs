@@ -54,6 +54,13 @@ pub struct SshServerShared {
     pub runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
     /// 在线设备（服务端视角只可能是 Tailscale 直连）
     pub online: Arc<tokio::sync::Mutex<fs_sync_net::conn::Presence>>,
+    /// 中继 host key 固定表（服务端 fallback 会话也走同一份）
+    pub relay_host_keys: Arc<crate::runtime::RelayHostKeys>,
+    /// SFTP 服务端带宽结算（下载=对端读我们，上传=对端写我们）；None = 不限速
+    pub sftp_bandwidth: Option<(
+        fs_sync_net::sftp_fs::BandwidthFn,
+        fs_sync_net::sftp_fs::BandwidthFn,
+    )>,
 }
 
 impl SshServerShared {
@@ -65,6 +72,8 @@ impl SshServerShared {
             ssh_port: self.ssh_port,
             mode: fs_sync_net::conn::NetworkMode::Tailscale,
             relay_url: None,
+            relay_host_keys: self.relay_host_keys.clone(),
+            relay_uploaded_blobs: None,
             store: self.store.clone(),
             blobs: self.blobs.clone(),
             sync_root: self.sync_root.clone(),
@@ -344,18 +353,50 @@ impl Drop for SshServerHandle {
 
 /// 启动 SSH 服务端（后台任务）。
 pub async fn run_ssh_server(shared: Arc<SshServerShared>) -> Result<SshServerHandle> {
-    let listener = match TcpListener::bind(("0.0.0.0", shared.ssh_port)).await {
-        Ok(l) => l,
+    // 双栈监听：bind [::] + 0.0.0.0 各一个。不能假设 [::] 一定收 v4-mapped
+    //（实测有 Windows 环境绑 v6 成功但 127.0.0.1 被拒），所以两个都绑；
+    // 真双栈系统上第二个 bind 报 AddrInUse = 已覆盖，忽略即可。
+    // 端口被占用时整体退回随机端口（设置页可改端口；不能让应用起不来）。
+    async fn bind_all(port: u16) -> std::io::Result<(Vec<TcpListener>, u16)> {
+        let v6 = TcpListener::bind(("::", port)).await.ok();
+        let actual = match &v6 {
+            Some(l) => l.local_addr()?.port(),
+            None => port,
+        };
+        let v4 = match TcpListener::bind(("0.0.0.0", actual)).await {
+            Ok(l) => Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None, // v6 已覆盖 v4
+            Err(e) => {
+                if v6.is_some() {
+                    None
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+        match (v6, v4) {
+            (None, None) => Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "无法绑定 IPv4/IPv6",
+            )),
+            (a, b) => {
+                let listeners = [a, b].into_iter().flatten().collect::<Vec<_>>();
+                Ok((listeners, actual))
+            }
+        }
+    }
+    let (listeners, port) = match bind_all(shared.ssh_port).await {
+        Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && shared.ssh_port != 0 => {
-            // 端口被占用时退回随机端口（设置页可改端口；不能让应用起不来）
             warn!(port = shared.ssh_port, "SSH 端口被占用，改用随机端口");
-            TcpListener::bind(("0.0.0.0", 0)).await?
+            bind_all(0)
+                .await
+                .context("SSH 服务端监听（随机端口）失败")?
         }
         Err(e) => {
             return Err(e).with_context(|| format!("SSH 服务端监听 {} 失败", shared.ssh_port));
         }
     };
-    let port = listener.local_addr()?.port();
     let config = Arc::new(server::Config {
         keys: vec![shared.host_key.clone()],
         inactivity_timeout: Some(Duration::from_secs(300)),
@@ -365,34 +406,56 @@ pub async fn run_ssh_server(shared: Arc<SshServerShared>) -> Result<SshServerHan
         nodelay: true,
         ..Default::default()
     });
-    let (stop_tx, mut stop_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => break,
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, peer)) => {
-                            let config = config.clone();
-                            let shared = shared.clone();
-                            let remote_ip = fs_sync_net::tailscale::is_tailscale_ip(peer.ip())
-                                .then(|| peer.ip().to_string());
-                            tokio::spawn(async move {
-                                let handler = SshSession::new(shared, remote_ip);
-                                if let Err(e) = server::run_stream(config, stream, handler).await {
-                                    debug!(%peer, "SSH 会话失败: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!("SSH accept 失败: {e}");
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+    let (stop_tx, stop_rx) = oneshot::channel();
+    // mDNS 本地发现：公布本机 SSH 服务，LAN 内已配对设备可以直接发现地址。
+    // 失败静默——mDNS 不可用只影响 LAN 直连，不影响 Tailscale/中继路径。
+    // 服务端生命周期 = 进程生命周期，句柄故意 forget（不主动 unregister）。
+    let mdns = fs_sync_net::discover::MdnsPublisher::publish(&shared.device_id, port);
+    std::mem::forget(mdns);
+    // 每个 listener 一个 accept 任务（v4/v6 各一）。
+    // oneshot Receiver 不能 clone，所以用 Notify 广播停止：bridge 任务等
+    // oneshot 触发后唤醒所有 accept 任务。
+    let stop_flag = Arc::new(tokio::sync::Notify::new());
+    {
+        let stop_flag = stop_flag.clone();
+        tokio::spawn(async move {
+            let _ = stop_rx.await;
+            stop_flag.notify_waiters();
+        });
+    }
+    for listener in listeners {
+        let config = config.clone();
+        let shared = shared.clone();
+        let stop_flag = stop_flag.clone();
+        tokio::spawn(async move {
+            let listener = listener;
+            loop {
+                tokio::select! {
+                    _ = stop_flag.notified() => break,
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((stream, peer)) => {
+                                let config = config.clone();
+                                let shared = shared.clone();
+                                let remote_ip = fs_sync_net::tailscale::is_tailscale_ip(peer.ip())
+                                    .then(|| peer.ip().to_string());
+                                tokio::spawn(async move {
+                                    let handler = SshSession::new(shared, remote_ip);
+                                    if let Err(e) = server::run_stream(config, stream, handler).await {
+                                        debug!(%peer, "SSH 会话失败: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!("SSH accept 失败: {e}");
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
     info!(port, "SSH 服务端已启动");
     Ok(SshServerHandle {
         port,
@@ -486,7 +549,7 @@ impl server::Handler for SshSession {
                 let root = self.shared.data_dir.join("share");
                 let trust = self.shared.trust.clone();
                 let peer_id = peer_id.clone();
-                let handler = FsSftpHandler::new_guarded(
+                let mut handler = FsSftpHandler::new_guarded(
                     &root,
                     Some(Box::new(move || {
                         trust.is_trusted(&peer_id).unwrap_or(false)
@@ -495,6 +558,9 @@ impl server::Handler for SshSession {
                 .map_err(|e| {
                     russh::Error::IO(std::io::Error::other(format!("SFTP 根目录不可用: {e}")))
                 })?;
+                if let Some((dl, ul)) = &self.shared.sftp_bandwidth {
+                    handler = handler.with_bandwidth(Some(dl.clone()), Some(ul.clone()));
+                }
                 tokio::spawn(async move {
                     russh_sftp::server::run(channel.into_stream(), handler).await;
                 });
@@ -544,6 +610,7 @@ async fn control_loop(
     let (mut reader, mut writer) = tokio::io::split(channel.into_stream());
     let result = async {
         let mut trust_check = tokio::time::interval(Duration::from_secs(10));
+        let mut peer_protocol = 0u16;
         trust_check.tick().await;
         loop {
             let msg = tokio::select! {
@@ -559,7 +626,11 @@ async fn control_loop(
                 Message::Hello {
                     protocol_version, ..
                 } => {
-                    if *protocol_version != fs_sync_net::message::PROTOCOL_VERSION {
+                    if !matches!(
+                        *protocol_version,
+                        fs_sync_net::message::LEGACY_PROTOCOL_VERSION
+                            | fs_sync_net::message::PROTOCOL_VERSION
+                    ) {
                         let _ = frame::write_frame(
                             &mut writer,
                             &Message::Error {
@@ -574,10 +645,11 @@ async fn control_loop(
                         .await;
                         anyhow::bail!("对端协议版本 {protocol_version} 不兼容");
                     }
+                    peer_protocol = *protocol_version;
                     frame::write_frame(
                         &mut writer,
                         &Message::Hello {
-                            protocol_version: fs_sync_net::message::PROTOCOL_VERSION,
+                            protocol_version: peer_protocol,
                             device_name: shared.device_name.clone(),
                             folders: Vec::new(),
                         },
@@ -587,6 +659,14 @@ async fn control_loop(
                 Message::Index { .. }
                 | Message::IndexUpdate { .. }
                 | Message::IndexChunk { .. } => {
+                    if peer_protocol == 0 {
+                        anyhow::bail!("对端在握手前发送同步消息");
+                    }
+                    if peer_protocol < fs_sync_net::message::PROTOCOL_VERSION
+                        && matches!(&msg, Message::IndexChunk { .. })
+                    {
+                        anyhow::bail!("旧版对端不支持分页索引");
+                    }
                     if !shared.trust.is_trusted(&peer_id).unwrap_or(false) {
                         anyhow::bail!("设备已取消配对，拒绝同步消息");
                     }
@@ -604,7 +684,9 @@ async fn control_loop(
                             fs_sync_net::message::FolderInviteResponse {
                                 folder_id: invite.folder_id.clone(),
                                 accepted,
-                                reason: if accepted {
+                                reason: if accepted
+                                    || peer_protocol < fs_sync_net::message::PROTOCOL_VERSION
+                                {
                                     None
                                 } else {
                                     Some("对端拒绝邀请（目录冲突、已暂停或已移除）".into())
@@ -729,6 +811,8 @@ mod tests {
             paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             online: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            relay_host_keys: crate::runtime::test_relay_host_keys(),
+            sftp_bandwidth: None,
         });
         let server = run_ssh_server(shared.clone()).await.unwrap();
         Fixture {
@@ -761,6 +845,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(local.get_bytes(&hash).await.unwrap(), b"hello over sftp");
+    }
+
+    /// 回归：下载中断后重试必须从断点续传，不能从 0 重来。
+    ///
+    /// 人为在临时文件里放前半段内容模拟"已下载 90% 断线"，
+    /// download_blob 应从已有字节继续补完，最终校验落库。
+    #[tokio::test]
+    async fn sftp_download_resumes_from_partial_temp() {
+        let f = fixture().await;
+        let payload = b"resume-half-then-full-content-marker";
+        let blobs = BlobStore::open(f.shared.data_dir.join("share")).unwrap();
+        let hash = blobs.add_bytes(payload.to_vec()).await.unwrap();
+
+        let target = fs_sync_net::ssh_client::SshTarget {
+            host: "127.0.0.1".into(),
+            port: f.server.port,
+            username: fs_sync_net::SSH_USER.into(),
+            host_key: host_public_key_text(&f.shared.host_key),
+        };
+        let client = fs_sync_net::ssh_client::SshClient::connect(&target, &f.client_id)
+            .await
+            .unwrap();
+        let local = BlobStore::open(f._tmp.path().join("client-share")).unwrap();
+
+        // 模拟中断：临时文件里已有前半段（正确的那些字节）
+        let tmp = local
+            .root()
+            .join(format!(".download-{}-{hash}", std::process::id()));
+        let half = payload.len() / 2;
+        std::fs::write(&tmp, &payload[..half]).unwrap();
+
+        fs_sync_net::ssh_client::SshClient::download_blob(&client.sftp(), &hash, &local)
+            .await
+            .unwrap();
+        assert_eq!(local.get_bytes(&hash).await.unwrap(), payload);
+        // 临时文件应被 adopt 消化掉
+        assert!(!tmp.exists(), "续传完成后临时文件应清理");
+    }
+
+    /// 临时文件长度超过远端（对端内容被换小）：必须丢弃重下而不是续传出坏文件。
+    #[tokio::test]
+    async fn sftp_download_rejects_oversized_temp() {
+        let f = fixture().await;
+        let blobs = BlobStore::open(f.shared.data_dir.join("share")).unwrap();
+        let hash = blobs.add_bytes(b"tiny".to_vec()).await.unwrap();
+
+        let target = fs_sync_net::ssh_client::SshTarget {
+            host: "127.0.0.1".into(),
+            port: f.server.port,
+            username: fs_sync_net::SSH_USER.into(),
+            host_key: host_public_key_text(&f.shared.host_key),
+        };
+        let client = fs_sync_net::ssh_client::SshClient::connect(&target, &f.client_id)
+            .await
+            .unwrap();
+        let local = BlobStore::open(f._tmp.path().join("client-share")).unwrap();
+
+        let tmp = local
+            .root()
+            .join(format!(".download-{}-{hash}", std::process::id()));
+        std::fs::write(&tmp, vec![0u8; 4096]).unwrap();
+
+        fs_sync_net::ssh_client::SshClient::download_blob(&client.sftp(), &hash, &local)
+            .await
+            .unwrap();
+        assert_eq!(local.get_bytes(&hash).await.unwrap(), b"tiny");
+    }
+
+    #[tokio::test]
+    async fn legacy_hello_v2_is_accepted() {
+        let f = fixture().await;
+        let target = fs_sync_net::ssh_client::SshTarget {
+            host: "127.0.0.1".into(),
+            port: f.server.port,
+            username: fs_sync_net::SSH_USER.into(),
+            host_key: host_public_key_text(&f.shared.host_key),
+        };
+        let mut client = fs_sync_net::ssh_client::SshClient::connect(&target, &f.client_id)
+            .await
+            .unwrap();
+        client
+            .send(&Message::Hello {
+                protocol_version: fs_sync_net::message::LEGACY_PROTOCOL_VERSION,
+                device_name: "old-client".into(),
+                folders: Vec::new(),
+            })
+            .await
+            .unwrap();
+        match client.recv().await.unwrap() {
+            Message::Hello {
+                protocol_version, ..
+            } => assert_eq!(
+                protocol_version,
+                fs_sync_net::message::LEGACY_PROTOCOL_VERSION
+            ),
+            other => panic!("unexpected handshake response: {other:?}"),
+        }
     }
 
     #[test]

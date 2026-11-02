@@ -181,6 +181,11 @@ async fn emit_folder_status(app: &tauri::AppHandle, state: &Arc<AppState>, folde
         .find(|f| f.id == folder_id)
     {
         let _ = app.emit("folder://status", f);
+        // 文件夹可能刚进入/解除错误态：托盘 tooltip 同步刷新
+        crate::update_tray_tooltip(
+            app,
+            state.paused_all.load(std::sync::atomic::Ordering::Relaxed),
+        );
     }
 }
 
@@ -591,20 +596,11 @@ pub async fn get_folder_tree(
     let prefix = subpath.unwrap_or_default();
     let entries = state
         .store
-        .list_entries(&folder_id)
+        .list_entries_under(&folder_id, &prefix)
         .map_err(|e| ErrorDto::new("store", e.to_string()))?;
 
     Ok(entries
         .into_iter()
-        .filter(|e| !e.deleted)
-        .filter(|e| {
-            if prefix.is_empty() {
-                !e.path.contains('/')
-            } else {
-                e.path.starts_with(&format!("{prefix}/"))
-                    && e.path[prefix.len() + 1..].split('/').count() == 1
-            }
-        })
         .map(|e| TreeNodeDto {
             name: e.path.rsplit('/').next().unwrap_or(&e.path).to_string(),
             is_conflict: e.path.contains(".sync-conflict-"),
@@ -786,30 +782,35 @@ pub fn conflict_dtos_for(state: &AppState, folder_id: Option<String>) -> Vec<Con
     out
 }
 
-const PREVIEW_LIMIT: u64 = 64 * 1024;
+const PREVIEW_LIMIT: u64 = 256 * 1024;
 
-fn read_text_preview(path: &std::path::Path) -> std::io::Result<(String, bool, bool)> {
-    use std::io::Read;
+fn read_text_preview_at(
+    path: &std::path::Path,
+    offset: u64,
+) -> std::io::Result<(String, bool, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
-    let mut buf = vec![0u8; PREVIEW_LIMIT as usize];
-    let n = file.read(&mut buf)?;
-    buf.truncate(n);
+    if offset >= metadata.len() {
+        return Ok((String::new(), false, false));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    (&mut file).take(PREVIEW_LIMIT).read_to_end(&mut buf)?;
     let binary = buf.contains(&0);
     Ok((
         String::from_utf8_lossy(&buf).to_string(),
-        metadata.len() > n as u64,
+        offset.saturating_add(buf.len() as u64) < metadata.len(),
         binary,
     ))
 }
 
-/// 读取冲突两侧的文本预览，供用户判断保留哪一版。
-#[tauri::command]
-pub async fn get_conflict_preview(
-    state: State<'_, Arc<AppState>>,
-    folder_id: String,
-    original_path: String,
-    conflict_path: String,
+fn conflict_preview_at(
+    state: &State<'_, Arc<AppState>>,
+    folder_id: &str,
+    original_path: &str,
+    conflict_path: &str,
+    offset: u64,
 ) -> CmdResult<ConflictPreviewDto> {
     let folder = state
         .store
@@ -818,15 +819,16 @@ pub async fn get_conflict_preview(
         .into_iter()
         .find(|f| f.id == folder_id)
         .ok_or_else(|| ErrorDto::new("not_found", "文件夹不存在"))?;
-    let conflict = resolve_inside_folder(&folder, &conflict_path)?;
-    let (conflict_text, conflict_truncated, conflict_binary) = read_text_preview(&conflict)
-        .map_err(|e| ErrorDto::new("io", format!("读取冲突副本失败: {e}")))?;
+    let conflict = resolve_inside_folder(&folder, conflict_path)?;
+    let (conflict_text, conflict_truncated, conflict_binary) =
+        read_text_preview_at(&conflict, offset)
+            .map_err(|e| ErrorDto::new("io", format!("读取冲突副本失败: {e}")))?;
     let (original, original_truncated, original_binary) =
-        match resolve_inside_folder(&folder, &original_path)
+        match resolve_inside_folder(&folder, original_path)
             .ok()
             .filter(|p| p.is_file())
         {
-            Some(path) => match read_text_preview(&path) {
+            Some(path) => match read_text_preview_at(&path, offset) {
                 Ok((text, truncated, binary)) => (Some(text), truncated, binary),
                 Err(_) => (None, false, false),
             },
@@ -837,7 +839,31 @@ pub async fn get_conflict_preview(
         conflict: conflict_text,
         truncated: conflict_truncated || original_truncated,
         binary: conflict_binary || original_binary,
+        next_offset: offset.saturating_add(PREVIEW_LIMIT),
     })
+}
+
+/// 读取冲突两侧的文本预览，供用户判断保留哪一版。
+#[tauri::command]
+pub async fn get_conflict_preview(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    original_path: String,
+    conflict_path: String,
+) -> CmdResult<ConflictPreviewDto> {
+    conflict_preview_at(&state, &folder_id, &original_path, &conflict_path, 0)
+}
+
+/// 按 next_offset 继续读取冲突两侧的下一段文本，支持完整对比大文件。
+#[tauri::command]
+pub async fn get_conflict_preview_page(
+    state: State<'_, Arc<AppState>>,
+    folder_id: String,
+    original_path: String,
+    conflict_path: String,
+    offset: u64,
+) -> CmdResult<ConflictPreviewDto> {
+    conflict_preview_at(&state, &folder_id, &original_path, &conflict_path, offset)
 }
 
 /// 列出所有冲突副本文件。
@@ -850,19 +876,7 @@ pub async fn list_conflicts(
 }
 
 /// 从 `名字.sync-conflict-20260101-120000-设备名.ext` 解析原名与设备。
-fn parse_conflict_name(name: &str) -> (String, String) {
-    let Some(pos) = name.find(".sync-conflict-") else {
-        return (name.to_string(), String::new());
-    };
-    let stem = &name[..pos];
-    let rest = &name[pos + ".sync-conflict-".len()..];
-    let (ext, body) = match rest.rsplit_once('.') {
-        Some((body, ext)) => (format!(".{ext}"), body),
-        None => (String::new(), rest),
-    };
-    let device = body.splitn(3, '-').nth(2).unwrap_or("").to_string();
-    (format!("{stem}{ext}"), device)
-}
+use fs_sync_core::parse_conflict_name;
 
 /// 解决冲突（保留其一或两者）。
 #[tauri::command]
@@ -895,7 +909,7 @@ pub async fn resolve_conflict(
         None => (None, conflict_id.as_str()),
     };
     let join = |n: &str| dir.map_or_else(|| n.to_string(), |d| format!("{d}/{n}"));
-    let (original_name, _) = parse_conflict_name(name);
+    let (original_name, _) = fs_sync_core::parse_conflict_name(name);
     let original_rel = join(&original_name);
     let conflict_abs = folder.local_path.join(&conflict_id);
     let original_abs = folder.local_path.join(&original_rel);
@@ -1253,5 +1267,19 @@ mod tests {
         let (orig, dev) = parse_conflict_name("normal.txt");
         assert_eq!(orig, "normal.txt");
         assert!(dev.is_empty());
+    }
+
+    #[test]
+    fn preview_reads_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let content = "x".repeat((PREVIEW_LIMIT + 1024) as usize);
+        std::fs::write(&path, &content).unwrap();
+        let (first, more, binary) = read_text_preview_at(&path, 0).unwrap();
+        assert!(!binary);
+        assert!(more);
+        let (second, more, _) = read_text_preview_at(&path, PREVIEW_LIMIT).unwrap();
+        assert!(!more);
+        assert_eq!(first.len() + second.len(), content.len());
     }
 }

@@ -179,7 +179,8 @@ pub fn check_firewall_rule() -> bool {
 }
 
 /// 尝试添加防火墙规则；没有管理员权限时返回 false（由 UI 引导提权修复）。
-pub fn ensure_firewall_rule(port: u16) -> bool {
+pub fn ensure_firewall_rule(_port: u16) -> bool {
+    // 端口参数已不再进规则（改为 any-port + program 双重限定），保留签名兼容。
     #[cfg(windows)]
     {
         if check_firewall_rule() {
@@ -199,7 +200,9 @@ pub fn ensure_firewall_rule(port: u16) -> bool {
                 "dir=in",
                 "action=allow",
                 "protocol=TCP",
-                &format!("localport={port}"),
+                // 端口回退随机后规则里的固定端口就错位了：any-port + program
+                // 双重限定仍然只放行本程序，安全面不变，回退端口天然覆盖。
+                "localport=any",
                 &format!("program={exe}"),
                 "profile=any",
             ])
@@ -209,7 +212,6 @@ pub fn ensure_firewall_rule(port: u16) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = port;
         true
     }
 }

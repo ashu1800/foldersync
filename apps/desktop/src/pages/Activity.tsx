@@ -29,7 +29,7 @@ export default function Activity() {
 
   const [items, setItems] = useState<ActivityDto[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [folderFilter, setFolderFilter] = useState<string>("");
   const [kindFilter, setKindFilter] = useState<ActivityKind | "">("");
   const [pausedScroll, setPausedScroll] = useState(false);
@@ -68,7 +68,7 @@ export default function Activity() {
       setItems((prev) => mergeRows(prev, rows));
       setHasMore(rows.length >= 300);
     } catch (e) {
-      if (gen === filterGeneration.current) setError(api.asCmdError(e).message);
+      if (gen === filterGeneration.current) setError(e);
     } finally {
       if (gen === filterGeneration.current) setLoadingMore(false);
     }
@@ -88,7 +88,7 @@ export default function Activity() {
         setItems(rows);
         setError(null);
       } catch (e) {
-        if (gen === filterGeneration.current) setError(api.asCmdError(e).message);
+        if (gen === filterGeneration.current) setError(e);
       } finally {
         if (gen === filterGeneration.current) setLoading(false);
       }
@@ -114,7 +114,7 @@ export default function Activity() {
           setError(null);
         }
       } catch (e) {
-        if (!cancelled) setError(api.asCmdError(e).message);
+        if (!cancelled) setError(e);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -216,7 +216,7 @@ export default function Activity() {
         </div>
       </div>
 
-      {error && <ErrorBanner message={error} onRetry={() => void load()} />}
+      {error && <ErrorBanner error={error} onRetry={() => void load()} />}
 
       <div className="btn-row" style={{ marginBottom: 14 }}>
         <label

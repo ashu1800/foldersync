@@ -75,6 +75,8 @@ async fn two_nodes_sync_through_relay() {
         data_dir: relay_dir.path().join("relay"),
         port: 0,
         room_retention_days: 30,
+        room_quota_bytes: 0,
+        health_addr: None,
     })
     .await
     .unwrap();
@@ -105,6 +107,8 @@ async fn two_nodes_sync_through_relay() {
             ssh_port: 2222,
             mode: NetworkMode::Relay,
             relay_url: Some(url.clone()),
+            relay_host_keys: fs_sync_daemon::runtime::test_relay_host_keys(),
+            relay_uploaded_blobs: None,
             store: node.runtime.session.engine.store.clone(),
             blobs: node.runtime.session.blobs.clone(),
             sync_root: node._dir.path().join("FolderSync"),

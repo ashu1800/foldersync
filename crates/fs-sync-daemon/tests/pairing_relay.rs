@@ -31,6 +31,8 @@ async fn relay_pairing_exchanges_ssh_keys() {
         data_dir: relay_dir.path().join("relay"),
         port: 0,
         room_retention_days: 30,
+        room_quota_bytes: 0,
+        health_addr: None,
     })
     .await
     .unwrap();

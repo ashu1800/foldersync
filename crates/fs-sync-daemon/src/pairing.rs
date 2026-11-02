@@ -22,7 +22,7 @@ use crate::trust::Trust;
 use fs_sync_store::Store;
 
 /// 待确认的配对请求。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PendingPairing {
     pub request_id: String,
     /// 发起方设备 ID
@@ -34,6 +34,9 @@ pub struct PendingPairing {
 
 /// 待确认请求表：request_id -> (请求详情, 用户决定的回复通道)
 type PendingMap = HashMap<String, (PendingPairing, oneshot::Sender<bool>)>;
+
+/// 新配对请求回调（桌面端转发给前端事件用）。
+type OnRequestCb = Arc<dyn Fn(PendingPairing) + Send + Sync>;
 
 /// 配对会话管理器。
 #[derive(Clone)]
@@ -48,6 +51,9 @@ pub struct PairingManager {
     pending: Arc<Mutex<PendingMap>>,
     /// 持久化层：token 跨进程共享（pair 与 serve 是不同进程）
     store: Arc<Store>,
+    /// 新配对请求回调（桌面端转发给前端 `pairing://request` 事件；CLI 为空）。
+    /// 内部可变：manager 构建在 AppState 里，回调只能在 setup 阶段注入。
+    on_request: Arc<std::sync::RwLock<Option<OnRequestCb>>>,
 }
 
 impl PairingManager {
@@ -69,6 +75,14 @@ impl PairingManager {
             relay_url,
             pending: Arc::new(Mutex::new(HashMap::new())),
             store,
+            on_request: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// 注册"新配对请求"回调（桌面端启动时调用，转发到前端）。
+    pub fn set_on_request(&self, cb: OnRequestCb) {
+        if let Ok(mut guard) = self.on_request.write() {
+            *guard = Some(cb);
         }
     }
 
@@ -165,9 +179,15 @@ impl PairingManager {
         self.pending
             .lock()
             .await
-            .insert(request_id.clone(), (pending, tx));
+            .insert(request_id.clone(), (pending.clone(), tx));
 
         info!(request = %request_id, peer = %peer.device_name, "配对请求待确认");
+        // 实时通知 UI（桌面端）；轮询只是兜底
+        if let Ok(guard) = self.on_request.read()
+            && let Some(cb) = guard.as_ref()
+        {
+            cb(pending);
+        }
 
         // 等待 UI 确认；超时视为拒绝并清理
         let accepted = match tokio::time::timeout(confirm_timeout, rx).await {

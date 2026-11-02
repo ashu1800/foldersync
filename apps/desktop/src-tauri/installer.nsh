@@ -36,4 +36,12 @@
   ; 兼容清理旧版本可能留下的规则
   nsExec::Exec 'netsh advfirewall firewall delete rule name="FolderSync"'
   nsExec::Exec 'netsh advfirewall firewall delete rule name="FolderSync TCP"'
+  ; 清理开机自启 Run 键：tauri_plugin_autostart（auto-launch crate）写在
+  ; HKCU\Software\Microsoft\Windows\CurrentVersion\Run，键名 = productName
+  ;（未调用 .app_name() 自定义时）。应用卸载后残留的键指向不存在的 exe，
+  ; 每次登录都会报错。同时清掉历史可能的 "foldersync-desktop" 键名。
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "FolderSync"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "foldersync-desktop"
+  ; 任务管理器「启动」页的启用状态覆盖项也一并清掉
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "FolderSync"
 !macroend

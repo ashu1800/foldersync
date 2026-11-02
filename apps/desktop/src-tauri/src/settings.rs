@@ -62,6 +62,35 @@ impl SettingsStore {
     fn persist(&self, dto: &SettingsDto) -> Result<()> {
         persist_to(&self.path, dto)
     }
+
+    /// 查询某中继地址的固定 host key（TOFU 首连后保存）。
+    pub fn relay_host_key(&self, relay_url: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .relay_host_keys
+            .get(relay_url)
+            .cloned()
+    }
+
+    /// 保存/更新中继 host key 并落盘。
+    pub fn set_relay_host_key(&self, relay_url: &str, host_key: &str) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        guard
+            .relay_host_keys
+            .insert(relay_url.to_string(), host_key.to_string());
+        self.persist(&guard)?;
+        Ok(())
+    }
+
+    /// 清除某中继地址的固定 host key（用户改中继地址 / 手动重置信任）。
+    pub fn clear_relay_host_key(&self, relay_url: &str) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.relay_host_keys.remove(relay_url).is_some() {
+            self.persist(&guard)?;
+        }
+        Ok(())
+    }
 }
 
 /// 原子写盘（先写临时文件再 rename，避免断电留半截文件）。

@@ -24,6 +24,15 @@ pub struct FileEntry {
     pub version: VersionVector,
     /// 最后修改该文件的设备
     pub modified_by: String,
+    /// Unix 权限位（如 0o755）。Windows 上恒 0（Windows 没有等价语义，
+    /// 落盘时跳过 chmod）。
+    ///
+    /// **协议兼容性**：必须 `skip`。postcard 是非自描述格式，`default` 不起
+    /// 作用——不带 skip 的话旧版本对端发来的条目会因缺字段解码失败，
+    /// 我们发出去的会让旧对端错位。mode 目前只在本地索引/存储里流转，
+    /// 跨设备同步留给将来的协议版本。
+    #[serde(skip)]
+    pub mode: u32,
 }
 
 impl FileEntry {
@@ -47,6 +56,7 @@ impl FileEntry {
             deleted: false,
             version,
             modified_by: device.to_string(),
+            mode: 0,
         }
     }
 

@@ -36,4 +36,9 @@ default_ignore: Array<string>,
 /**
  * 日志级别：error/warn/info/debug/trace
  */
-log_level: string, };
+log_level: string,
+/**
+ * 中继 host key 固定表（relay_url → openssh 公钥行）。
+ * 首次连接时记录（TOFU），之后每次重连严格校验，防中继链路 MITM。
+ */
+relay_host_keys: Record<string, string>, };

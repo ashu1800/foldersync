@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder};
+use fs_sync_core::{FileEntry, SyncAction, diff, scan_folder, scan_folder_known};
 use fs_sync_net::blobstore::BlobStore;
+use futures::stream::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
@@ -20,8 +21,13 @@ use crate::watcher::{EventKind, FileEvent};
 pub struct SessionConfig {
     /// 防抖毫秒数（提示词 4.6：300~500ms）
     pub debounce_ms: u64,
-    /// 兜底全量扫描间隔（提示词 4.6：默认 10 分钟）
+    /// 兜底快扫间隔（提示词 4.6：默认 10 分钟）。
+    /// 快扫复用未变文件的 hash（size+mtime 一致不读盘），零 I/O 成本。
     pub full_scan_interval: Duration,
+    /// 深度校验间隔：全量重哈希，抓"等长同秒写入"这类 mtime 探测不到的变更。
+    /// 默认 6 小时——这是等长改写被发现的最坏延迟，对极端场景可接受
+    /// （Syncthing 的扫描间隔同样是小时级）。
+    pub deep_scan_interval: Duration,
     /// 墓碑保留天数（提示词 4.4）
     pub tombstone_days: i64,
 }
@@ -31,6 +37,7 @@ impl Default for SessionConfig {
         Self {
             debounce_ms: 400,
             full_scan_interval: Duration::from_secs(600),
+            deep_scan_interval: Duration::from_secs(6 * 3600),
             tombstone_days: 30,
         }
     }
@@ -47,12 +54,17 @@ pub struct SyncSession {
     pub config: SessionConfig,
     /// 当前索引快照（path → entry）
     index: Arc<Mutex<HashMap<String, FileEntry>>>,
+    /// 索引版本号：任何索引变更 +1。中继轮询用它判断是否需要重建/上传索引，
+    /// 避免 10 万文件的文件夹每秒全量 snapshot + 序列化一次。
+    index_version: Arc<std::sync::atomic::AtomicU64>,
     /// 待发送的增量
     pending: Arc<Mutex<Vec<FileEntry>>>,
     /// 缓存的 blob 存储
     pub blobs: Arc<BlobStore>,
     /// 已提示过的大小写冲突路径：避免每秒全量索引时刷爆日志与活动表
     case_clash_notified: Arc<Mutex<HashSet<String>>>,
+    /// 已提示过的单文件失败（时间, "path|detail"）：同错误 10 分钟只记一次 activity
+    failure_notified: Arc<std::sync::Mutex<Vec<(std::time::Instant, String)>>>,
     /// 传输限速（桌面端注入；CLI/测试为空实现）
     pub throttle: Arc<std::sync::RwLock<crate::runtime::TransferThrottle>>,
 }
@@ -75,9 +87,11 @@ impl SyncSession {
                 .unwrap_or_else(|_| device_id[..device_id.len().min(8)].to_string()),
             config: SessionConfig::default(),
             index: Arc::new(Mutex::new(HashMap::new())),
+            index_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending: Arc::new(Mutex::new(Vec::new())),
             blobs,
             case_clash_notified: Arc::new(Mutex::new(HashSet::new())),
+            failure_notified: Arc::new(std::sync::Mutex::new(Vec::new())),
             throttle: Arc::new(std::sync::RwLock::new(
                 crate::runtime::TransferThrottle::default(),
             )),
@@ -145,6 +159,7 @@ impl SyncSession {
                     e.modified_by = self.device_id.clone();
                     self.engine.store.upsert_entry(&self.folder_id, &e)?;
                     idx.insert(ev.path.clone(), e.clone());
+                    self.bump_index_version();
                     self.pending.lock().await.push(e.clone());
                     return Ok(Some(e));
                 }
@@ -158,6 +173,52 @@ impl SyncSession {
                     return Ok(None);
                 }
 
+                // 写入静默检查（quiescence）：文件刚被写过（mtime 距今 < 2 秒）时
+                // 内容可能还在写入中（录制、Office 保存、下载），立即哈希会把半成品
+                // 当成完整版本推给对端。等待到 mtime 稳定（≥2 秒不动）再哈希。
+                // 等待期间 mtime 还在前移 = 真的还在写（OBS 录制、数据库）：
+                // 放弃本次事件——写完时 notify 会再来一个事件，自然重新处理。
+                // 上限 5 秒兜底，防极端场景无限等待。
+                let mut last_seen_mtime = mtime;
+                for _ in 0..10 {
+                    let age = std::fs::metadata(&abs).ok().and_then(|m| {
+                        m.modified().ok().map(|t| {
+                            (
+                                t.duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0),
+                                t.elapsed().ok(),
+                            )
+                        })
+                    });
+                    match age {
+                        Some((_, Some(d))) if d >= std::time::Duration::from_secs(2) => break,
+                        Some((secs, _)) => {
+                            if secs != last_seen_mtime {
+                                // mtime 还在前进 = 持续写入，不哈希半成品
+                                return Ok(None);
+                            }
+                            last_seen_mtime = secs;
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        None => break, // 读不了元数据：交给后面的正常错误处理
+                    }
+                }
+                // 等待期间可能被删除/改名
+                let meta = match std::fs::metadata(&abs) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return self.tombstone_local(&ev.path).await;
+                    }
+                    Err(_) => return Ok(None),
+                };
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
                 let hash = fs_sync_core::hash_file(&abs)?;
                 // 内容没变（拉取落盘后抑制窗口已过、touch 等）：只刷新元数据，不算新版本
                 if let Some(o) = &old
@@ -170,6 +231,7 @@ impl SyncSession {
                     e.mtime = mtime;
                     self.engine.store.upsert_entry(&self.folder_id, &e)?;
                     idx.insert(ev.path.clone(), e);
+                    self.bump_index_version();
                     return Ok(None);
                 }
                 let mut entry = match old {
@@ -197,6 +259,7 @@ impl SyncSession {
 
                 self.engine.store.upsert_entry(&self.folder_id, &entry)?;
                 idx.insert(ev.path.clone(), entry.clone());
+                self.bump_index_version();
                 self.pending.lock().await.push(entry.clone());
                 debug!(path = %ev.path, "入队变更");
                 Ok(Some(entry))
@@ -216,6 +279,7 @@ impl SyncSession {
         tomb.modified_by = self.device_id.clone();
         self.engine.store.upsert_entry(&self.folder_id, &tomb)?;
         idx.insert(path.to_string(), tomb.clone());
+        self.bump_index_version();
         self.pending.lock().await.push(tomb.clone());
         debug!(path = %path, "入队墓碑");
         Ok(Some(tomb))
@@ -234,6 +298,18 @@ impl SyncSession {
     /// 当前索引快照。
     pub async fn snapshot(&self) -> HashMap<String, FileEntry> {
         self.index.lock().await.clone()
+    }
+
+    /// 索引版本号：只在索引内容变化时递增。中继轮询据此跳过无谓的
+    /// 全量 snapshot + 序列化（10 万文件每秒一次是不可接受的）。
+    pub fn index_version(&self) -> u64 {
+        self.index_version
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump_index_version(&self) {
+        self.index_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 应用对端的**全量**索引：算出需要拉取的动作并执行。
@@ -314,7 +390,49 @@ impl SyncSession {
         let mut case_idx =
             cfg!(any(windows, target_os = "macos")).then(|| fs_sync_core::CaseIndex::new(&local));
 
+        // 文件内容拉取是有界并发的（高延迟链路下串行逐个 await 吞吐极差）；
+        // 其余动作（删除/建目录/冲突/元数据）操作共享状态，保持串行。
+        // 先收集，最后一轮并发执行。
+        let mut pull_jobs: Vec<(String, FileEntry)> = Vec::new();
         for action in &actions {
+            let path = match action {
+                SyncAction::Push { path }
+                | SyncAction::MergeMeta { path, .. }
+                | SyncAction::Pull { path }
+                | SyncAction::Conflict { path, .. } => path,
+            };
+            if let SyncAction::Pull { .. } = action
+                && let Some(entry) = remote.get(path)
+                && !entry.deleted
+                && !entry.is_dir
+            {
+                // 命中就跳过，等用户手动改名（目录不检查：落进同一个目录不丢数据）
+                if let Some(existing) = case_idx.as_ref().and_then(|ci| ci.clash(path)) {
+                    // 中继/全量索引每轮都会重新看到同一条，只提示一次
+                    let first = self.case_clash_notified.lock().await.insert(path.clone());
+                    if first {
+                        warn!(%path, %existing, "对端文件与本地文件仅大小写不同，跳过以免覆盖，请手动改名");
+                        let _ = self.engine.store.log_activity(
+                            "conflict",
+                            &self.folder_id,
+                            path,
+                            "对端文件与本机文件仅大小写不同，已跳过；请手动改名后重新同步",
+                        );
+                    } else {
+                        debug!(%path, %existing, "大小写冲突仍在，已跳过");
+                    }
+                    stats.failed += 1;
+                    continue;
+                }
+                // 收集时立即登记：同批 job 之间的 `a.txt` / `A.txt` 也要互相
+                // 拦住，否则并发落盘时后者覆盖前者（大小写不敏感文件系统）。
+                // 落盘成功后无需重复 insert（results 循环里的 insert 幂等）。
+                if let Some(ci) = &mut case_idx {
+                    ci.insert(path);
+                }
+                pull_jobs.push((path.clone(), entry.clone()));
+                continue;
+            }
             match action {
                 SyncAction::Push { path } => {
                     stats.pushed += 1;
@@ -345,6 +463,7 @@ impl SyncSession {
                             }
                             Err(e) => {
                                 warn!(%path, "删除失败: {e}");
+                                self.log_failure(path, &format!("删除失败: {e}"));
                                 stats.failed += 1;
                             }
                         }
@@ -355,53 +474,12 @@ impl SyncSession {
                             self.set_index_entry(entry.clone()).await;
                             stats.pulled += 1;
                         } else {
+                            self.log_failure(path, "建目录失败");
                             stats.failed += 1;
                         }
                         continue;
                     }
-                    // 命中就跳过，等用户手动改名（目录不检查：落进同一个目录不丢数据）
-                    if let Some(existing) = case_idx.as_ref().and_then(|ci| ci.clash(path)) {
-                        // 中继/全量索引每轮都会重新看到同一条，只提示一次
-                        let first = self.case_clash_notified.lock().await.insert(path.clone());
-                        if first {
-                            warn!(%path, %existing, "对端文件与本地文件仅大小写不同，跳过以免覆盖，请手动改名");
-                            let _ = self.engine.store.log_activity(
-                                "conflict",
-                                &self.folder_id,
-                                path,
-                                "对端文件与本机文件仅大小写不同，已跳过；请手动改名后重新同步",
-                            );
-                        } else {
-                            debug!(%path, %existing, "大小写冲突仍在，已跳过");
-                        }
-                        stats.failed += 1;
-                        continue;
-                    }
-                    match self.pull_with_retry(&mut pull_blob, &entry.hash).await {
-                        Ok(()) => {
-                            // 传输后结算限速（不阻塞小文件；大文件按配额等待）
-                            let throttle =
-                                self.throttle.read().map(|t| t.clone()).unwrap_or_default();
-                            throttle.consume_download(entry.size).await;
-                            match self.engine.apply_pulled(entry, &entry.hash).await {
-                                Ok(()) => {
-                                    if let Some(ci) = &mut case_idx {
-                                        ci.insert(path);
-                                    }
-                                    self.set_index_entry(entry.clone()).await;
-                                    stats.pulled += 1;
-                                }
-                                Err(e) => {
-                                    warn!(%path, "落盘失败: {e}");
-                                    stats.failed += 1;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(%path, "拉取失败: {e}");
-                            stats.failed += 1;
-                        }
-                    }
+                    unreachable!("文件拉取应已进并发队列");
                 }
                 SyncAction::Conflict {
                     path,
@@ -409,90 +487,203 @@ impl SyncSession {
                     winner,
                     loser,
                 } => {
-                    // diff 产出的 winner/loser 已经是按 winner_side 挑好的，不能再按 side 对调
-                    let (win, lose) = (winner, loser);
-                    let win_local = matches!(winner_side, fs_sync_core::Side::Local);
-
-                    // 删除 vs 修改 的冲突（提示词 4.4：修改优先于删除）：
-                    // 删除侧没有内容可拉，直接保留文件侧，不产生副本、不丢数据。
-                    if win.deleted || lose.deleted {
-                        let keep = if win.deleted { lose } else { win };
-                        if keep.deleted {
-                            // 两侧都是删除 → 一致，无需动作
-                            stats.deleted += 1;
-                        } else {
-                            // 保留文件侧：合并版本向量，让双端收敛到"文件存在"
-                            let mut merged = keep.clone();
-                            merged.version = fs_sync_core::merge(&win.version, &lose.version);
-                            merged.version.increment(&self.device_id);
-                            merged.deleted = false;
-                            merged.modified_by = self.device_id.clone();
-                            self.set_index_entry(merged.clone()).await;
-                            let _ = self.engine.store.upsert_entry(&self.folder_id, &merged);
-                            self.pending.lock().await.push(merged);
-                            info!(%path, "删除/修改冲突：保留文件（修改优先于删除）");
-                            stats.conflicts += 1;
-                        }
-                        continue;
-                    }
-
-                    // 本地一侧的内容在本地文件里，入 blob 库即可；只有远端一侧才需要拉取
-                    let (win_got, lose_got) = if win_local {
-                        (
-                            self.engine.ensure_blob(win).await.map(|_| ()),
-                            self.pull_with_retry(&mut pull_blob, &lose.hash).await,
-                        )
-                    } else {
-                        (
-                            self.pull_with_retry(&mut pull_blob, &win.hash).await,
-                            self.engine.ensure_blob(lose).await.map(|_| ()),
-                        )
-                    };
-                    if let Err(e) = win_got {
-                        warn!(%path, "冲突胜者内容不可得: {e}");
-                        stats.failed += 1;
-                        continue;
-                    }
-                    let loser_bytes = match lose_got {
-                        Ok(()) => crate::sync::read_blob_bytes(&self.blobs, &lose.hash)
-                            .await
-                            .ok(),
-                        Err(e) => {
-                            // 拿不到落败版本内容不是致命错误——apply_conflict 会把
-                            // 本地现有文件改名保住（见 engine.rs）。这里记一条日志，
-                            // 不要因为拉取失败就跳过整个冲突处理。
-                            warn!(%path, "落败版本内容不可读，将保留本地文件为副本: {e}");
-                            None
-                        }
-                    };
-                    match self
-                        .engine
-                        .apply_conflict(win, loser_bytes, &win.hash, &self.device_name)
-                        .await
-                    {
-                        Ok(copy) => {
-                            info!(%path, copy = %copy, "冲突已处理，副本另存");
-                            // 关键：冲突后必须把「双方版本合并」写进本地索引并递增，
-                            // 否则下一轮仍被判为并发冲突，会不断产生新副本。
-                            let mut merged = win.clone();
-                            merged.version = fs_sync_core::merge(&win.version, &lose.version);
-                            merged.version.increment(&self.device_id);
-                            merged.modified_by = self.device_id.clone();
-                            merged.deleted = false;
-                            self.set_index_entry(merged.clone()).await;
-                            let _ = self.engine.store.upsert_entry(&self.folder_id, &merged);
-                            self.pending.lock().await.push(merged);
-                            stats.conflicts += 1;
-                        }
-                        Err(e) => {
-                            warn!(%path, "冲突处理失败: {e}");
-                            stats.failed += 1;
-                        }
-                    }
+                    self.apply_conflict_action(
+                        path,
+                        *winner_side,
+                        winner,
+                        loser,
+                        &mut pull_blob,
+                        &mut stats,
+                    )
+                    .await;
                 }
             }
         }
+
+        // 有界并发拉取文件内容（4 路）：传输是网络 I/O 密集，互不依赖；
+        // 落盘在 apply_pulled 里是原子写，并发安全。
+        // pull_blob 是 FnMut（内含连接缓存），用 Arc<Mutex> 共享：锁只包住
+        // "调用闭包拿 future"的瞬间，网络传输本身在锁外并发进行。
+        const PULL_CONCURRENCY: usize = 4;
+        let puller = Arc::new(tokio::sync::Mutex::new(pull_blob));
+        let results = futures::stream::iter(pull_jobs)
+            .map(|(_path, entry)| {
+                let this = &self;
+                let puller = puller.clone();
+                let throttle = self.throttle.read().map(|t| t.clone()).unwrap_or_default();
+                async move {
+                    // 带退避重试（1 → 2 → 3 次），每次尝试在锁内生成 future
+                    let mut last_err: Option<anyhow::Error> = None;
+                    let mut pulled = Err(anyhow::anyhow!("拉取未开始"));
+                    for attempt in 0..3 {
+                        let fut = {
+                            let mut guard = puller.lock().await;
+                            guard(entry.hash.clone())
+                        };
+                        match fut.await {
+                            Ok(()) => {
+                                pulled = Ok(());
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                if attempt < 2 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        200 * (1 << attempt),
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    match pulled {
+                        Ok(()) => {
+                            throttle.consume_download(entry.size).await;
+                            match this.engine.apply_pulled(&entry, &entry.hash).await {
+                                Ok(()) => Ok(entry),
+                                Err(e) => {
+                                    warn!(path = %entry.path, "落盘失败: {e}");
+                                    this.log_failure(&entry.path, &format!("落盘失败: {e}"));
+                                    Err(())
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            let detail = format!(
+                                "拉取失败: {:#}",
+                                last_err.unwrap_or_else(|| anyhow::anyhow!("未知错误"))
+                            );
+                            warn!(path = %entry.path, "{detail}");
+                            this.log_failure(&entry.path, &detail);
+                            Err(())
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(PULL_CONCURRENCY)
+            .collect::<Vec<std::result::Result<FileEntry, ()>>>()
+            .await;
+        for result in results {
+            match result {
+                Ok(entry) => {
+                    if let Some(ci) = &mut case_idx {
+                        ci.insert(&entry.path);
+                    }
+                    self.set_index_entry(entry).await;
+                    stats.pulled += 1;
+                }
+                Err(()) => stats.failed += 1,
+            }
+        }
         Ok(stats)
+    }
+
+    /// 处理一个冲突动作：删除 vs 修改按"修改优先于删除"保留文件；
+    /// 双改按胜者落原路径、败者存副本，并合并版本向量让双端收敛。
+    async fn apply_conflict_action<F, Fut>(
+        &self,
+        path: &str,
+        winner_side: fs_sync_core::Side,
+        winner: &FileEntry,
+        loser: &FileEntry,
+        pull_blob: &mut F,
+        stats: &mut SyncStats,
+    ) where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        // diff 产出的 winner/loser 已经是按 winner_side 挑好的，不能再按 side 对调
+        let (win, lose) = (winner, loser);
+        let win_local = matches!(winner_side, fs_sync_core::Side::Local);
+
+        // 删除 vs 修改 的冲突（提示词 4.4：修改优先于删除）：
+        // 删除侧没有内容可拉，直接保留文件侧，不产生副本、不丢数据。
+        if win.deleted || lose.deleted {
+            let keep = if win.deleted { lose } else { win };
+            if keep.deleted {
+                // 两侧都是删除 → 一致，无需动作
+                stats.deleted += 1;
+            } else {
+                // 保留文件侧：合并版本向量，让双端收敛到"文件存在"
+                let mut merged = keep.clone();
+                merged.version = fs_sync_core::merge(&win.version, &lose.version);
+                merged.version.increment(&self.device_id);
+                merged.deleted = false;
+                merged.modified_by = self.device_id.clone();
+                self.set_index_entry(merged.clone()).await;
+                let _ = self.engine.store.upsert_entry(&self.folder_id, &merged);
+                self.pending.lock().await.push(merged);
+                info!(%path, "删除/修改冲突：保留文件（修改优先于删除）");
+                stats.conflicts += 1;
+            }
+            return;
+        }
+
+        // 本地一侧的内容在本地文件里，入 blob 库即可；只有远端一侧才需要拉取
+        let (win_got, lose_got) = if win_local {
+            (
+                self.engine.ensure_blob(win).await.map(|_| ()),
+                self.pull_with_retry(pull_blob, &lose.hash).await,
+            )
+        } else {
+            (
+                self.pull_with_retry(pull_blob, &win.hash).await,
+                self.engine.ensure_blob(lose).await.map(|_| ()),
+            )
+        };
+        if let Err(e) = win_got {
+            warn!(%path, "冲突胜者内容不可得: {e}");
+            stats.failed += 1;
+            return;
+        }
+        let loser_bytes = match lose_got {
+            Ok(()) => crate::sync::read_blob_bytes(&self.blobs, &lose.hash)
+                .await
+                .ok(),
+            Err(e) => {
+                // 拿不到落败版本内容不是致命错误——apply_conflict 会把
+                // 本地现有文件改名保住（见 engine.rs）。这里记一条日志，
+                // 不要因为拉取失败就跳过整个冲突处理。
+                warn!(%path, "落败版本内容不可读，将保留本地文件为副本: {e}");
+                None
+            }
+        };
+        match self
+            .engine
+            .apply_conflict(win, loser_bytes, &win.hash, &self.device_name)
+            .await
+        {
+            Ok(copy) => {
+                info!(%path, copy = %copy, "冲突已处理，副本另存");
+                // 关键：冲突后必须把「双方版本合并」写进本地索引并递增，
+                // 否则下一轮仍被判为并发冲突，会不断产生新副本。
+                let mut merged = win.clone();
+                merged.version = fs_sync_core::merge(&win.version, &lose.version);
+                merged.version.increment(&self.device_id);
+                merged.modified_by = self.device_id.clone();
+                merged.deleted = false;
+                self.set_index_entry(merged.clone()).await;
+                let _ = self.engine.store.upsert_entry(&self.folder_id, &merged);
+                // 副本也进内存索引：SQLite 里有了（engine 落的），但
+                // build_index/全量索引走 snapshot()（内存），不进的话
+                // 对端永远看不到这份副本。
+                if let Some(copy_entry) = self
+                    .engine
+                    .store
+                    .list_entries(&self.folder_id)
+                    .ok()
+                    .and_then(|es| es.into_iter().find(|e| e.path == copy))
+                {
+                    self.set_index_entry(copy_entry).await;
+                }
+                self.pending.lock().await.push(merged);
+                stats.conflicts += 1;
+            }
+            Err(e) => {
+                warn!(%path, "冲突处理失败: {e}");
+                stats.failed += 1;
+            }
+        }
     }
 
     /// 测试辅助：直接替换内存索引。
@@ -501,8 +692,31 @@ impl SyncSession {
         *self.index.lock().await = map;
     }
 
+    /// 单文件同步失败落 activity 表（kind=error），让用户在活动页看到
+    /// "哪个文件、为什么失败"，而不是只有一行"N 个文件失败"。
+    /// 同一文件同一错误 10 分钟内只记一次——中继/全量索引每轮都会重试，
+    /// 不去重会刷爆活动表。
+    fn log_failure(&self, path: &str, detail: &str) {
+        let mut seen = self
+            .failure_notified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        seen.retain(|(t, _)| now.duration_since(*t) < std::time::Duration::from_secs(600));
+        let key = format!("{path}|{detail}");
+        if seen.iter().any(|(_, k)| *k == key) {
+            return;
+        }
+        seen.push((now, key));
+        let _ = self
+            .engine
+            .store
+            .log_activity("error", &self.folder_id, path, detail);
+    }
+
     async fn set_index_entry(&self, entry: FileEntry) {
         self.index.lock().await.insert(entry.path.clone(), entry);
+        self.bump_index_version();
     }
 
     /// 记录远端墓碑：本地索引与数据库都标记为已删除。
@@ -517,22 +731,42 @@ impl SyncSession {
             deleted: true,
             version: fs_sync_core::VersionVector::new(),
             modified_by: self.device_id.clone(),
+            mode: 0,
         });
         entry.deleted = true;
         entry.version.increment(&self.device_id);
         entry.modified_by = self.device_id.clone();
         idx.insert(path.to_string(), entry.clone());
         let _ = self.engine.store.upsert_entry(&self.folder_id, &entry);
+        self.bump_index_version();
     }
 
-    /// 兜底全量扫描：先比 size+mtime，变化才哈希（提示词 4.6）。
+    /// 兜底扫描。
+    ///
+    /// `deep = true`：全量重哈希（慢，抓等长同秒写入）；`deep = false`：
+    /// size+mtime 一致的文件复用索引 hash，不读盘（快，每 10 分钟跑）。
+    /// 之前每次兜底扫描对所有文件重读重哈希，10 万文件 = 每次读几十 GB，
+    /// 磁盘持续被打满。等长同秒写入由 6 小时一次的深扫兜底。
     pub async fn full_scan(&self) -> Result<Vec<FileEntry>> {
+        self.full_scan_inner(false).await
+    }
+
+    /// 深度校验扫描：无视已知索引，所有文件重哈希。
+    pub async fn deep_scan(&self) -> Result<Vec<FileEntry>> {
+        self.full_scan_inner(true).await
+    }
+
+    async fn full_scan_inner(&self, deep: bool) -> Result<Vec<FileEntry>> {
         let root = self.root.clone();
         let matcher = fs_sync_core::matcher_for_folder(&root);
         let matcher_for_gone = matcher.clone();
-        let mut scan = tokio::task::spawn_blocking(move || scan_folder(&root, &matcher))
-            .await
-            .context("兜底扫描任务失败")??;
+        let known: fs_sync_core::KnownIndex = self.index.lock().await.clone();
+        let scan_res = if deep {
+            tokio::task::spawn_blocking(move || scan_folder(&root, &matcher)).await
+        } else {
+            tokio::task::spawn_blocking(move || scan_folder_known(&root, &matcher, &known)).await
+        };
+        let mut scan = scan_res.context("兜底扫描任务失败")??;
         if !scan.unreadable.is_empty() {
             warn!(count = scan.unreadable.len(), first = %scan.unreadable[0], "兜底扫描有路径读取失败，保留旧条目");
         }
@@ -615,8 +849,12 @@ impl SyncSession {
         }
         let gone: Vec<String> = idx
             .iter()
-            // 读不了的路径不算消失：读失败 ≠ 已删除
-            .filter(|(p, e)| !e.deleted && !seen.contains(*p) && !scan.is_unreadable(p))
+            // 读不了的路径不算消失：读失败 ≠ 已删除；
+            // 被跳过的路径（符号链接）也不算消失：链接 ≠ 已删除，
+            // 否则常规文件被替换成 symlink 后，对端会把真实文件删掉。
+            .filter(|(p, e)| {
+                !e.deleted && !seen.contains(*p) && !scan.is_unreadable(p) && !scan.is_skipped(p)
+            })
             .map(|(p, _)| p.clone())
             .collect();
         for path in gone {
@@ -633,30 +871,33 @@ impl SyncSession {
 
         if !changed.is_empty() {
             info!(count = changed.len(), "兜底扫描发现变更");
+            self.bump_index_version();
         }
         Ok(changed)
     }
 
     /// 清理过期墓碑（提示词 4.4：默认保留 30 天）。
+    ///
+    /// 判据是**删除时间**（entries.deleted_at，由 store 层在置墓碑时自动记录），
+    /// 不是文件 mtime。以前用 mtime：删除一个 31 天没动过的文件，墓碑 10 分钟内
+    /// 就被清掉，对端离线回来后按"本地有、远端无"把文件复活，删除永久丢失。
     pub fn purge_expired_tombstones(&self) -> Result<usize> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let cutoff = now - self.config.tombstone_days * 86400;
-        let entries = self.engine.store.list_entries(&self.folder_id)?;
-        let mut purged = 0;
-        for e in entries {
-            if e.deleted && e.mtime > 0 && e.mtime < cutoff {
-                // 墓碑过期：直接移除记录（文件早已不在）
-                self.engine.store.delete_entry(&self.folder_id, &e.path)?;
-                purged += 1;
-            }
+        let expired = self
+            .engine
+            .store
+            .list_expired_tombstones(&self.folder_id, cutoff)?;
+        for path in &expired {
+            self.engine.store.delete_entry(&self.folder_id, path)?;
         }
-        if purged > 0 {
-            info!(purged, "清理过期墓碑");
+        if !expired.is_empty() {
+            info!(purged = expired.len(), "清理过期墓碑");
         }
-        Ok(purged)
+        Ok(expired.len())
     }
 }
 
@@ -688,7 +929,7 @@ pub async fn run_event_loop(
     }
 }
 
-/// 周期任务：兜底扫描 + 墓碑清理。
+/// 周期任务：兜底快扫（复用 hash，零读盘）+ 低频深扫（全量重哈希）+ 墓碑清理。
 pub async fn run_periodic(
     session: Arc<SyncSession>,
     on_change: impl Fn(Vec<FileEntry>) + Send + Sync + 'static,
@@ -696,9 +937,22 @@ pub async fn run_periodic(
     let on_change = Arc::new(on_change);
     let mut interval = tokio::time::interval(session.config.full_scan_interval);
     interval.tick().await; // 跳过立即触发
+    let mut deep = tokio::time::interval(session.config.deep_scan_interval);
+    deep.tick().await; // 跳过立即触发
+    let mut deep_due = false;
     loop {
-        interval.tick().await;
-        match session.full_scan().await {
+        tokio::select! {
+            _ = deep.tick() => deep_due = true,
+            _ = interval.tick() => {}
+        }
+        // 深扫 tick 到了：这一轮改跑深扫（与快扫重叠时顺带覆盖快扫职责）
+        let do_deep = std::mem::take(&mut deep_due);
+        let scan_result = if do_deep {
+            session.deep_scan().await
+        } else {
+            session.full_scan().await
+        };
+        match scan_result {
             Ok(changed) if !changed.is_empty() => {
                 for e in &changed {
                     if !e.is_dir && !e.deleted {
@@ -707,6 +961,7 @@ pub async fn run_periodic(
                 }
                 on_change(changed);
             }
+            Ok(_) if do_deep => debug!("深扫完成，无变化"),
             Ok(_) => debug!("兜底扫描无变化"),
             Err(e) => warn!("兜底扫描失败: {e}"),
         }
@@ -758,6 +1013,7 @@ mod tests {
             deleted: false,
             version: vv,
             modified_by: dev.into(),
+            mode: 0,
         }
     }
 
@@ -831,6 +1087,63 @@ mod tests {
             .unwrap();
         assert!(tomb.deleted);
         assert_eq!(tomb.version.get("devA"), 2, "墓碑版本必须递增");
+    }
+
+    /// 回归：墓碑过期按删除时间（deleted_at）判定，不再按文件 mtime。
+    /// 删一个 mtime 很老（31 天未动）的文件，墓碑必须立刻可保留满 30 天，
+    /// 不能在下一轮周期任务里就被清掉（否则对端离线回来文件复活）。
+    #[tokio::test]
+    async fn old_file_tombstone_survives_by_delete_time_not_mtime() {
+        let (s, _t) = session().await;
+        // 写入后把磁盘 mtime 拨回 40 天前，模拟"很久没动过的文件"
+        let p = s.root.join("stale.txt");
+        std::fs::write(&p, b"stale").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400);
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+
+        s.on_local_event(FileEvent {
+            path: "stale.txt".into(),
+            kind: EventKind::Changed,
+        })
+        .await
+        .unwrap();
+
+        std::fs::remove_file(&p).unwrap();
+        let tomb = s
+            .on_local_event(FileEvent {
+                path: "stale.txt".into(),
+                kind: EventKind::Removed,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tomb.deleted);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            tomb.mtime < now_secs - 30 * 86400,
+            "前置条件：文件 mtime 在 30 天前（mtime={}</{})",
+            tomb.mtime,
+            now_secs - 30 * 86400
+        );
+
+        // 现在（tombstone_days=30）清理：文件 mtime 已超期，但删除时间是现在，
+        // 墓碑必须存活。旧实现按 mtime 判定会在这里把它清掉。
+        let purged = s.purge_expired_tombstones().unwrap();
+        assert_eq!(purged, 0, "按删除时间判定，刚产生的墓碑不应过期");
+        assert!(
+            s.engine
+                .store
+                .list_entries("f1")
+                .unwrap()
+                .iter()
+                .any(|e| e.path == "stale.txt" && e.deleted),
+            "墓碑必须还在，否则对端离线回来会复活文件"
+        );
     }
 
     #[tokio::test]

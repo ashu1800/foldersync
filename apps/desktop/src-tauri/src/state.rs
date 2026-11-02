@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use fs_sync_daemon::{
-    FolderRuntime, PairingManager, PeerLoopConfig, SshServerHandle, SshServerShared, Trust,
-    run_peer_loop, run_ssh_server,
+    FolderRuntime, PairingManager, PeerLoopConfig, RelayHostKeys, SshServerHandle, SshServerShared,
+    Trust, run_peer_loop, run_ssh_server,
 };
 use fs_sync_net::blobstore::BlobStore;
 use fs_sync_net::identity::{SshIdentity, public_key_line};
@@ -125,6 +125,47 @@ impl AppState {
 
         let online: Arc<Mutex<fs_sync_net::conn::Presence>> =
             Arc::new(Mutex::new(Default::default()));
+        // 带宽限速（共享给 SFTP 服务端与文件夹运行时）
+        let limits = Arc::new(std::sync::RwLock::new(crate::limits::Limits::new(
+            snapshot.upload_limit_kbps,
+            snapshot.download_limit_kbps,
+        )));
+        // SFTP 服务端带宽结算：read = 对端下载我们（走下载限速），
+        // write = 对端上传进来（走上传限速）。之前服务端路径完全不限速。
+        let sftp_bandwidth = {
+            let dl = limits.clone();
+            let ul = limits.clone();
+            let download: fs_sync_net::sftp_fs::BandwidthFn = Arc::new(move |bytes| {
+                let limiter = dl
+                    .read()
+                    .map(|l| l.download.clone())
+                    .unwrap_or_else(|e| e.into_inner().download.clone());
+                Box::pin(async move { limiter.consume(bytes).await })
+            });
+            let upload: fs_sync_net::sftp_fs::BandwidthFn = Arc::new(move |bytes| {
+                let limiter = ul
+                    .read()
+                    .map(|l| l.upload.clone())
+                    .unwrap_or_else(|e| e.into_inner().upload.clone());
+                Box::pin(async move { limiter.consume(bytes).await })
+            });
+            Some((download, upload))
+        };
+        // 中继 host key 固定表（桌面端存 settings.json）：服务端 fallback 与对等循环共用一份
+        let relay_host_keys = Arc::new(RelayHostKeys::new(
+            {
+                let settings = settings.clone();
+                Arc::new(move |url| settings.relay_host_key(url))
+            },
+            {
+                let settings = settings.clone();
+                Arc::new(move |url, key| {
+                    if let Err(e) = settings.set_relay_host_key(url, key) {
+                        tracing::warn!("保存中继 host key 失败: {e}");
+                    }
+                })
+            },
+        ));
         let shared = Arc::new(SshServerShared {
             identity: identity.clone(),
             host_key,
@@ -142,6 +183,8 @@ impl AppState {
             paused_all: paused_all.clone(),
             runtimes: runtimes.clone(),
             online: online.clone(),
+            relay_host_keys: relay_host_keys.clone(),
+            sftp_bandwidth,
         });
         let server = run_ssh_server(shared)
             .await
@@ -150,6 +193,10 @@ impl AppState {
         let actual_port = server.port;
         pairing.set_ssh_port(actual_port);
 
+        // 已上传中继 blob 的进程级缓存：跨重连保留，重连后不必逐文件 stat
+        let relay_uploaded_blobs: Arc<
+            std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let peer_cfg = Arc::new(std::sync::RwLock::new(PeerLoopConfig {
             identity: identity.clone(),
             device_id: device_id.clone(),
@@ -157,6 +204,8 @@ impl AppState {
             ssh_port: actual_port,
             mode: snapshot.network_mode.into(),
             relay_url: snapshot.relay_url.clone(),
+            relay_host_keys: relay_host_keys.clone(),
+            relay_uploaded_blobs: Some(relay_uploaded_blobs),
             store: store.clone(),
             blobs: blobs.clone(),
             sync_root: sync_root.clone(),
@@ -182,10 +231,7 @@ impl AppState {
             pending_pairings: Arc::new(Mutex::new(HashMap::new())),
             settings,
             paused_all,
-            limits: Arc::new(std::sync::RwLock::new(crate::limits::Limits::new(
-                snapshot.upload_limit_kbps,
-                snapshot.download_limit_kbps,
-            ))),
+            limits,
             peer_cfg,
             ssh_server: Mutex::new(Some(server)),
         });

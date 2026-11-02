@@ -91,6 +91,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // pair 与 serve 是两个独立进程共享同一库文件；并发写时默认 0 等待
+        // 会直接报 SQLITE_BUSY。给 5 秒让锁等待重试。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
@@ -141,6 +144,8 @@ impl Store {
                 deleted INTEGER NOT NULL,
                 version_json TEXT NOT NULL,
                 modified_by TEXT NOT NULL,
+                deleted_at INTEGER NOT NULL DEFAULT 0,
+                mode INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (folder_id, path)
             );
             CREATE INDEX IF NOT EXISTS idx_entries_folder ON entries(folder_id);
@@ -181,6 +186,9 @@ impl Store {
         ensure_column(conn, "activity", "size", "INTEGER NOT NULL DEFAULT 0")?;
         // 文件夹补共享设备列表（旧库升级，空表示所有设备）
         ensure_column(conn, "folders", "shared_with", "TEXT NOT NULL DEFAULT '[]'")?;
+        // 墓碑记录删除时间（旧库升级）：旧墓碑按 0 处理，由首次 upsert 刷新
+        ensure_column(conn, "entries", "deleted_at", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(conn, "entries", "mode", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -427,6 +435,20 @@ impl Store {
         Ok(())
     }
 
+    /// 过期的墓碑路径（deleted_at 早于 cutoff）。deleted_at = 0 的是旧版数据，
+    /// 保守起见不过期，等下一次墓碑刷新补上时间戳。
+    pub fn list_expired_tombstones(&self, folder_id: &str, cutoff: i64) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT path FROM entries
+             WHERE folder_id = ?1 AND deleted = 1 AND deleted_at > 0 AND deleted_at < ?2",
+        )?;
+        let rows = st
+            .query_map([folder_id, &cutoff.to_string()], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// 只统计存活条目，避免概览页为拿文件数反序列化整棵索引。
     pub fn count_live_entries(&self, folder_id: &str) -> Result<u32> {
         let conn = self.lock();
@@ -441,11 +463,49 @@ impl Store {
     pub fn list_entries(&self, folder_id: &str) -> Result<Vec<FileEntry>> {
         let conn = self.lock();
         let mut st = conn.prepare(
-            "SELECT path, size, mtime, hash, is_dir, deleted, version_json, modified_by
+            "SELECT path, size, mtime, hash, is_dir, deleted, version_json, modified_by, deleted_at, mode
              FROM entries WHERE folder_id = ?1 ORDER BY path",
         )?;
         let rows = st
             .query_map([folder_id], row_to_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 列出某前缀下的**直接子项**（文件树浏览用）。
+    ///
+    /// 之前 get_folder_tree 每次点击都 list_entries 全表载入内存再过滤，
+    /// 几万文件 = 每点一个目录全表扫。SQL 条件把过滤下推给 SQLite 的
+    /// 主键索引（folder_id, path），只取需要的那一层。
+    pub fn list_entries_under(&self, folder_id: &str, prefix: &str) -> Result<Vec<FileEntry>> {
+        let conn = self.lock();
+        // 空前缀：顶层条目 = path 不含 '/'（INSTR 找不到分隔符返回 0）。
+        // 非空前缀：`prefix/xxx`（LIKE 走索引前缀），且 tail（prefix 之后剩余）不含 '/'。
+        // SUBSTR 是 1-based：path = "pre/xxx"，prefix = "pre" → tail 从 len+2 开始。
+        if prefix.is_empty() {
+            let sql = "SELECT path, size, mtime, hash, is_dir, deleted, version_json, modified_by, deleted_at, mode
+                 FROM entries WHERE folder_id = ?1 AND deleted = 0 AND INSTR(path, '/') = 0
+                 ORDER BY path";
+            let mut st = conn.prepare(sql)?;
+            let rows = st
+                .query_map([folder_id], row_to_entry)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
+        let pattern = format!("{prefix}/%");
+        let tail_offset = (prefix.len() + 2) as i64;
+        let sql = "SELECT path, size, mtime, hash, is_dir, deleted, version_json, modified_by, deleted_at, mode
+                 FROM entries
+                 WHERE folder_id = ?1 AND deleted = 0
+                   AND path LIKE ?2
+                   AND INSTR(SUBSTR(path, ?3), '/') = 0
+                 ORDER BY path";
+        let mut st = conn.prepare(sql)?;
+        let rows = st
+            .query_map(
+                rusqlite::params![folder_id, pattern, tail_offset],
+                row_to_entry,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -604,12 +664,28 @@ fn ensure_column(conn: &Connection, table: &str, name: &str, ddl: &str) -> Resul
 
 fn insert_entry(conn: &Connection, folder_id: &str, e: &FileEntry) -> Result<()> {
     let version_json = serde_json::to_string(&e.version)?;
+    // deleted_at：墓碑的删除时间（Unix 秒）。由 SQL 自动维护，调用方无需关心：
+    // - 置为墓碑（活 → deleted）：记当前时间；
+    // - 已是墓碑：保留原删除时间（版本递增的墓碑刷新不能把时间洗掉，否则 30 天保留期永远从最后一次广播算起）；
+    // - 复活/普通条目：清 0。
     conn.execute(
-        "INSERT INTO entries (folder_id, path, size, mtime, hash, is_dir, deleted, version_json, modified_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO entries (folder_id, path, size, mtime, hash, is_dir, deleted, version_json, modified_by, deleted_at, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 CASE WHEN ?7 = 1
+                      THEN CASE WHEN EXISTS (SELECT 1 FROM entries WHERE folder_id = ?1 AND path = ?2 AND deleted = 1)
+                                THEN (SELECT deleted_at FROM entries WHERE folder_id = ?1 AND path = ?2)
+                                ELSE (SELECT strftime('%s','now'))
+                           END
+                      ELSE 0 END,
+                 ?10)
          ON CONFLICT(folder_id, path) DO UPDATE SET
             size = ?3, mtime = ?4, hash = ?5, is_dir = ?6,
-            deleted = ?7, version_json = ?8, modified_by = ?9",
+            deleted = ?7, version_json = ?8, modified_by = ?9, mode = ?10,
+            deleted_at = CASE WHEN ?7 = 1
+                              THEN CASE WHEN entries.deleted = 1 THEN entries.deleted_at
+                                        ELSE (SELECT strftime('%s','now'))
+                                   END
+                              ELSE 0 END",
         rusqlite::params![
             folder_id,
             e.path,
@@ -619,7 +695,8 @@ fn insert_entry(conn: &Connection, folder_id: &str, e: &FileEntry) -> Result<()>
             e.is_dir as i64,
             e.deleted as i64,
             version_json,
-            e.modified_by
+            e.modified_by,
+            e.mode
         ],
     )?;
     Ok(())
@@ -638,6 +715,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> std::result::Result<FileEntry, rusqlit
         deleted: r.get::<_, i64>(5)? != 0,
         version,
         modified_by: r.get(7)?,
+        mode: r.get::<_, i64>(10).unwrap_or(0) as u32,
     })
 }
 
@@ -743,6 +821,112 @@ mod tests {
         let got = s.list_entries("f1").unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, "b.txt");
+    }
+
+    /// 文件树前缀查询：只取该层直接子项，不混入深层、不混入墓碑、不混入其他文件夹。
+    #[test]
+    fn list_entries_under_returns_direct_children_only() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_entries(
+            "f1",
+            &[
+                sample_entry("top.txt", "A"),
+                sample_entry("docs", "A"),
+                sample_entry("docs/readme.md", "A"),
+                sample_entry("docs/sub/deep.txt", "A"),
+                sample_entry("docs2/other.txt", "A"),
+            ],
+        )
+        .unwrap();
+        // 墓碑不出现在树里
+        let mut t = sample_entry("gone.txt", "A");
+        t.deleted = true;
+        s.upsert_entry("f1", &t).unwrap();
+        // 其他文件夹不串
+        s.replace_entries("f2", &[sample_entry("docs/alien.txt", "A")])
+            .unwrap();
+
+        let top = s.list_entries_under("f1", "").unwrap();
+        let mut names: Vec<&str> = top.iter().map(|e| e.path.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["docs", "top.txt"], "顶层不应含 docs2/deep/gone");
+
+        let docs = s.list_entries_under("f1", "docs").unwrap();
+        let mut names: Vec<&str> = docs.iter().map(|e| e.path.as_str()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["docs/readme.md"],
+            "docs 层只有直接子项，不含 sub/deep 与 docs2"
+        );
+    }
+
+    /// 墓碑的 deleted_at 必须记录删除时间，且墓碑版本刷新（递增重广播）不能把它洗掉。
+    /// 以前 GC 按文件 mtime 过期：删一个 31 天未动的文件，墓碑 10 分钟内被清，
+    /// 对端离线回来后文件复活。现在 GC 按 deleted_at。
+    #[test]
+    fn tombstone_records_delete_time_and_survives_resurrection_updates() {
+        let s = Store::open_in_memory().unwrap();
+
+        // 新墓碑：deleted_at ≈ now
+        let mut t = sample_entry("old.txt", "A");
+        t.deleted = true;
+        s.upsert_entry("f1", &t).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expired_fresh = s.list_expired_tombstones("f1", now - 60).unwrap();
+        assert!(
+            expired_fresh.is_empty(),
+            "刚删除的墓碑 60 秒内不应过期: {expired_fresh:?}"
+        );
+
+        // 墓碑版本刷新（对端确认时递增重广播）：deleted_at 必须保留
+        t.version.increment("A");
+        s.upsert_entry("f1", &t).unwrap();
+        let still_fresh = s.list_expired_tombstones("f1", now - 60).unwrap();
+        assert!(still_fresh.is_empty(), "墓碑刷新不能把 deleted_at 洗掉");
+
+        // 复活（同名新文件）：deleted_at 清 0，不再出现在过期列表
+        let revived = sample_entry("old.txt", "A");
+        s.upsert_entry("f1", &revived).unwrap();
+        assert!(
+            s.list_expired_tombstones("f1", now + 86400 * 365)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 再次删除后，大 cutoff 应过期
+        let mut t2 = sample_entry("old.txt", "A");
+        t2.deleted = true;
+        s.upsert_entry("f1", &t2).unwrap();
+        let expired = s.list_expired_tombstones("f1", now + 86400 * 365).unwrap();
+        assert_eq!(expired, vec!["old.txt".to_string()]);
+    }
+
+    /// 旧版库（无 deleted_at 列）升级后：旧墓碑 deleted_at=0，永不过期（保守），
+    /// 待下一次墓碑刷新补上时间戳。
+    #[test]
+    fn legacy_tombstone_without_deleted_at_never_expires() {
+        let s = Store::open_in_memory().unwrap();
+        let mut t = sample_entry("legacy.txt", "A");
+        t.deleted = true;
+        s.upsert_entry("f1", &t).unwrap();
+        // 直接把 deleted_at 改成 0，模拟旧版数据
+        s.lock()
+            .execute(
+                "UPDATE entries SET deleted_at = 0 WHERE path = 'legacy.txt'",
+                [],
+            )
+            .unwrap();
+        let far_future = i64::MAX / 2;
+        assert!(
+            s.list_expired_tombstones("f1", far_future)
+                .unwrap()
+                .is_empty(),
+            "deleted_at=0 的旧墓碑必须保守不过期"
+        );
     }
 
     #[test]

@@ -563,13 +563,15 @@ async fn random_operation_sequence_converges() {
         }
     }
 
-    // 收尾：真实产品每 10 分钟做一次兜底全量扫描，把「绕过应用改的文件」
-    // 和「watcher 漏掉的事件」重新纳入索引。这里显式跑同样的流程，
-    // 顺带验证 full_scan 确实能修正磁盘与索引的偏差。
+    // 收尾：真实产品每 10 分钟做一次兜底快扫（复用 hash）、每 6 小时一次深扫
+    // （全量重哈希），把「绕过应用改的文件」和「watcher 漏掉的事件」重新纳入索引。
+    // 这里显式跑同样的流程（快扫 + 深扫），顺带验证两者确实能修正磁盘与索引的偏差。
     // 顺序很重要：先各自扫描修正索引，再同步，最后再同步一轮把上一步的修正传播出去。
     for _ in 0..4 {
         let _ = a.runtime.session.full_scan().await.unwrap();
         let _ = b.runtime.session.full_scan().await.unwrap();
+        let _ = a.runtime.session.deep_scan().await.unwrap();
+        let _ = b.runtime.session.deep_scan().await.unwrap();
         sync_both(&a, &b).await.unwrap();
         sync_both(&a, &b).await.unwrap();
     }
@@ -627,20 +629,33 @@ async fn full_scan_registers_blob_content() {
     );
 }
 
-/// 回归：同大小同 mtime 但内容不同，兜底扫描必须能发现。
+/// 回归：同大小同 mtime 但内容不同，变更最终必须被发现并进入索引。
+///
+/// 发现路径有三条，任意一条到达即可（真实产品三条都在跑）：
+/// - watcher 事件（防抖后哈希，quiescence 等写入稳定）；
+/// - 快扫（full_scan，10 分钟一次，mtime/size 变化时重哈希）；
+/// - 深扫（deep_scan，6 小时一次，全量重哈希，抓等长同秒写入）。
 #[tokio::test]
 async fn full_scan_detects_content_change_with_same_size_and_mtime() {
     let a = node("A").await;
 
     write(&a, "same.txt", b"AAAA").await;
     let _ = a.runtime.session.full_scan().await.unwrap();
+    let h1 = a.runtime.session.snapshot().await["same.txt"].hash.clone();
 
-    // 等一帧确保时间推进不会碰巧帮忙；直接按同尺寸覆盖
+    // 同尺寸同秒覆盖（mtime 秒精度不变，快扫复用 hash 会漏）
     std::fs::write(a.root().join("same.txt"), b"BBBB").unwrap();
 
-    let changed = a.runtime.session.full_scan().await.unwrap();
-    assert!(
-        changed.iter().any(|e| e.path == "same.txt"),
-        "等长内容变更必须被发现（不能只比 size/mtime）"
+    // 显式跑快扫 + 深扫；watcher 事件也在后台并行处理
+    let _ = a.runtime.session.full_scan().await.unwrap();
+    let _ = a.runtime.session.deep_scan().await.unwrap();
+
+    // 最终索引里的 hash 必须反映新内容（blake3(b"BBBB")）
+    let h2 = fs_sync_core::hash_file(&a.root().join("same.txt")).unwrap();
+    assert_ne!(h1, h2, "前置：两次内容不同");
+    let got = a.runtime.session.snapshot().await["same.txt"].hash.clone();
+    assert_eq!(
+        got, h2,
+        "等长同秒写入必须最终进入索引（watcher/快扫/深扫任一路径）"
     );
 }

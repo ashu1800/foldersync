@@ -13,6 +13,9 @@ use fs_sync_core::FileEntry;
 /// 当前协议版本。
 pub const PROTOCOL_VERSION: u16 = 3;
 
+/// 兼容旧版客户端的协议版本（0.2.5 及更早）。v3 新增 IndexChunk，但 v2 握手仍可用。
+pub const LEGACY_PROTOCOL_VERSION: u16 = 2;
+
 /// 文件夹摘要（Hello 中交换）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderSummary {
@@ -79,7 +82,7 @@ pub struct FolderInviteResponse {
     pub folder_id: String,
     pub accepted: bool,
     /// 拒绝原因（供邀请方展示；旧版本对端不填）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
 
@@ -159,6 +162,24 @@ mod tests {
     use fs_sync_core::VersionVector;
 
     #[test]
+    fn legacy_folder_response_decodes_without_reason() {
+        #[derive(Deserialize)]
+        struct LegacyFolderInviteResponse {
+            folder_id: String,
+            accepted: bool,
+        }
+        let bytes = postcard::to_stdvec(&FolderInviteResponse {
+            folder_id: "f1".into(),
+            accepted: false,
+            reason: None,
+        })
+        .unwrap();
+        let old: LegacyFolderInviteResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(old.folder_id, "f1");
+        assert!(!old.accepted);
+    }
+
+    #[test]
     fn roundtrip_all_variants() {
         let mut vv = VersionVector::new();
         vv.increment("dev-a");
@@ -171,6 +192,8 @@ mod tests {
             deleted: false,
             version: vv,
             modified_by: "dev-a".into(),
+            // mode 不上 wire（skip）：wire 解码回来恒为 0
+            mode: 0,
         }];
         let peer = PeerInfo {
             device_id: "SHA256:abc".into(),
@@ -242,5 +265,47 @@ mod tests {
     #[test]
     fn decode_rejects_short() {
         assert!(decode_frame(&[0, 0]).is_err());
+    }
+
+    /// 协议兼容性证明：wire 上不含 mode 字段。
+    /// 用旧版（无 mode 字段）的 struct 定义反序列化新编码的消息必须成功；
+    /// 反过来也一样。P3-9 曾因漏 skip 导致 v2/v3 全部不兼容。
+    #[test]
+    fn wire_format_is_backward_compatible_without_mode() {
+        // 模拟旧版本的 FileEntry（没有 mode 字段）
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct LegacyEntry {
+            path: String,
+            size: u64,
+            mtime: i64,
+            hash: String,
+            is_dir: bool,
+            deleted: bool,
+            version: VersionVector,
+            modified_by: String,
+        }
+        let mut vv = VersionVector::new();
+        vv.increment("dev-a");
+        let legacy = LegacyEntry {
+            path: "a.txt".into(),
+            size: 5,
+            mtime: 100,
+            hash: "ab".repeat(32),
+            is_dir: false,
+            deleted: false,
+            version: vv.clone(),
+            modified_by: "dev-a".into(),
+        };
+        // 旧 → 新
+        let wire = postcard::to_stdvec(&legacy).unwrap();
+        let modern: FileEntry = postcard::from_bytes(&wire).unwrap();
+        assert_eq!(modern.path, "a.txt");
+        assert_eq!(modern.mode, 0);
+        // 新 → 旧
+        let mut modern_full = modern;
+        modern_full.mode = 0o644;
+        let wire2 = postcard::to_stdvec(&modern_full).unwrap();
+        let legacy2: LegacyEntry = postcard::from_bytes(&wire2).unwrap();
+        assert_eq!(legacy2, legacy);
     }
 }

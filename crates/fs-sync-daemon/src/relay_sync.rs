@@ -33,10 +33,25 @@ struct RelayIndex {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayFolder {
     folder_id: String,
-    /// 共享文件夹名；旧版本索引没有该字段，按空处理（不自动建目录）
+    /// 共享文件夹名；旧版本索引没有该字段时回退为按 folder_id 生成的安全名称
     #[serde(default)]
     folder_name: String,
     entries: Vec<FileEntry>,
+}
+
+/// 解析中继地址列表：支持逗号分隔多个（`tcp://a:9443,tcp://b:9443`），
+/// 按序尝试做故障转移。设置里只填一个时行为不变。
+fn relay_url_candidates(cfg: &PeerLoopConfig, peer: &Device) -> Vec<String> {
+    let primary = cfg.relay_url.clone().or_else(|| peer.relay_url.clone());
+    match primary {
+        Some(url) => url
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// 中继同步主循环。断线立即返回，由上层监督任务退避重连。
@@ -45,19 +60,42 @@ pub async fn relay_sync_round(
     peer: &Device,
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
 ) -> Result<()> {
-    let relay_url = cfg
-        .relay_url
-        .clone()
-        .or_else(|| peer.relay_url.clone())
-        .context("没有配置中继服务器地址")?;
     let room = peer.relay_room.clone().context("没有中继房间信息")?;
     let secret = peer.relay_secret.clone().context("没有中继房间口令")?;
+    let candidates = relay_url_candidates(cfg, peer);
+    anyhow::ensure!(!candidates.is_empty(), "没有配置中继服务器地址");
 
-    let relay = Arc::new(Mutex::new(
-        RelaySftp::connect(&relay_url, &room, &secret, None)
-            .await
-            .context("连接中继失败")?,
-    ));
+    // 按序尝试所有中继地址：第一个成功者优先，坏了自动切下一个（故障转移）。
+    // host key 固定校验按地址分别记录（每个中继一份 TOFU）。
+    let mut last_err = None;
+    let mut connected: Option<(String, Arc<Mutex<RelaySftp>>)> = None;
+    for relay_url in &candidates {
+        let expected = cfg.relay_host_keys.get(relay_url);
+        match RelaySftp::connect(relay_url, &room, &secret, expected.as_deref()).await {
+            Ok(relay) => {
+                let actual = relay.host_key().to_string();
+                if expected.as_deref() != Some(actual.as_str()) {
+                    cfg.relay_host_keys.set(relay_url, &actual);
+                    if expected.is_some() {
+                        warn!(relay = %relay_url, "中继 host key 已变化，已更新固定记录");
+                    } else {
+                        info!(relay = %relay_url, "已固定中继 host key（TOFU 首连）");
+                    }
+                }
+                connected = Some((relay_url.clone(), Arc::new(Mutex::new(relay))));
+                break;
+            }
+            Err(e) => {
+                warn!(relay = %relay_url, "连接中继失败，尝试下一个: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    let (relay_url, relay) = connected.with_context(|| {
+        last_err
+            .map(|e| e.context("所有中继地址均连接失败"))
+            .unwrap()
+    })?;
     info!(peer = %peer.name, relay = %relay_url, "中继同步会话已建立");
     for rt in crate::runtime::all_runtimes(runtimes) {
         if rt.shared_with_peer(&peer.id)
@@ -74,13 +112,58 @@ pub async fn relay_sync_round(
     let peer_index_path = format!("devices/{}/index.json", device_dir(&peer.id));
     let mut last_uploaded = String::new();
     let mut last_applied = String::new();
-    // 已确认存在于中继的 blob：避免每轮对每个文件做一次 SFTP stat
-    let mut uploaded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 已确认存在于中继的 blob：跨重连保留（进程级共享，按中继地址分键），
+    // 重连后不再对每个文件做 SFTP exists()。本地会话集合作"本轮有疑问的"暂存。
+    let mut uploaded: std::collections::HashSet<String> = cfg
+        .relay_uploaded_blobs
+        .as_ref()
+        .and_then(|m| m.lock().ok()?.get(&relay_url).cloned())
+        .unwrap_or_default();
     let mut last_peer_stamp: Option<(u64, std::time::SystemTime)> = None;
+    // 各文件夹索引版本号快照：版本没变就跳过本轮的 snapshot + 序列化 +
+    // 全量上传。10 万文件的文件夹每秒全量重建是不可接受的。
+    let mut last_index_versions: HashMap<String, u64> = HashMap::new();
 
     loop {
         // 1. 生成本机索引并上传缺失的 blob（先内容后索引，避免对端读到索引却拉不到内容）
-        let my_index = build_index(cfg, runtimes, &peer.id).await;
+        // 快速路径：所有共享文件夹的索引版本都没变 → 跳过重建与上传，
+        // 直接进入对端索引检查。新落盘的 blob 由对端按 hash 自行从
+        // 「拉取失败重试」兜住（我们的索引里 hash 已存在）。
+        let index_unchanged = {
+            let rts = crate::runtime::all_runtimes(runtimes);
+            !last_uploaded.is_empty()
+                && rts
+                    .iter()
+                    .filter(|rt| rt.shared_with_peer(&peer.id))
+                    .all(|rt| {
+                        last_index_versions.get(&rt.session.folder_id)
+                            == Some(&rt.session.index_version())
+                    })
+        };
+        if index_unchanged {
+            // 仍要看对端索引有没有变（对端可能推送了变更）
+            let peer_stamp = relay.lock().await.stamp(&peer_index_path).await;
+            if peer_stamp == last_peer_stamp {
+                let entries = last_uploaded.matches("\"path\"").count();
+                let interval = if entries > 5000 { 5 } else { 1 };
+                debug!(peer = %peer.name, "中继轮询（索引无变化，跳过重建）");
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                continue;
+            }
+            // 对端变了：走完整轮（不重建我们的索引也无妨，但逻辑简单起见重建）
+            last_uploaded.clear();
+        }
+        let my_index = {
+            let idx = build_index(cfg, runtimes, &peer.id).await;
+            let rts = crate::runtime::all_runtimes(runtimes);
+            for rt in rts {
+                if rt.shared_with_peer(&peer.id) {
+                    last_index_versions
+                        .insert(rt.session.folder_id.clone(), rt.session.index_version());
+                }
+            }
+            idx
+        };
         let my_json = serde_json::to_string(&my_index)?;
         for folder in &my_index.folders {
             for entry in folder.entries.iter().filter(|e| !e.is_dir && !e.deleted) {
@@ -220,8 +303,15 @@ pub async fn relay_sync_round(
                                         "已应用中继增量"
                                     );
                                 }
+                                // 有失败时**不**记录 last_applied：下轮 stamp 比较即使
+                                // 相同，text != last_applied 仍成立，会重新 diff——
+                                // 已成功的文件 diff 判无变化直接跳过，只重拉失败的。
+                                // 之前无条件记录，对端索引不变时失败文件永远不重试，
+                                // 与活动日志里"将自动重试"的承诺自相矛盾。
+                                if stats.failed == 0 {
+                                    last_applied = text.clone();
+                                }
                             }
-                            last_applied = text;
                         }
                     }
                     Err(e) => warn!(peer = %peer.name, "解析对端索引失败: {e}"),
@@ -230,6 +320,12 @@ pub async fn relay_sync_round(
         }
 
         debug!(peer = %peer.name, "中继同步轮询");
+        // 写回进程级已上传缓存：下轮重连不用重新 stat
+        if let Some(shared) = &cfg.relay_uploaded_blobs
+            && let Ok(mut map) = shared.lock()
+        {
+            map.insert(relay_url.clone(), uploaded.clone());
+        }
         // 大文件夹降低轮询频率：每轮仍要序列化全量索引（分页协议前的上限）
         let entries: usize = my_index.folders.iter().map(|f| f.entries.len()).sum();
         let interval = if entries > 5000 { 5 } else { 1 };
@@ -249,7 +345,11 @@ async fn build_index(
         if !rt.shared_with_peer(peer_id) {
             continue;
         }
-        let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
+        // **必须排序**：HashMap 遍历顺序不稳定（RandomState），不排序的话
+        // 同一份索引每秒序列化出的 JSON 字节序都不同——"索引变了"的字符串
+        // 比较恒真，两端都会每轮重传/重算全量 diff。排序后字节级确定。
+        let mut entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         folders.push(RelayFolder {
             folder_id: rt.session.folder_id.clone(),
             folder_name: rt
@@ -270,6 +370,24 @@ async fn build_index(
     }
 }
 
+/// 旧版中继索引没有 `folder_name`，用 folder_id 尾部生成稳定、安全的显示名。
+fn fallback_folder_name(folder_id: &str) -> String {
+    let suffix: String = folder_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if suffix.is_empty() {
+        "共享文件夹".to_string()
+    } else {
+        format!("共享文件夹-{suffix}")
+    }
+}
+
 /// 中继索引里出现本机没有的文件夹时，按邀请自动创建（仅新建空目录，绝不覆盖已有内容）。
 async fn ensure_peer_folder(
     cfg: &PeerLoopConfig,
@@ -280,8 +398,12 @@ async fn ensure_peer_folder(
     if find_runtime(runtimes, &folder.folder_id).is_some() {
         return true;
     }
-    let name = folder.folder_name.trim();
-    if !crate::ssh_server::is_safe_folder_name(name) {
+    let name = if folder.folder_name.trim().is_empty() {
+        fallback_folder_name(&folder.folder_id)
+    } else {
+        folder.folder_name.trim().to_string()
+    };
+    if !crate::ssh_server::is_safe_folder_name(&name) {
         warn!(peer = %peer.name, folder = %folder.folder_id, "拒绝非法中继共享文件夹名");
         return false;
     }
@@ -300,7 +422,7 @@ async fn ensure_peer_folder(
         // 已存在但 runtime 没起来，通常是用户暂停了：不自动恢复。
         return false;
     }
-    let target = cfg.sync_root.join(name);
+    let target = cfg.sync_root.join(&name);
     if existing.iter().any(|f| f.local_path == target) {
         warn!(path = %target.display(), "中继邀请路径已被其他文件夹占用");
         return false;
@@ -402,7 +524,7 @@ async fn ensure_peer_folder(
         "",
         &format!("已接受来自「{}」的共享文件夹（中继）", peer.name),
     );
-    info!(peer = %peer.name, folder = %folder.folder_name, "已接受中继共享文件夹");
+    info!(peer = %peer.name, folder = %name, "已接受中继共享文件夹");
     true
 }
 
@@ -513,6 +635,8 @@ async fn pull_blob(
             .with_context(|| format!("从中继拉取 blob 失败: {hash}"))?;
     }
     store.adopt_downloaded(&tmp, hash).await.inspect_err(|_| {
+        // 校验失败说明续传基础已坏：删掉临时文件，下次从 0 开始。
+        // 传输中途失败时 tmp 保留，下一轮 pull_blob 从断点续传。
         let _ = std::fs::remove_file(&tmp);
     })?;
     Ok(())
@@ -536,6 +660,8 @@ mod tests {
             ssh_port: 2222,
             mode: fs_sync_net::conn::NetworkMode::Relay,
             relay_url: None,
+            relay_host_keys: crate::runtime::test_relay_host_keys(),
+            relay_uploaded_blobs: None,
             store: store.clone(),
             blobs,
             sync_root: data.join("FolderSync"),
@@ -569,6 +695,29 @@ mod tests {
         // 第二轮不应重复创建
         assert!(ensure_peer_folder(&cfg, &peer, &folder, &runtimes).await);
         assert_eq!(store.list_folders().unwrap().len(), 1);
+
+        // 旧版索引没有 folder_name：按 folder_id 生成安全回退名
+        let legacy = RelayFolder {
+            folder_id: "folder-legacy".into(),
+            folder_name: String::new(),
+            entries: Vec::new(),
+        };
+        assert!(ensure_peer_folder(&cfg, &peer, &legacy, &runtimes).await);
+        let folders = store.list_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert!(folders.iter().any(|f| {
+            f.local_path
+                == data
+                    .join("FolderSync")
+                    .join(fallback_folder_name("folder-legacy"))
+        }));
+    }
+
+    #[test]
+    fn old_index_without_folder_name_gets_safe_fallback() {
+        let name = fallback_folder_name("folder-abcd/ef12");
+        assert_eq!(name, "共享文件夹-bcdef12");
+        assert!(crate::ssh_server::is_safe_folder_name(&name));
     }
 
     #[test]

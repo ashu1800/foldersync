@@ -18,6 +18,10 @@ enum HandleState {
     Dir(Vec<File>),
 }
 
+/// 带宽结算回调：参数为本批字节数，等待直到配额允许。
+pub type BandwidthFn =
+    std::sync::Arc<dyn Fn(u64) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 /// 沙箱 SFTP 处理器。
 pub struct FsSftpHandler {
     root: PathBuf,
@@ -25,6 +29,13 @@ pub struct FsSftpHandler {
     next_handle: u64,
     /// 每次操作前的访问检查（设备取消配对后立即拒绝）
     access: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// 下载（read 出去的字节）结算；None = 不限速
+    download_throttle: Option<BandwidthFn>,
+    /// 上传（write 进来的字节）结算；None = 不限速
+    upload_throttle: Option<BandwidthFn>,
+    /// 写前配额检查：返回 false 拒绝写入（磁盘超限）。None = 不限制。
+    /// 中继用软配额：每次 write 前查一次（调用方自行权衡成本）。
+    quota_check: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl FsSftpHandler {
@@ -45,7 +56,39 @@ impl FsSftpHandler {
             handles: HashMap::new(),
             next_handle: 1,
             access,
+            download_throttle: None,
+            upload_throttle: None,
+            quota_check: None,
         })
+    }
+
+    /// 注入带宽结算（read = 对端下载我们的内容，write = 对端上传内容进来）。
+    pub fn with_bandwidth(
+        mut self,
+        download: Option<BandwidthFn>,
+        upload: Option<BandwidthFn>,
+    ) -> Self {
+        self.download_throttle = download;
+        self.upload_throttle = upload;
+        self
+    }
+
+    /// 注入写前配额检查：返回 false 时 write/open-truncate 被拒绝。
+    pub fn with_quota_check(mut self, check: Box<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.quota_check = Some(check);
+        self
+    }
+
+    async fn settle_download(&self, bytes: u64) {
+        if let Some(f) = &self.download_throttle {
+            f(bytes).await;
+        }
+    }
+
+    async fn settle_upload(&self, bytes: u64) {
+        if let Some(f) = &self.upload_throttle {
+            f(bytes).await;
+        }
     }
 
     fn resolve(&self, path: &str) -> Result<PathBuf, StatusReply> {
@@ -179,6 +222,8 @@ impl Handler for FsSftpHandler {
             return Err(StatusReply::new(StatusCode::Eof));
         }
         buf.truncate(n);
+        // 下载带宽结算（对端从我们这里读走的字节）
+        self.settle_download(n as u64).await;
         Ok(Data { id, data: buf })
     }
 
@@ -190,6 +235,14 @@ impl Handler for FsSftpHandler {
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
         self.check_access()?;
+        // 写前配额检查：超限拒绝（软配额，检查成本由调用方权衡）
+        if let Some(check) = &self.quota_check
+            && !check()
+        {
+            return Err(StatusReply::new(StatusCode::Failure).with_message("磁盘配额已满"));
+        }
+        // 先结算带宽（对端写进我们文件系统的字节），再借文件句柄写盘
+        self.settle_upload(data.len() as u64).await;
         let Some(HandleState::File(file)) = self.handles.get_mut(&handle) else {
             return Err(StatusReply::new(StatusCode::Failure).with_message("句柄无效"));
         };

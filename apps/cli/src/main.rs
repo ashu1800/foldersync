@@ -55,9 +55,28 @@ enum Cmd {
     /// 用配对码完成配对
     Join { code: String },
     /// 显示本机身份、Tailscale 状态与信任列表
-    Status,
+    Status {
+        /// 以 JSON 输出（脚本/监控用）
+        #[arg(long)]
+        json: bool,
+    },
     /// 单向推送一个文件夹到指定设备（调试）
     Sync { path: String, peer: String },
+    /// 列出冲突副本（默认全部文件夹）
+    Conflicts {
+        /// 只看某个文件夹名
+        #[arg(long = "folder", short = 'f')]
+        folder: Option<String>,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+        /// 保留某个副本：`keep=conflict|original`（配合 --path）
+        #[arg(long)]
+        keep: Option<String>,
+        /// 要解决的冲突副本路径（配合 --keep）
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 fn default_data_dir() -> PathBuf {
@@ -87,6 +106,33 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "foldersync-cli".into())
+}
+
+/// CLI 的中继 host key 固定表：存 `<data_dir>/relay_host_keys.json`（url → 公钥行）。
+/// 与桌面端 settings.json 各自独立，互不影响。
+fn cli_relay_host_keys(
+    data_dir: &std::path::Path,
+) -> std::sync::Arc<fs_sync_daemon::runtime::RelayHostKeys> {
+    use std::sync::Arc;
+    let path = Arc::new(data_dir.join("relay_host_keys.json"));
+    let path_for_get = path.clone();
+    let get = Arc::new(move |url: &str| {
+        let text = std::fs::read_to_string(&*path_for_get).ok()?;
+        let map: std::collections::HashMap<String, String> = serde_json::from_str(&text).ok()?;
+        map.get(url).cloned()
+    });
+    let set = Arc::new(move |url: &str, key: &str| {
+        let current: std::collections::HashMap<String, String> = std::fs::read_to_string(&*path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let mut map = current;
+        map.insert(url.to_string(), key.to_string());
+        if let Ok(json) = serde_json::to_string_pretty(&map) {
+            let _ = std::fs::write(&*path, json);
+        }
+    });
+    Arc::new(fs_sync_daemon::runtime::RelayHostKeys::new(get, set))
 }
 
 /// 把设置里的全局默认忽略规则追加到文件夹 `.syncignore`（不覆盖已有内容）。
@@ -208,8 +254,14 @@ async fn main() -> Result<()> {
         } => serve(&cli, auto_confirm, folders).await,
         Cmd::Pair => pair(&cli).await,
         Cmd::Join { code } => join(&cli, code).await,
-        Cmd::Status => status(&cli).await,
+        Cmd::Status { json } => status(&cli, json).await,
         Cmd::Sync { path, peer } => sync_once(&cli, path, peer).await,
+        Cmd::Conflicts {
+            folder,
+            json,
+            keep,
+            path,
+        } => conflicts(&cli, folder, json, keep, path).await,
     }
 }
 
@@ -238,6 +290,8 @@ async fn start_sync_server(
         paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         runtimes,
         online: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        relay_host_keys: cli_relay_host_keys(&ctx.data_dir),
+        sftp_bandwidth: None,
     });
     let server = run_ssh_server(shared).await?;
     ctx.pairing.set_ssh_port(server.port);
@@ -246,6 +300,8 @@ async fn start_sync_server(
 
 async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()> {
     let ctx = build_context(cli).await?;
+    // 活动表只保留最近 2 万条（与桌面端一致），长期 serve 不至于无限膨胀
+    let _ = ctx.store.prune_activity(20_000);
     let runtimes: Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     for folder in folders {
@@ -302,6 +358,8 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
         ssh_port: actual_port,
         mode: ctx.network_mode,
         relay_url: ctx.relay.clone(),
+        relay_host_keys: cli_relay_host_keys(&ctx.data_dir),
+        relay_uploaded_blobs: Some(Arc::new(std::sync::Mutex::new(Default::default()))),
         store: ctx.store.clone(),
         blobs: ctx.blobs.clone(),
         sync_root: std::env::var_os("USERPROFILE")
@@ -410,9 +468,38 @@ async fn join(cli: &Cli, code_text: String) -> Result<()> {
     Ok(())
 }
 
-async fn status(cli: &Cli) -> Result<()> {
+async fn status(cli: &Cli, json: bool) -> Result<()> {
     let ctx = build_context(cli).await?;
     let ts = tailscale::detect();
+    if json {
+        let devices: Vec<_> = ctx
+            .trust
+            .devices()?
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": d.id,
+                    "name": d.name,
+                    "addresses": d.addresses,
+                    "port": d.port,
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "device_name": hostname(),
+            "device_id": ctx.identity.id(),
+            "fingerprint": fingerprint_text(&ctx.identity.id()),
+            "tailscale": {
+                "installed": ts.installed,
+                "running": ts.running,
+                "ips": ts.ips,
+            },
+            "relay": ctx.relay,
+            "devices": devices,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
     println!("设备名: {}", hostname());
     println!("设备 ID: {}", ctx.identity.id());
     println!("指纹: {}", fingerprint_text(&ctx.identity.id()));
@@ -438,10 +525,184 @@ async fn status(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// 一条冲突副本信息（CLI 展示用）。
+struct ConflictRow {
+    folder: String,
+    folder_path: String,
+    path: String,
+    original_path: String,
+    size: i64,
+    mtime: i64,
+    device: String,
+}
+
+/// 扫描全部（或指定）文件夹的冲突副本。与桌面端同规则：
+/// 索引里有 `.sync-conflict-`、非墓碑、磁盘上仍存在。
+fn scan_conflicts(ctx: &Context2, want: Option<&str>) -> Result<Vec<ConflictRow>> {
+    let mut rows = Vec::new();
+    for f in ctx.store.list_folders()? {
+        if let Some(w) = want
+            && f.id != w
+            && f.name != w
+        {
+            continue;
+        }
+        for e in ctx
+            .store
+            .list_entries(&f.id)?
+            .into_iter()
+            .filter(|e| !e.deleted && e.path.contains(".sync-conflict-"))
+            .filter(|e| f.local_path.join(&e.path).is_file())
+        {
+            let name = e.path.rsplit('/').next().unwrap_or(&e.path);
+            let (original_name, device) = fs_sync_core::parse_conflict_name(name);
+            let original_path = match e.path.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{original_name}"),
+                None => original_name.clone(),
+            };
+            rows.push(ConflictRow {
+                folder: f.name.clone(),
+                folder_path: f.local_path.display().to_string(),
+                path: e.path.clone(),
+                original_path,
+                size: e.size as i64,
+                mtime: e.mtime,
+                device,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+async fn conflicts(
+    cli: &Cli,
+    folder: Option<String>,
+    json: bool,
+    keep: Option<String>,
+    path: Option<String>,
+) -> Result<()> {
+    let ctx = build_context(cli).await?;
+    // 解决模式：--keep conflict|original --path <冲突副本路径>
+    if let (Some(keep), Some(conflict_path)) = (keep, path) {
+        let mode = keep.as_str();
+        anyhow::ensure!(
+            mode == "conflict" || mode == "original",
+            "--keep 只接受 conflict 或 original"
+        );
+        // 找到副本所在的文件夹
+        let mut target = None;
+        for f in ctx.store.list_folders()? {
+            if ctx
+                .store
+                .list_entries(&f.id)?
+                .iter()
+                .any(|e| e.path == conflict_path)
+            {
+                target = Some(f);
+                break;
+            }
+        }
+        let f = target.context("找不到该冲突副本（检查路径与文件夹）")?;
+        let conflict_abs = f.local_path.join(&conflict_path);
+        let name = conflict_path.rsplit('/').next().unwrap_or(&conflict_path);
+        let (original_name, _) = fs_sync_core::parse_conflict_name(name);
+        let original_path = match conflict_path.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{original_name}"),
+            None => original_name.clone(),
+        };
+        let original_abs = f.local_path.join(&original_path);
+        match mode {
+            "conflict" => {
+                // 副本顶掉原文件：副本改名回原名（原文件先删）
+                if original_abs.exists() {
+                    std::fs::remove_file(&original_abs)
+                        .with_context(|| format!("删除原文件失败: {}", original_abs.display()))?;
+                }
+                std::fs::rename(&conflict_abs, &original_abs)
+                    .with_context(|| format!("改名失败: {}", conflict_abs.display()))?;
+                // 索引：原路径复活、副本变墓碑（引擎下次全量交换时同步到对端）
+                let mut e = ctx
+                    .store
+                    .list_entries(&f.id)?
+                    .into_iter()
+                    .find(|e| e.path == conflict_path)
+                    .context("索引里没有该副本")?;
+                let new_hash = fs_sync_core::hash_file(&original_abs)?;
+                let meta = std::fs::metadata(&original_abs)?;
+                e.path = original_path.clone();
+                e.hash = new_hash;
+                e.size = meta.len() as u64;
+                e.mtime = meta
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs() as i64;
+                e.deleted = false;
+                ctx.store.upsert_entry(&f.id, &e)?;
+                let mut tomb = e;
+                tomb.path = conflict_path.clone();
+                tomb.deleted = true;
+                ctx.store.upsert_entry(&f.id, &tomb)?;
+                println!("已保留副本，原路径更新为副本内容");
+            }
+            "original" => {
+                std::fs::remove_file(&conflict_abs)
+                    .with_context(|| format!("删除副本失败: {}", conflict_abs.display()))?;
+                let mut e = ctx
+                    .store
+                    .list_entries(&f.id)?
+                    .into_iter()
+                    .find(|e| e.path == conflict_path)
+                    .context("索引里没有该副本")?;
+                e.deleted = true;
+                ctx.store.upsert_entry(&f.id, &e)?;
+                println!("已删除副本，保留原文件");
+            }
+            _ => unreachable!(),
+        }
+        println!(
+            "注意：若 `serve` 正在运行，其内存索引与本命令的改动会在下一次全量交换时对齐；建议处理完冲突后重启 serve。"
+        );
+        return Ok(());
+    }
+
+    let rows = scan_conflicts(&ctx, folder.as_deref())?;
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "folder": r.folder,
+                    "folder_path": r.folder_path,
+                    "conflict_path": r.path,
+                    "original_path": r.original_path,
+                    "size": r.size,
+                    "mtime": r.mtime,
+                    "device": r.device,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("没有冲突副本");
+        return Ok(());
+    }
+    for r in rows {
+        println!(
+            "[{}] {} ({} 字节, 设备: {})；原名: {}",
+            r.folder, r.path, r.size, r.device, r.original_path
+        );
+    }
+    println!("\n解决: foldersync conflicts --path <冲突路径> --keep conflict|original");
+    Ok(())
+}
+
 async fn sync_once(cli: &Cli, path: String, peer: String) -> Result<()> {
     let ctx = build_context(cli).await?;
     let device = ctx.trust.get(&peer)?.context("设备未配对（先 join）")?;
     let root = PathBuf::from(&path);
+    apply_default_ignore(&ctx.data_dir, &root)?;
     let folder_name = root
         .file_name()
         .context("同步路径没有文件夹名")?

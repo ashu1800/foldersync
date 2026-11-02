@@ -79,8 +79,9 @@ pub fn scan_and_index(
             continue;
         }
         // 读不了的路径：原样保留旧条目，读失败 ≠ 已删除
+        // 被跳过的路径（符号链接）：链接 ≠ 已删除，同样保留，绝不能产墓碑
         // 已有墓碑：原样保留，否则 replace_entries 会把它抹掉，对端就收不到删除
-        if old.deleted || scan.is_unreadable(path) {
+        if old.deleted || scan.is_unreadable(path) || scan.is_skipped(path) {
             out.insert(path.clone(), old.clone());
             continue;
         }
@@ -406,6 +407,34 @@ mod tests {
         std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
         let second = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
         assert!(second["a.txt"].deleted, "消失的文件应变成墓碑");
+    }
+
+    /// 回归：常规文件被替换成符号链接后，扫描把它归入 skipped（不同步链接），
+    /// 但"链接 ≠ 已删除"。以前它被当成消失的文件产墓碑，对端收到后会删掉
+    /// 自己那份真实文件。现在必须保留旧条目、绝不产墓碑。
+    #[test]
+    fn symlink_replacing_live_file_keeps_entry_without_tombstone() {
+        // 建符号链接在 Windows 需要开发者模式/管理员权限，仅在 unix 上真实创建链接；
+        // Windows 上模拟同等语义：skipped 列表里有该路径（由 is_skipped 单测覆盖匹配逻辑）。
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Store::open_in_memory().unwrap();
+            let first = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+            assert!(first.contains_key("a.txt"), "前置：文件已在索引");
+
+            // 用指向外部的 symlink 替换真实文件
+            let target = tmp.path().join("elsewhere.txt");
+            std::fs::write(&target, b"target").unwrap();
+            std::fs::remove_file(tmp.path().join("a.txt")).unwrap();
+            std::os::unix::fs::symlink(&target, tmp.path().join("a.txt")).unwrap();
+
+            let second = scan_and_index(tmp.path(), "f1", "devA", &store).unwrap();
+            let e = &second["a.txt"];
+            assert!(!e.deleted, "链接不能被当成删除，否则对端会删真实文件");
+            assert_eq!(e.hash, first["a.txt"].hash, "应保留旧条目内容");
+            assert_eq!(e.version, first["a.txt"].version, "不应递增版本");
+        }
     }
 
     /// 回归：墓碑必须跨扫描保留。曾经第二次扫描时墓碑没进 out，

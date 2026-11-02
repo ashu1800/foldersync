@@ -22,6 +22,14 @@ pub const DEFAULT_RULES: &[&str] = &[
     ".syncignore",
     // .git 默认忽略：两端同时写 .git 易损坏仓库，由 git 自己管理
     ".git/",
+    // Office/编辑器锁文件与下载中间态：同步它们会把"半成品版本"推给对端，
+    // 且 Office 保存过程中每按一次 Ctrl+S 就产生一次整文件重传。
+    "~$*",
+    "*.tmp",
+    "*.partial",
+    "*.crdownload",
+    "*.download",
+    ".~lock.*", // LibreOffice 锁文件
 ];
 
 /// 编译好的匹配器。不可变、可克隆、Send+Sync。
@@ -139,6 +147,22 @@ mod tests {
         assert!(m.matched(".git/HEAD", false));
         assert!(!m.matched("src/main.rs", false));
         assert!(!m.matched("node_modules_backup/x", false)); // 前缀相似但不同名
+    }
+
+    /// Office 锁文件与下载中间态必须默认忽略：同步半成品会把不完整版本
+    /// 推给对端，且 Office 每次保存都触发一次整文件重传。
+    #[test]
+    fn default_rules_ignore_office_lock_and_partial_files() {
+        let m = IgnoreMatcher::with_defaults(Path::new("/docs"));
+        assert!(m.matched("~$报告.docx", false), "Word 锁文件");
+        assert!(m.matched("sub/~$x.xlsx", false), "子目录里的 Word 锁文件");
+        assert!(m.matched(".~lock.report.ods#", false), "LibreOffice 锁文件");
+        assert!(m.matched("setup.tmp", false));
+        assert!(m.matched("movie.partial", false));
+        assert!(m.matched("ubuntu.iso.crdownload", false));
+        assert!(m.matched("big.download", false));
+        assert!(!m.matched("正常文档.docx", false), "正常文档不受影响");
+        assert!(!m.matched("my~rename.txt", false), "波浪号开头但不是锁文件");
     }
 
     #[test]

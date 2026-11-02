@@ -11,6 +11,7 @@ pub mod limits;
 pub mod settings;
 pub mod state;
 pub mod updater;
+pub mod watchdog;
 
 use std::sync::{Arc, OnceLock};
 
@@ -35,6 +36,21 @@ fn default_data_dir() -> std::path::PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 回滚通道：`foldersync-desktop.exe --rollback` 用备份覆盖当前 exe 并重启。
+    // 新版本启动即异常时用户在 cmd 里执行这一条就能退回旧版。
+    if std::env::args().any(|a| a == "--rollback") {
+        if let Err(e) = updater::rollback() {
+            eprintln!("回滚失败: {e:#}");
+        }
+        return;
+    }
+    // 看门狗进程入口：`--watchdog <pid>` 监控主进程，崩溃后自动重启
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == crate::watchdog::WATCHDOG_ARG)
+        && let Some(pid) = args.get(pos + 1).and_then(|s| s.parse::<u32>().ok())
+    {
+        std::process::exit(crate::watchdog::run(pid));
+    }
     let data_dir = default_data_dir();
     // 日志级别在初始化日志系统前就要读出来，否则设置页改了也不生效
     let initial_log_level = settings::SettingsStore::load(&data_dir.join("settings.json"))
@@ -44,6 +60,17 @@ pub fn run() {
         .unwrap_or_else(|e| panic!("日志初始化失败: {e:#}"));
 
     tauri::Builder::default()
+        // 单实例锁：双开会产生两个同 device_id 节点抢同一 SQLite/SSH 端口/双份 watcher。
+        // 第二实例启动时回调这里（插件内部已保证此时主实例存活），把已有窗口带到前台即可。
+        // 必须第一个注册：越早拒绝第二实例越好。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+            info!("检测到二次启动，已聚焦已有窗口");
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -54,6 +81,10 @@ pub fn run() {
         .setup(move |app| {
             std::mem::forget(log_guard);
             info!(dir = %data_dir.display(), "启动 FolderSync");
+            // 自看门狗：崩溃/被杀后由看门狗进程自动重启。
+            // 与单实例锁配合：崩溃后旧实例已死、锁已释放，看门狗拉起的新
+            // 主进程能正常拿到锁。
+            watchdog::spawn();
 
             // 必须在窗口加载前完成 manage()：前端挂载后会立刻调用命令，
             // 异步 spawn 初始化会出现短暂的 "state not managed" 报错。
@@ -64,6 +95,14 @@ pub fn run() {
             match initialized {
                 Ok(st) => {
                     let want_auto_start = st.settings_dto().auto_start;
+                    // 配对请求实时推送：回调转发给前端 pairing://request 事件。
+                    // 之前前端订阅了事件但后端从未发过，弹窗全靠 5 秒轮询兜底，
+                    // 配对请求 2 分钟过期，高峰期会错过。
+                    let handle = app.handle().clone();
+                    st.pairing.set_on_request(Arc::new(move |p| {
+                        use tauri::Emitter;
+                        let _ = handle.emit("pairing://request", p);
+                    }));
                     let restore = st.clone();
                     app.manage(st);
                     tauri::async_runtime::spawn(async move {
@@ -127,6 +166,7 @@ pub fn run() {
             commands::list_activity,
             commands::list_conflicts,
             commands::get_conflict_preview,
+            commands::get_conflict_preview_page,
             commands::resolve_conflict,
             commands::get_settings,
             commands::update_settings,
@@ -182,8 +222,21 @@ pub(crate) fn apply_autostart(app: &tauri::AppHandle, want: bool) {
 
 pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, paused: bool) {
     if let Some(tray) = app.tray_by_id("main-tray") {
+        // 错误态优先于同步态：用户不看主窗口也能从托盘图标提示发现故障
+        let has_error = app
+            .try_state::<Arc<AppState>>()
+            .map(|st| {
+                st.runtimes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|rt| rt.last_error().is_some())
+            })
+            .unwrap_or(false);
         let text = if paused {
             "FolderSync — 已暂停"
+        } else if has_error {
+            "FolderSync — 有同步错误（点击查看）"
         } else {
             "FolderSync — 全部已同步"
         };
@@ -246,6 +299,8 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 }
             }
             "quit" => {
+                // 正常退出：通知看门狗别重启（否则关掉应用它又给你拉起来）
+                watchdog::release();
                 app.exit(0);
             }
             _ => {}

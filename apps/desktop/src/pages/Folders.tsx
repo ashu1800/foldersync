@@ -26,7 +26,7 @@ export default function Folders() {
   const { folders, foldersLoaded, refreshFolders, foldersError } = useStore();
   const [showAdd, setShowAdd] = useState(false);
   const [detail, setDetail] = useState<FolderDto | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<FolderDto | null>(null);
 
@@ -45,7 +45,7 @@ export default function Folders() {
         }
         await refreshFolders();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setBusy(false);
       }
@@ -61,7 +61,7 @@ export default function Folders() {
         setConfirmRemove(null);
         await refreshFolders();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setBusy(false);
       }
@@ -84,7 +84,7 @@ export default function Folders() {
 
       {(error ?? foldersError) && (
         <ErrorBanner
-          message={error ?? foldersError ?? ""}
+          error={error ?? foldersError}
           onRetry={() => void refreshFolders()}
           onDismiss={() => setError(null)}
         />
@@ -144,7 +144,7 @@ export default function Folders() {
                                 await api.relocateFolder(f.id, selected);
                                 await refreshFolders();
                               } catch (e) {
-                                setError(api.asCmdError(e).message);
+                                setError(e);
                               }
                             }}
                           >
@@ -228,7 +228,7 @@ function AddFolderWizard({
   const [customRules, setCustomRules] = useState("");
   const [useDefaults, setUseDefaults] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const pick = async () => {
     try {
@@ -254,7 +254,7 @@ function AddFolderWizard({
       await api.addFolder({ path, device_ids: selected, ignore });
       onDone();
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setBusy(false);
     }
@@ -307,7 +307,7 @@ function AddFolderWizard({
         ))}
       </div>
 
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error != null && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
 
       {step === 0 && (
         <div className="field">
@@ -399,7 +399,7 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
       : folder.shared_with,
   );
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [saved, setSaved] = useState(false);
   const [rulesDirty, setRulesDirty] = useState(false);
   const [sharingDirty, setSharingDirty] = useState(false);
@@ -426,7 +426,7 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
         setTreeLimit(TREE_RENDER_LIMIT);
         setRules(rl);
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setLoading(false);
       }
@@ -447,7 +447,7 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setSavingRules(false);
     }
@@ -462,7 +462,7 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setSavingSharing(false);
     }
@@ -482,7 +482,7 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
               className="btn"
               onClick={() =>
                 void api.openFolder(folder.id).catch((e) => {
-                  setError(api.asCmdError(e).message);
+                  setError(e);
                 })
               }
             >
@@ -562,7 +562,9 @@ function FolderDetail({ folder, onClose }: { folder: FolderDto; onClose: () => v
           </button>
         </div>
 
-        {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+        {error != null && (
+          <ErrorBanner error={error} onDismiss={() => setError(null)} />
+        )}
 
         <div id="folder-panel" role="tabpanel" aria-labelledby={`folder-tab-${tab}`}>
           {tab === "files" ? (

@@ -228,11 +228,13 @@ impl FolderRuntime {
 
         // 监听
         let matcher = fs_sync_core::matcher_for_folder(&root);
+        let dirty = crate::watcher::DirtyFlag::new();
         let (rx, debouncer) = watch_folder(
             &root,
             matcher,
             session.engine.suppression.clone(),
             debounce_ms,
+            dirty.clone(),
         )?;
 
         // 事件循环：本地变更 → 入 blob → 写入 outbox（由连接循环推送）
@@ -242,22 +244,44 @@ impl FolderRuntime {
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(async move {
             let mut rx: mpsc::Receiver<FileEvent> = rx;
-            while let Some(ev) = rx.recv().await {
-                match sess.on_local_event(ev).await {
-                    Ok(Some(entry)) => {
-                        if !entry.is_dir
-                            && !entry.deleted
-                            && let Err(e) = sess.engine.ensure_blob(&entry).await
-                        {
-                            warn!(path = %entry.path, "加入 blob 失败: {e}");
+            loop {
+                // 溢出/监听错误置脏后：先全量对账再处理新事件，
+                // 把「丢事件」的感知窗口从 10 分钟快扫缩到秒级。
+                if dirty.take() {
+                    warn!("监听事件丢失，立即执行一次兜底扫描");
+                    match sess.full_scan().await {
+                        Ok(changed) if !changed.is_empty() => {
+                            for e in changed {
+                                if !e.is_dir && !e.deleted {
+                                    let _ = sess.engine.ensure_blob(&e).await;
+                                }
+                                outbox_for_events.lock().await.push(e);
+                            }
                         }
-                        // on_local_event 已把条目放进 session.pending；从 pending 取，
-                        // 否则 pending 只进不出，永远堆积
-                        let pending = sess.take_pending().await;
-                        outbox_for_events.lock().await.extend(pending);
+                        Ok(_) => {}
+                        Err(e) => warn!("脏标记触发扫描失败: {e}"),
                     }
-                    Ok(None) => {}
-                    Err(e) => warn!("本地事件处理失败: {e}"),
+                }
+                match rx.recv().await {
+                    Some(ev) => {
+                        match sess.on_local_event(ev).await {
+                            Ok(Some(entry)) => {
+                                if !entry.is_dir
+                                    && !entry.deleted
+                                    && let Err(e) = sess.engine.ensure_blob(&entry).await
+                                {
+                                    warn!(path = %entry.path, "加入 blob 失败: {e}");
+                                }
+                                // on_local_event 已把条目放进 session.pending；从 pending 取，
+                                // 否则 pending 只进不出，永远堆积
+                                let pending = sess.take_pending().await;
+                                outbox_for_events.lock().await.extend(pending);
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!("本地事件处理失败: {e}"),
+                        }
+                    }
+                    None => break,
                 }
             }
         });
@@ -289,6 +313,22 @@ impl FolderRuntime {
                 }
                 if let Err(e) = sess2.purge_expired_tombstones() {
                     warn!("墓碑清理失败: {e}");
+                }
+                // blob GC：清掉所有活条目 hash 之外的 blob（旧版本历史内容）。
+                // 之前只增不减，常用文档库用一年能膨胀几十 GB。
+                {
+                    let keep: std::collections::HashSet<String> = sess2
+                        .snapshot()
+                        .await
+                        .into_values()
+                        .filter(|e| !e.is_dir && !e.deleted)
+                        .map(|e| e.hash)
+                        .collect();
+                    match sess2.blobs.gc(&keep).await {
+                        Ok(n) if n > 0 => info!(removed = n, "blob 清理完成"),
+                        Ok(_) => {}
+                        Err(e) => warn!("blob 清理失败: {e}"),
+                    }
                 }
             }
         });
@@ -419,11 +459,50 @@ pub struct PeerLoopConfig {
     pub ssh_port: u16,
     pub mode: NetworkMode,
     pub relay_url: Option<String>,
+    /// 中继 host key 固定表（relay_url → openssh 公钥行）。
+    /// 首连 TOFU 后由上层保存，之后每次连接严格校验，防中继链路 MITM。
+    /// 读写回调封装成 Arc，避免持有 settings 锁跨 await。
+    pub relay_host_keys: Arc<RelayHostKeys>,
+    /// 已确认上传到中继的 blob hash 集合（按中继地址分键）。
+    /// 跨重连保留：blob 内容寻址不变、中继房间不变，重连后不必对每个文件
+    /// 再做一次 SFTP exists()（10 万文件 = 10 万次 stat）。
+    /// 上层注入进程级共享实例；传 None 则每次会话从零开始（测试用）。
+    pub relay_uploaded_blobs: Option<SharedUploadedBlobs>,
     /// 中继模式自动接受共享邀请时需要创建本地文件夹
     pub store: Arc<Store>,
     pub blobs: Arc<BlobStore>,
     pub sync_root: PathBuf,
     pub paused_all: Arc<AtomicBool>,
+}
+
+/// 中继 host key 读写回调类型。
+pub type RelayHostKeyGet = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+pub type RelayHostKeySet = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// 进程级"已上传中继 blob"缓存：中继地址 → hash 集合。
+pub type SharedUploadedBlobs =
+    Arc<std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>>>;
+
+/// 中继 host key 固定表的存储抽象：daemon 不依赖桌面层的 settings，
+/// 由调用方注入读写实现（桌面端存 settings.json，CLI 存数据目录文件）。
+#[derive(Clone)]
+pub struct RelayHostKeys {
+    get: RelayHostKeyGet,
+    set: RelayHostKeySet,
+}
+
+impl RelayHostKeys {
+    pub fn new(get: RelayHostKeyGet, set: RelayHostKeySet) -> Self {
+        Self { get, set }
+    }
+
+    pub fn get(&self, relay_url: &str) -> Option<String> {
+        (self.get)(relay_url)
+    }
+
+    pub fn set(&self, relay_url: &str, host_key: &str) {
+        (self.set)(relay_url, host_key)
+    }
 }
 
 /// 对等连接循环：周期检查信任列表，为每个设备起一个独立监督任务。
@@ -483,12 +562,31 @@ async fn peer_supervisor(
             }
         };
         let cfg = cfg.read().unwrap().clone();
+        let lan_available = || {
+            !fs_sync_net::discover::discover(std::time::Duration::from_secs(3))
+                .iter()
+                .any(|p| {
+                    p.device_id
+                        == peer
+                            .id
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+                            .collect::<String>()
+                })
+        };
         let use_relay = match cfg.mode {
             NetworkMode::Relay => true,
             NetworkMode::Tailscale => false,
             NetworkMode::Auto => {
                 let ts = fs_sync_net::tailscale::detect();
-                auto_fallback_relay || peer.addresses.is_empty() || !ts.running
+                if auto_fallback_relay {
+                    true
+                } else if peer.addresses.is_empty() || !ts.running {
+                    // 没有记录地址不等于不能直连：LAN 发现到对端就走直连
+                    lan_available()
+                } else {
+                    false
+                }
             }
         };
         let conn_ty = if use_relay {
@@ -644,16 +742,22 @@ async fn wait_for_direct_reachable(trust: &crate::trust::Trust, peer_id: &str) {
     }
 }
 
-/// 一轮 Tailscale SSH 同步：连上对端 → 交换索引 → 持续收发增量，直到连接断开。
-async fn sync_round_ssh(
+async fn connect_ssh_client(
     cfg: &PeerLoopConfig,
     peer: &Device,
-    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
-    online: Option<&Arc<Mutex<fs_sync_net::conn::Presence>>>,
-) -> Result<()> {
+) -> Result<fs_sync_net::ssh_client::SshClient> {
+    // 连接地址 = 配对时记录的地址 + mDNS LAN 发现的同指纹地址。
+    // LAN 发现只补地址不自动配对：指纹必须在信任列表里才会尝试。
+    let mut addrs = peer.addresses.clone();
+    let lan = fs_sync_net::discover::discover(std::time::Duration::from_secs(3));
+    for p in lan {
+        if lan_peer_matches(&p, peer) && !addrs.contains(&p.ip) {
+            info!(peer = %peer.name, ip = %p.ip, port = p.port, "mDNS 发现对端 LAN 地址");
+            addrs.push(p.ip);
+        }
+    }
     let mut last_err = None;
-    let mut client = None;
-    for addr in &peer.addresses {
+    for addr in &addrs {
         let target = fs_sync_net::ssh_client::SshTarget {
             host: addr.clone(),
             port: peer.port,
@@ -661,16 +765,80 @@ async fn sync_round_ssh(
             host_key: peer.host_key.clone(),
         };
         match fs_sync_net::ssh_client::SshClient::connect(&target, &cfg.identity).await {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
+            Ok(c) => return Ok(c),
             Err(e) => last_err = Some(e),
         }
     }
-    let mut client = client
-        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("设备没有 Tailscale 地址")))?;
-    info!(peer = %peer.name, rtt_ms = client.rtt_ms(), "SSH 同步会话已建立");
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("设备没有可用地址")))
+}
+
+/// mDNS 发现的服务是否对应这台已配对设备：指纹前缀匹配（TXT 里存的是指纹 hex）。
+/// 指纹不在信任列表 → 不是我们的对端 → 忽略（不自动配对陌生人）。
+fn lan_peer_matches(p: &fs_sync_net::discover::LanPeer, peer: &Device) -> bool {
+    // device_id 形如 "SHA256:hex..."；mDNS TXT 里是去符号后的指纹。
+    let expected: String = peer
+        .id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+        .collect();
+    p.device_id == expected
+}
+
+async fn handshake_protocol(
+    client: &mut fs_sync_net::ssh_client::SshClient,
+    cfg: &PeerLoopConfig,
+    version: u16,
+) -> Result<u16> {
+    client
+        .send(&Message::Hello {
+            protocol_version: version,
+            device_name: cfg.device_name.clone(),
+            folders: Vec::new(),
+        })
+        .await?;
+    match client.recv().await? {
+        Message::Hello {
+            protocol_version, ..
+        } if protocol_version == fs_sync_net::message::PROTOCOL_VERSION
+            || protocol_version == fs_sync_net::message::LEGACY_PROTOCOL_VERSION =>
+        {
+            Ok(protocol_version)
+        }
+        Message::Hello {
+            protocol_version, ..
+        } => anyhow::bail!(
+            "对端协议版本 {protocol_version} 不兼容（本机 {}）",
+            fs_sync_net::message::PROTOCOL_VERSION
+        ),
+        Message::Error { message, .. } => anyhow::bail!("对端拒绝连接: {message}"),
+        _ => anyhow::bail!("对端未完成协议握手"),
+    }
+}
+
+/// 一轮 Tailscale SSH 同步：连上对端 → 交换索引 → 持续收发增量，直到连接断开。
+async fn sync_round_ssh(
+    cfg: &PeerLoopConfig,
+    peer: &Device,
+    runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    online: Option<&Arc<Mutex<fs_sync_net::conn::Presence>>>,
+) -> Result<()> {
+    let mut client = connect_ssh_client(cfg, peer).await?;
+    let peer_protocol =
+        match handshake_protocol(&mut client, cfg, fs_sync_net::message::PROTOCOL_VERSION).await {
+            Ok(version) => version,
+            Err(first) => {
+                // 0.2.5 及更早版本只认 v2；第一次 v3 握手被拒后，用 v2 重连。
+                debug!(peer = %peer.name, "v3 握手失败，尝试 v2 兼容模式: {first:#}");
+                client = connect_ssh_client(cfg, peer).await?;
+                handshake_protocol(
+                    &mut client,
+                    cfg,
+                    fs_sync_net::message::LEGACY_PROTOCOL_VERSION,
+                )
+                .await?
+            }
+        };
+    info!(peer = %peer.name, rtt_ms = client.rtt_ms(), protocol = peer_protocol, "SSH 同步会话已建立");
     for rt in all_runtimes(runtimes) {
         if rt.shared_with_peer(&peer.id)
             && rt
@@ -685,27 +853,6 @@ async fn sync_round_ssh(
         p.lock().await.set_rtt(&peer.id, client.rtt_ms());
     }
 
-    client
-        .send(&Message::Hello {
-            protocol_version: fs_sync_net::message::PROTOCOL_VERSION,
-            device_name: cfg.device_name.clone(),
-            folders: Vec::new(),
-        })
-        .await?;
-    match client.recv().await? {
-        Message::Hello {
-            protocol_version, ..
-        } if protocol_version == fs_sync_net::message::PROTOCOL_VERSION => {}
-        Message::Hello {
-            protocol_version, ..
-        } => anyhow::bail!(
-            "对端协议版本 {protocol_version} 不兼容（本机 {}）",
-            fs_sync_net::message::PROTOCOL_VERSION
-        ),
-        Message::Error { message, .. } => anyhow::bail!("对端拒绝连接: {message}"),
-        _ => anyhow::bail!("对端未完成协议握手"),
-    }
-
     // 交换全量索引（每个文件夹一条）。文件夹列表直接读 runtimes，不用配置里的快照：
     // 应用启动时对等循环比"恢复文件夹"先跑，快照是空的，整个会话就一条都不推。
     let mut announced: HashSet<String> = HashSet::new();
@@ -714,6 +861,7 @@ async fn sync_round_ssh(
         &peer.id,
         &cfg.device_name,
         runtimes,
+        peer_protocol,
         &mut announced,
     )
     .await?;
@@ -727,11 +875,24 @@ async fn sync_round_ssh(
     ping.tick().await;
     let mut rescan = tokio::time::interval(std::time::Duration::from_secs(3));
     rescan.tick().await;
+    // 半开连接检测：对端拔电源时 TCP 不会立刻断，inactivity_timeout 要 2-5 分钟。
+    // 每 20s 发一个 Ping，收到任何消息（含 Pong）清零；连续 3 次（约 60s）
+    // 无响应即主动断开，交由上层退避重连，比被动超时快 2-4 分钟。
+    let mut unanswered_pings: u32 = 0;
+    const PING_FAIL_LIMIT: u32 = 3;
     loop {
         tokio::select! {
             msg = incoming.recv() => {
                 match msg {
-                    Some(Ok(msg)) => handle_incoming(&msg, peer, cfg, runtimes, Some(&sftp)).await?,
+                    Some(Ok(msg)) => {
+                        unanswered_pings = 0;
+                        // 对端主动探测：必须回 Pong，否则双方都有半开检测时
+                        // 会互相把对方的 Ping 当"无响应"而误判死连接。
+                        if matches!(msg, Message::Ping) {
+                            client.send(&Message::Pong).await?;
+                        }
+                        handle_incoming(&msg, peer, cfg, runtimes, Some(&sftp)).await?
+                    }
                     Some(Err(e)) => {
                         warn!(peer = %peer.name, "读对端消息失败: {e:#}");
                         return Err(e.context("读对端消息失败"));
@@ -772,9 +933,16 @@ async fn sync_round_ssh(
             }
             // 会话期间新加入的文件夹：补发全量索引
             _ = rescan.tick() => {
-                announce_new_folders(&mut client, &peer.id, &cfg.device_name, runtimes, &mut announced).await?;
+                announce_new_folders(&mut client, &peer.id, &cfg.device_name, runtimes, peer_protocol, &mut announced).await?;
             }
             _ = ping.tick() => {
+                unanswered_pings += 1;
+                if unanswered_pings > PING_FAIL_LIMIT {
+                    anyhow::bail!(
+                        "对端 {} 秒无心跳响应，主动断开（半开连接）",
+                        PING_FAIL_LIMIT * 20
+                    );
+                }
                 client.send(&Message::Ping).await?;
             }
         }
@@ -787,6 +955,7 @@ async fn announce_new_folders(
     peer_id: &str,
     device_name: &str,
     runtimes: &Arc<std::sync::Mutex<Vec<Arc<FolderRuntime>>>>,
+    peer_protocol: u16,
     announced: &mut HashSet<String>,
 ) -> Result<()> {
     let rts = all_runtimes(runtimes);
@@ -816,9 +985,11 @@ async fn announce_new_folders(
         }
         // 全量索引已经包含全部条目，对端据此 diff 拉取即可。
         // 以前还把每个条目再排进 outbox 逐条推一遍：10 万文件就是 10 万条重复消息。
-        let entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
+        // 排序：HashMap 遍历序不稳定，排序让分页内容可复现（也方便对端调试）。
+        let mut entries: Vec<FileEntry> = rt.session.snapshot().await.into_values().collect();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         info!(folder = %fid, count = entries.len(), "发送全量索引");
-        if entries.len() > 4000 {
+        if entries.len() > 4000 && peer_protocol >= fs_sync_net::message::PROTOCOL_VERSION {
             let total = entries.len();
             for (i, chunk) in entries.chunks(4000).enumerate() {
                 let done = (i + 1) * 4000 >= total;
@@ -1083,6 +1254,24 @@ async fn recv_local_change(
     }
 }
 
+/// 测试专用：内存版中继 host key 固定表（单元与集成测试共用）。
+pub fn test_relay_host_keys() -> Arc<RelayHostKeys> {
+    use std::sync::Mutex as StdMutex;
+    let map = Arc::new(StdMutex::new(
+        std::collections::HashMap::<String, String>::new(),
+    ));
+    let get_map = map.clone();
+    let get = Arc::new(move |url: &str| get_map.lock().unwrap().get(url).cloned());
+    let set_map = map;
+    let set = Arc::new(move |url: &str, key: &str| {
+        set_map
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), key.to_string());
+    });
+    Arc::new(RelayHostKeys::new(get, set))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,6 +1375,8 @@ mod tests {
             ssh_port: 2222,
             mode: NetworkMode::Tailscale,
             relay_url: None,
+            relay_host_keys: test_relay_host_keys(),
+            relay_uploaded_blobs: None,
             store,
             blobs,
             sync_root: data.join("FolderSync"),

@@ -90,19 +90,86 @@ impl BlobStore {
             .context("读取 blob 失败")
     }
 
+    /// 计算文件 blake3（与核心扫描使用同一算法）。
+    pub async fn hash_file(&self, path: &Path) -> Result<String> {
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    /// 删除不在 `keep` 集合里的 blob，返回删除数量。
+    ///
+    /// 之前 blob 只增不减：每次修改文件都新增一个按 hash 寻址的 blob，
+    /// 旧版本永久保留，常用文档库用一年能膨胀几十 GB。调用方（兜底扫描
+    /// 周期任务）传入当前所有活条目的 hash 集合；墓碑对应的内容会随之
+    /// 清掉——这正是预期行为（文件删除后其历史内容没有保留价值）。
+    /// 根目录下的遗留临时文件（.tmp-* / .download-* / .relay-download-*，
+    /// 超过 1 小时）顺带清理。
+    pub async fn gc(&self, keep: &std::collections::HashSet<String>) -> Result<usize> {
+        let mut removed = 0;
+        let blobs_dir = self.root.join("blobs");
+        let mut rd = tokio::fs::read_dir(&blobs_dir).await?;
+        while let Some(e) = rd.next_entry().await? {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !is_valid_hash(&name) {
+                continue;
+            }
+            if !keep.contains(&name) && tokio::fs::remove_file(e.path()).await.is_ok() {
+                removed += 1;
+            }
+        }
+        // 清理 root 下的遗留临时文件（崩溃/断电残留）
+        let mut rd = tokio::fs::read_dir(&self.root).await?;
+        while let Some(e) = rd.next_entry().await? {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_tmp = name.starts_with(".tmp-")
+                || name.starts_with(".download-")
+                || name.starts_with(".relay-download-");
+            if is_tmp {
+                let stale = match tokio::fs::metadata(e.path()).await {
+                    Ok(m) => m
+                        .modified()
+                        .map(|t| {
+                            t.elapsed()
+                                .map(|d| d > std::time::Duration::from_secs(3600))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                if stale && tokio::fs::remove_file(e.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// 导出到目标路径（原子写：临时文件 + rename）。
     pub async fn export_to(&self, hash: &str, dest: &Path) -> Result<()> {
         anyhow::ensure!(is_valid_hash(hash), "hash 格式无效（需 64 位 hex）");
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
+        // 调用方可能已加 \\?\ 长路径前缀；临时文件名必须从**原始形态**派生
+        //（with_file_name 作用在前缀形态上会生成 `\...` 开头的坏路径），
+        // 真正打开时再统一走 long_path。
+        let raw = fs_sync_core::strip_long_path(dest);
+        if let Some(parent) = raw.parent() {
+            tokio::fs::create_dir_all(fs_sync_core::long_path(parent))
                 .await
                 .context("创建目标目录失败")?;
         }
-        let name = dest
+        let name = raw
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "blob".into());
-        let tmp = dest.with_file_name(format!(
+        let tmp = raw.with_file_name(format!(
             ".foldersync-tmp-{name}-{}-{:x}",
             std::process::id(),
             rand::random::<u64>()
@@ -110,7 +177,7 @@ impl BlobStore {
         let mut src = tokio::fs::File::open(self.blob_path(hash))
             .await
             .context("读取 blob 失败")?;
-        let mut out = tokio::fs::File::create(&tmp)
+        let mut out = tokio::fs::File::create(fs_sync_core::long_path(&tmp))
             .await
             .context("创建临时目标文件失败")?;
         tokio::io::copy(&mut src, &mut out)
@@ -118,7 +185,7 @@ impl BlobStore {
             .context("写临时文件失败")?;
         out.flush().await.ok();
         drop(out);
-        tokio::fs::rename(&tmp, dest)
+        tokio::fs::rename(fs_sync_core::long_path(&tmp), fs_sync_core::long_path(&raw))
             .await
             .context("原子替换目标文件失败")?;
         Ok(())
@@ -236,5 +303,34 @@ mod tests {
         let bad = tmp.path().join("bad.tmp");
         std::fs::write(&bad, b"xyz").unwrap();
         assert!(store.adopt_downloaded(&bad, &good).await.is_err());
+    }
+
+    /// GC：keep 之外的内容被删、keep 之内的保留、临时文件按年龄清理。
+    #[tokio::test]
+    async fn gc_removes_unreferenced_blobs_and_stale_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(tmp.path().join("share")).unwrap();
+        let h_keep = store.add_bytes(b"keep".to_vec()).await.unwrap();
+        let h_drop = store.add_bytes(b"drop".to_vec()).await.unwrap();
+
+        // 造一个 2 小时前的遗留临时文件
+        let stale_tmp = tmp.path().join("share/.tmp-999-deadbeef");
+        std::fs::write(&stale_tmp, b"leftover").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&stale_tmp)
+            .unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+
+        let removed = store
+            .gc(&std::collections::HashSet::from([h_keep.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(removed, 2, "应删 1 个孤儿 blob + 1 个过期临时文件");
+        assert!(store.has(&h_keep).await, "keep 集合内的必须保留");
+        assert!(!store.has(&h_drop).await, "keep 之外的应被删");
+        assert!(!stale_tmp.exists());
     }
 }

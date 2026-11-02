@@ -17,6 +17,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub fn init(log_dir: &Path, level: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     std::fs::create_dir_all(log_dir).context("创建日志目录失败")?;
 
+    // 启动时清理 N 天前的旧日志（按天滚动只建不删，忘关 debug 级别会占满盘）
+    cleanup_old_logs(log_dir, 14);
+
     let file_appender = tracing_appender::rolling::daily(log_dir, "foldersync.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -38,7 +41,59 @@ pub fn init(log_dir: &Path, level: &str) -> Result<tracing_appender::non_blockin
         )
         .init();
 
+    install_panic_hook(log_dir);
+
     Ok(guard)
+}
+
+/// 清理超过保留期的旧日志文件（foldersync.log.* / crash-*.log）。
+fn cleanup_old_logs(log_dir: &Path, keep_days: u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(keep_days * 86_400));
+    let Some(cutoff) = cutoff else { return };
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_log = name.starts_with("foldersync.log.") || name.starts_with("crash-");
+        if !is_log {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if expired {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// panic 时把 backtrace 追加写入 `logs/crash-<时间戳>.log`。
+/// 之前进程崩溃即死且不留痕迹，用户只能描述"闪退了"。
+/// 静默失败：崩溃路径上不能因为写日志失败再 panic。
+fn install_panic_hook(log_dir: &Path) {
+    let dir = log_dir.to_path_buf();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let file = dir.join(format!("crash-{ts}.log"));
+        let msg = format!(
+            "time: {}\nthread: {}\nmessage: {info}\nbacktrace:\n{}\n",
+            chrono::Local::now().to_rfc3339(),
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            std::backtrace::Backtrace::capture(),
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)
+            .and_then(|mut f| f.write_all(msg.as_bytes()));
+        default_hook(info);
+    }));
 }
 
 /// 诊断包内容（纯文本，便于贴到 issue）。
@@ -269,5 +324,66 @@ mod tests {
         let path = report.write_to(tmp.path()).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "hello");
+    }
+
+    /// 启动时清理超期日志：新的保留、旧的删除、非日志文件不动。
+    #[test]
+    fn cleanup_old_logs_removes_only_expired_log_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let old = logs.join("foldersync.log.2026-01-01");
+        let new = logs.join("foldersync.log.2026-10-31");
+        let crash = logs.join("crash-20260101-000000.log");
+        let other = logs.join("settings.json");
+        for p in [&old, &new, &crash, &other] {
+            std::fs::write(p, "x").unwrap();
+        }
+        // 把 old / crash 的修改时间拨到 30 天前
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        for p in [&old, &crash] {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(stale).unwrap();
+        }
+
+        cleanup_old_logs(&logs, 14);
+
+        assert!(!old.exists(), "超期日志应被删除");
+        assert!(!crash.exists(), "超期崩溃日志应被删除");
+        assert!(new.exists(), "新日志必须保留");
+        assert!(other.exists(), "非日志文件不能动");
+    }
+
+    /// panic hook 会把崩溃信息写入 crash-*.log。
+    #[test]
+    fn panic_hook_writes_crash_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        // 安装 hook 后主动 panic 一次（catch_unwind 接住），验证文件落地。
+        // panic_hook 是进程级全局的，这里装的是测试进程的 hook；生产代码路径相同。
+        install_panic_hook(&logs);
+        let result = std::panic::catch_unwind(|| {
+            panic!("hook 验证用 panic");
+        });
+        assert!(result.is_err(), "panic 应被 catch_unwind 接住");
+
+        let crash_files: Vec<_> = std::fs::read_dir(&logs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("crash-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(!crash_files.is_empty(), "崩溃日志应落地");
+        let text = std::fs::read_to_string(&crash_files[0]).unwrap();
+        assert!(text.contains("hook 验证用 panic"), "崩溃信息应写入");
+        assert!(text.contains("backtrace:"), "应包含 backtrace 段");
     }
 }

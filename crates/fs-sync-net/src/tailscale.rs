@@ -47,8 +47,27 @@ pub struct TailscaleInfo {
     pub cli_available: bool,
 }
 
+/// detect() 的短缓存：CLI 子进程要 50-200ms，而 get_overview 每 5 秒轮询一次，
+/// 机器休眠恢复时子进程可能挂起数秒拖死 UI。10 秒缓存对状态感知足够新鲜。
+static DETECT_CACHE: std::sync::Mutex<Option<(std::time::Instant, TailscaleInfo)>> =
+    std::sync::Mutex::new(None);
+
 /// 探测本机 Tailscale：优先 CLI，失败则枚举本机地址筛网段。全程不报错。
 pub fn detect() -> TailscaleInfo {
+    if let Ok(guard) = DETECT_CACHE.lock()
+        && let Some((at, info)) = guard.as_ref()
+        && at.elapsed() < std::time::Duration::from_secs(10)
+    {
+        return info.clone();
+    }
+    let info = detect_uncached();
+    if let Ok(mut guard) = DETECT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), info.clone()));
+    }
+    info
+}
+
+fn detect_uncached() -> TailscaleInfo {
     let mut info = TailscaleInfo::default();
 
     match run_tailscale_status() {

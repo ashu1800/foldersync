@@ -262,11 +262,58 @@ pub async fn download_verified(
     Err(last_err.context("下载更新包失败（已重试 3 次）"))
 }
 
+/// 旧版 exe 备份路径（回滚通道）。放在 `%LOCALAPPDATA%\FolderSync` 而非安装目录：
+/// NSIS 升级会清空安装目录，备份放那里活不过一次升级。
+pub fn backup_path() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    Some(local.join("FolderSync").join("foldersync-desktop.exe.bak"))
+}
+
+/// 备份当前 exe（升级前调用）。备份失败只记警告不阻塞升级——
+/// 回滚是兜底通道，不能因为它让升级失败。
+pub fn backup_current_exe() {
+    let Some(backup) = backup_path() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Some(parent) = backup.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!("创建备份目录失败: {e}");
+        return;
+    }
+    match std::fs::copy(&exe, &backup) {
+        Ok(n) => info!(bytes = n, path = %backup.display(), "已备份当前版本（供回滚）"),
+        Err(e) => warn!("备份当前 exe 失败（升级继续，本次无法回滚）: {e}"),
+    }
+}
+
+/// 回滚：用备份覆盖当前安装的 exe 并启动。
+/// 用于新版本启动失败/异常时，用户执行 `foldersync-desktop.exe --rollback`。
+pub fn rollback() -> Result<()> {
+    let backup = backup_path().context("无法确定备份路径")?;
+    anyhow::ensure!(backup.exists(), "没有备份可回滚: {}", backup.display());
+    let exe = std::env::current_exe()?;
+    // 先改名当前 exe（可能被占用但改名通常允许），再放备份
+    let old = exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(&exe, &old).context("当前 exe 改名失败（可能被占用）")?;
+    std::fs::copy(&backup, &exe).context("恢复备份失败")?;
+    let _ = std::fs::remove_file(&backup);
+    std::process::Command::new(&exe)
+        .spawn()
+        .context("启动回滚版本失败")?;
+    info!("已回滚到备份版本，退出当前进程");
+    std::process::exit(0);
+}
+
 /// 运行 NSIS 安装器（被动模式：只显示进度条，装完自动重启应用）。调用方随后应退出进程。
 ///
 /// 参数与 tauri-plugin-updater 的 passive 模式一致：`/P` 被动、`/R` 装完重启、
 /// `/UPDATE` 告诉安装器这是升级（会先结束正在运行的旧进程）。
 pub fn launch_installer(path: &Path) -> Result<()> {
+    // 升级前备份当前版本：新版本异常时可用 --rollback 退回
+    backup_current_exe();
     info!(path = %path.display(), "启动更新安装器");
     std::process::Command::new(path)
         .args(["/P", "/R", "/UPDATE"])

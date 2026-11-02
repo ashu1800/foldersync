@@ -2,6 +2,8 @@
 
 文件夹实时双向同步软件。两台电脑（如公司/家里）在 NAT 后也能同步，不依赖第三方云盘。网络层为 **SSH + SFTP + Tailscale（直连）** 或 **自建中继服务器** 两种方案。
 
+> **平台范围：桌面客户端仅支持 Windows 10/11 x64；macOS 和 Linux 不在支持范围内，不提供安装包与兼容性保证。**
+
 ## 技术栈与版本
 
 | 组件 | 版本 | 说明 |
@@ -107,7 +109,7 @@ foldersync-relay --port 9443 --data-dir ./foldersync-relay-data
 - [x] 双端索引交换、增量同步、冲突副本、断线重连
 - [x] 中继服务器二进制 `foldersync-relay`（按房间隔离）
 - [x] 桌面应用：配对/设备/文件夹/活动/设置/诊断页面
-- [ ] macOS/Linux 实机验证（当前主要在 Windows 上验证）
+- [x] Windows 10/11 x64 桌面客户端（唯一支持平台；macOS/Linux 客户端不在支持范围）
 
 ## 打包与分发
 
@@ -123,7 +125,7 @@ pnpm exec tauri build          # 产出 NSIS 安装包
 | `target/release/bundle/nsis/FolderSync_<version>_x64-setup.exe` | Windows 安装包（currentUser 安装，无需管理员） |
 | `target/release/foldersync-desktop.exe` | 免安装可执行文件 |
 
-安装包内置中文/英文安装向导。安装时 `installer.nsh` 会尝试添加防火墙规则 `FolderSync SSH`（TCP 2222 + 程序路径）和程序级 TCP 放行；`currentUser` 模式没有管理员权限时 netsh 可能失败，应用内设置页的「初始化/修复 SSH 环境」会再次尝试（会弹 UAC）。macOS/Linux 打包需在对应平台执行同样命令。
+安装包内置中文/英文安装向导。安装时 `installer.nsh` 会尝试添加防火墙规则 `FolderSync SSH`（TCP 2222 + 程序路径）和程序级 TCP 放行；`currentUser` 模式没有管理员权限时 netsh 可能失败，应用内设置页的「初始化/修复 SSH 环境」会再次尝试（会弹 UAC）。
 
 ## 自动更新与版本发布
 
@@ -211,10 +213,11 @@ cargo build --release -p foldersync-relay
 | 限速是“传输后结算” | 用户感知准确，网络统计不精确 | 在 `limits.rs` 加流包装器，调用点不动 |
 | 文件树初始渲染 1000 行 | 大文件夹需要点「显示更多」继续加载 | 换成 react-window 虚拟滚动 |
 | 活动列表最多 500 条 | 更早的记录要从数据库查 | 加分页游标（DTO 里已有 `before_id`） |
-| 协议 v3 与 0.2.5 及更早不兼容 | 旧版对端无法建立同步 | 两端一起升级 |
+| 协议 v3 与 0.2.5 及更早对端 | 自动降级为 v2 握手；旧版对端不会使用 `IndexChunk` 分页 | 两端升级后可启用分页索引 |
+| 冲突预览分段加载 | 打开后先显示当前 256 KiB，按「加载更多」继续读取 | 超大文件也可在应用内完整分段查看，或直接打开原文件/副本 |
 | 不跟随符号链接 | 链接目标不会同步 | 初版有意为之，见设计决策 |
 | 中继落盘文件未做应用层加密 | 中继管理员/入侵者可读取文件内容 | 自建可信服务器 + 磁盘加密；需要更强隔离时做客户端加密 |
-| macOS/Linux 未实机验证 | 主要在 Windows 上验证 | Tauri bundler 已配好，需在对应平台构建 |
+| macOS/Linux 客户端不支持 | 不提供安装包、更新包与兼容性保证 | 仅支持 Windows 10/11 x64；不计划支持 |
 | 旧 iroh 身份/信任不兼容 | 升级后旧设备记录无法继续认证 | 双方升级后重新配对 |
 
 ## 排障

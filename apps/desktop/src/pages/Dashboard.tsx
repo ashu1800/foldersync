@@ -36,7 +36,7 @@ export default function Dashboard() {
   } = useStore();
   const [env, setEnv] = useState<EnvStatusDto | null>(null);
   const [envLoading, setEnvLoading] = useState(false);
-  const [envError, setEnvError] = useState<string | null>(null);
+  const [envError, setEnvError] = useState<unknown>(null);
   const [showRelayGuide, setShowRelayGuide] = useState(false);
 
   const refreshEnv = useCallback(async () => {
@@ -45,7 +45,7 @@ export default function Dashboard() {
       setEnv(next);
       setEnvError(null);
     } catch (e) {
-      setEnvError(api.asCmdError(e).message);
+      setEnvError(e);
     }
   }, []);
 
@@ -66,7 +66,7 @@ export default function Dashboard() {
         const next = await api.getEnvironmentStatus();
         if (!cancelled) setEnv(next);
       } catch (e) {
-        if (!cancelled) setEnvError(api.asCmdError(e).message);
+        if (!cancelled) setEnvError(e);
       }
     })();
     return () => {
@@ -79,7 +79,7 @@ export default function Dashboard() {
       await api.openTailscaleDownload();
       setEnvError(null);
     } catch (e) {
-      setEnvError(api.asCmdError(e).message);
+      setEnvError(e);
     }
   };
 
@@ -102,7 +102,7 @@ export default function Dashboard() {
 
       {(overviewError || devicesError || foldersError) && (
         <ErrorBanner
-          message={overviewError ?? devicesError ?? foldersError ?? ""}
+          error={overviewError ?? devicesError ?? foldersError}
           onRetry={() => void refreshAll()}
         />
       )}
@@ -162,9 +162,7 @@ export default function Dashboard() {
           </div>
         </div>
       )}
-      {envError && (
-        <ErrorBanner message={envError} onDismiss={() => setEnvError(null)} />
-      )}
+      {envError && <ErrorBanner error={envError} onDismiss={() => setEnvError(null)} />}
       {showRelayGuide && <RelayGuideModal onClose={() => setShowRelayGuide(false)} />}
 
       <div className="stat-row">

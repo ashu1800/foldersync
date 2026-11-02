@@ -16,18 +16,18 @@
 | UI 初查 | 图标/主题/交互/排版/布局 | SVG 图标集、设计 token、深色对比、Modal focus trap、ConfirmDialog、状态徽标、响应式布局、动画与 reduced-motion |
 | UI 复查 | 状态展示/错误/字体/移动端 | 分片 loading/error、短指纹与复制、24h 时间、表格固定布局、文件详情脏数据保护、更新进度条、活动筛选标签、环境提示 |
 | 用户视角 | 配对/文件夹/缺失路径/邀请 | 配对弹窗收到请求自动关闭、配对后指纹核对、共享“全部设备”哨兵语义、缺失路径“重新选择路径”、邀请接受/拒绝活动记录 |
-| P2 收口 | 活动暂停/冲突对比/托盘状态/目录加载/中继清理 | 活动暂停时缓存并计数新事件、恢复后合并；冲突页并排文本预览（前 64 KiB）；托盘菜单暂停/恢复勾选与 tooltip 同步；文件夹树显示更多；中继空闲房间保留期清理；SSH 端口变更提示立即重启 |
+| P2 收口 | 活动暂停/冲突对比/托盘状态/目录加载/中继清理 | 活动暂停时缓存并计数新事件、恢复后合并；冲突页并排文本预览支持 256 KiB 分段加载；托盘菜单暂停/恢复勾选与 tooltip 同步；文件夹树显示更多；中继空闲房间保留期清理；SSH 端口变更提示立即重启 |
+| P2 补齐 | 旧中继索引、CLI 忽略、首扫、协议兼容 | 旧索引无 `folder_name` 自动生成回退名；CLI `sync` 应用 `default_ignore`；首次扫描并行哈希；v3 对 v2 对端自动降级 |
 
 ## 验证基线
 
 - `cargo fmt --all -- --check`：通过
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过
-- `cargo test --workspace`：207 passed，2 ignored，0 failed
+- `cargo test --workspace`：212 passed，2 ignored，0 failed
 - `pnpm exec prettier --check src`、`tsc --noEmit`、`eslint src`、`pnpm build`：通过
 - 桌面端 916×639 截图检查：Dashboard / Devices / Folders / FolderDetail / Settings / Activity / Conflicts 均无溢出或遮挡
 
 ## 遗留事项
 
-- `Message::Index` 已按 4000 条分页，协议版本 3；旧版对端需升级（P2 兼容）
-- 中继自动邀请已支持；旧版本中继索引无 `folder_name` 时仍需手动添加（P2 兼容）
-- 超大冲突文件完整对比、macOS 签名与公证（P2）
+- 平台范围：桌面客户端仅支持 Windows 10/11 x64；macOS/Linux 客户端不在支持范围，不提供安装包或兼容性保证
+- 长期设计限制：`folder_id` 由文件夹名派生、限速传输后结算、活动列表最多 500 条、不跟随符号链接、中继落盘未做应用层加密

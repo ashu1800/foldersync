@@ -24,11 +24,13 @@ export default function Conflicts() {
   const { t } = useTranslation();
   const { conflicts, folders, refreshConflicts, conflictsError } = useStore();
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [preview, setPreview] = useState<ConflictPreviewDto | null>(null);
+  const [previewSource, setPreviewSource] = useState<ConflictDto | null>(null);
   const [previewLabel, setPreviewLabel] = useState("");
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
+  const [previewLoadingMore, setPreviewLoadingMore] = useState(false);
   const previewGeneration = useRef(0);
   const [confirmAction, setConfirmAction] = useState<{
     c: ConflictDto;
@@ -61,6 +63,7 @@ export default function Conflicts() {
     const gen = ++previewGeneration.current;
     setPreviewLoading(c.id);
     setPreviewLabel(c.original_path);
+    setPreviewSource(c);
     try {
       const data = await api.getConflictPreview(
         c.folder_id,
@@ -70,7 +73,7 @@ export default function Conflicts() {
       if (gen !== previewGeneration.current) return;
       setPreview(data);
     } catch (e) {
-      if (gen === previewGeneration.current) setError(api.asCmdError(e).message);
+      if (gen === previewGeneration.current) setError(e);
     } finally {
       if (gen === previewGeneration.current) setPreviewLoading(null);
     }
@@ -79,8 +82,42 @@ export default function Conflicts() {
   const closePreview = () => {
     previewGeneration.current += 1;
     setPreview(null);
+    setPreviewSource(null);
     setPreviewLoading(null);
+    setPreviewLoadingMore(false);
   };
+
+  const loadMorePreview = useCallback(async () => {
+    if (!preview || !previewSource || !preview.truncated || previewLoadingMore) return;
+    const gen = previewGeneration.current;
+    setPreviewLoadingMore(true);
+    try {
+      const data = await api.getConflictPreviewPage(
+        previewSource.folder_id,
+        previewSource.original_path,
+        previewSource.conflict_path,
+        preview.next_offset,
+      );
+      if (gen !== previewGeneration.current) return;
+      setPreview((current) =>
+        current
+          ? {
+              ...current,
+              original:
+                data.original == null ? null : (current.original ?? "") + data.original,
+              conflict: current.conflict + data.conflict,
+              truncated: data.truncated,
+              binary: data.binary,
+              next_offset: data.next_offset,
+            }
+          : data,
+      );
+    } catch (e) {
+      if (gen === previewGeneration.current) setError(e);
+    } finally {
+      if (gen === previewGeneration.current) setPreviewLoadingMore(false);
+    }
+  }, [preview, previewSource, previewLoadingMore]);
 
   const resolve = useCallback(
     async (c: ConflictDto, resolution: ConflictResolution) => {
@@ -90,7 +127,7 @@ export default function Conflicts() {
         setConfirmAction(null);
         await refreshConflicts();
       } catch (e) {
-        setError(api.asCmdError(e).message);
+        setError(e);
       } finally {
         setBusy(null);
       }
@@ -106,7 +143,7 @@ export default function Conflicts() {
 
       {(error ?? conflictsError) && (
         <ErrorBanner
-          message={error ?? conflictsError ?? ""}
+          error={error ?? conflictsError}
           onRetry={() => void refreshConflicts()}
           onDismiss={() => setError(null)}
         />
@@ -199,7 +236,7 @@ export default function Conflicts() {
                   onClick={() =>
                     void api
                       .openFile(c.folder_id, c.original_path)
-                      .catch((e) => setError(api.asCmdError(e).message))
+                      .catch((e) => setError(e))
                   }
                 >
                   {t("conflicts.openOriginal")}
@@ -209,7 +246,7 @@ export default function Conflicts() {
                   onClick={() =>
                     void api
                       .openFile(c.folder_id, c.conflict_path)
-                      .catch((e) => setError(api.asCmdError(e).message))
+                      .catch((e) => setError(e))
                   }
                 >
                   {t("conflicts.openCopy")}
@@ -219,7 +256,7 @@ export default function Conflicts() {
                   onClick={() =>
                     void api
                       .openFolderItem(c.folder_id, c.conflict_path)
-                      .catch((e) => setError(api.asCmdError(e).message))
+                      .catch((e) => setError(e))
                   }
                 >
                   {t("conflicts.openDir")}
@@ -280,9 +317,22 @@ export default function Conflicts() {
           width={920}
           onClose={closePreview}
           footer={
-            <button className="btn" onClick={closePreview}>
-              {t("common.close")}
-            </button>
+            <div className="btn-row">
+              {preview.truncated && !preview.binary && (
+                <button
+                  className="btn"
+                  disabled={previewLoadingMore}
+                  onClick={() => void loadMorePreview()}
+                >
+                  {previewLoadingMore
+                    ? t("conflicts.loadingPreview")
+                    : t("conflicts.loadMorePreview")}
+                </button>
+              )}
+              <button className="btn" onClick={closePreview}>
+                {t("common.close")}
+              </button>
+            </div>
           }
         >
           <div className="card-meta" style={{ marginBottom: 10 }}>

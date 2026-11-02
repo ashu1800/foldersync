@@ -12,6 +12,7 @@
 
 pub mod blobstore;
 pub mod conn;
+pub mod discover;
 pub mod env;
 pub mod frame;
 pub mod identity;

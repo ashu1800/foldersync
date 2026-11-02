@@ -21,7 +21,7 @@ export default function Settings() {
   const { t, i18n } = useTranslation();
   const [s, setS] = useState<SettingsDto | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [saved, setSaved] = useState(false);
   const [savingField, setSavingField] = useState<string | null>(null);
   const [version, setVersion] = useState("");
@@ -29,7 +29,7 @@ export default function Settings() {
   const [diagPath, setDiagPath] = useState<string | null>(null);
   const [env, setEnv] = useState<EnvStatusDto | null>(null);
   const [envBusy, setEnvBusy] = useState(false);
-  const [envError, setEnvError] = useState<string | null>(null);
+  const [envError, setEnvError] = useState<unknown>(null);
   const [showRelayGuide, setShowRelayGuide] = useState(false);
   const [sshPortRestart, setSshPortRestart] = useState(false);
   // 手动检查更新（Basic 版本更新服务）；下载安装与弹窗共用 useUpdateInstall
@@ -37,7 +37,7 @@ export default function Settings() {
     "idle" | "checking" | "found" | "latest" | "error"
   >("idle");
   const [update, setUpdate] = useState<UpdateDto | null>(null);
-  const [checkError, setCheckError] = useState<string | null>(null);
+  const [checkError, setCheckError] = useState<unknown>(null);
   const installer = useUpdateInstall();
 
   const refreshEnv = useCallback(async () => {
@@ -46,7 +46,7 @@ export default function Settings() {
       setEnv(next);
       setEnvError(null);
     } catch (e) {
-      setEnvError(api.asCmdError(e).message);
+      setEnvError(e);
     }
   }, []);
 
@@ -62,7 +62,7 @@ export default function Settings() {
       setDeviceId(String(info.device_id ?? ""));
       setError(null);
     } catch (e) {
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setLoading(false);
     }
@@ -80,7 +80,7 @@ export default function Settings() {
         const next = await api.getEnvironmentStatus();
         if (!cancelled) setEnv(next);
       } catch (e) {
-        if (!cancelled) setEnvError(api.asCmdError(e).message);
+        if (!cancelled) setEnvError(e);
       }
     })();
     return () => {
@@ -126,7 +126,7 @@ export default function Settings() {
         if (keys.some((k) => (prev as any)[k] !== (preview as any)[k])) return prev;
         return { ...prev, ...previous };
       });
-      setError(api.asCmdError(e).message);
+      setError(e);
     } finally {
       setSavingField(null);
     }
@@ -138,7 +138,7 @@ export default function Settings() {
     try {
       setEnv(await api.repairSshEnvironment());
     } catch (e) {
-      setEnvError(api.asCmdError(e).message);
+      setEnvError(e);
     } finally {
       setEnvBusy(false);
     }
@@ -148,18 +148,13 @@ export default function Settings() {
     try {
       await api.openTailscaleDownload();
     } catch (e) {
-      setEnvError(api.asCmdError(e).message);
+      setEnvError(e);
     }
   };
 
   if (loading) return <Loading />;
   if (!s) {
-    return (
-      <ErrorBanner
-        message={error ?? t("common.loadFailed")}
-        onRetry={() => void loadSettings()}
-      />
-    );
+    return <ErrorBanner error={error} onRetry={() => void loadSettings()} />;
   }
 
   return (
@@ -170,7 +165,7 @@ export default function Settings() {
         {savingField && <span className="badge badge-muted">{t("common.saving")}</span>}
       </div>
 
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error != null && <ErrorBanner error={error} onDismiss={() => setError(null)} />}
 
       {/* 基本信息 */}
       <div className="card">
@@ -306,9 +301,9 @@ export default function Settings() {
           {t("settings.networkTitle")}
         </h2>
 
-        {envError && (
+        {envError != null && (
           <p className="hint" style={{ color: "var(--danger)", marginBottom: 10 }}>
-            {envError}
+            {api.localizedError(envError, t)}
           </p>
         )}
 
@@ -552,7 +547,7 @@ export default function Settings() {
                 await api.openLogDir();
                 setError(null);
               } catch (e) {
-                setError(api.asCmdError(e).message);
+                setError(e);
               }
             }}
           >
@@ -566,7 +561,7 @@ export default function Settings() {
                 setDiagPath(path);
                 await navigator.clipboard?.writeText(path).catch(() => {});
               } catch (e) {
-                setError(api.asCmdError(e).message);
+                setError(e);
               }
             }}
           >
@@ -589,7 +584,7 @@ export default function Settings() {
                   setUpdate(u);
                   setUpdateState(u.available ? "found" : "latest");
                 } catch (e) {
-                  setCheckError(api.asCmdError(e).message);
+                  setCheckError(e);
                   setUpdateState("error");
                 }
               }}

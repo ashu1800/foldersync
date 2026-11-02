@@ -165,12 +165,18 @@ impl SshClient {
         self.sftp.clone()
     }
 
-    /// 从对端 SFTP 下载 blob 到本地 blob 库。
+    /// 从对端 SFTP 下载 blob 到本地 blob 库（支持断点续传）。
+    ///
+    /// 之前每次失败都从 0 开始重传整个文件：2GB 文件在弱网下传 90% 断线
+    /// 就全部作废，重试 3 次 = 最多白传 6 份。现在从已下载的字节处续传
+    /// （临时文件保留在 blob 根目录，跨重试复用），内容哈希在
+    /// [`BlobStore::adopt_downloaded`] 里强校验，续传错位不可能落库。
     pub async fn download_blob(
         sftp: &Arc<tokio::sync::Mutex<SftpSession>>,
         hash: &str,
         store: &BlobStore,
     ) -> Result<()> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
         anyhow::ensure!(
             crate::blobstore::is_valid_hash(hash),
             "hash 格式无效（需 64 位 hex）"
@@ -187,15 +193,39 @@ impl SshClient {
                 .open(format!("blobs/{hash}"))
                 .await
                 .with_context(|| format!("对端缺少文件内容: {hash}"))?;
-            let mut local = tokio::fs::File::create(&tmp)
+            let remote_len = remote.metadata().await.map(|m| m.len()).unwrap_or(0);
+            // 已有的临时文件续传；长度异常（对端内容变了/上轮写坏）就重来
+            let mut have = tokio::fs::metadata(&tmp)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if have > remote_len {
+                have = 0;
+            }
+            let mut local = tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&tmp)
                 .await
                 .context("创建下载临时文件失败")?;
-            tokio::io::copy(&mut remote, &mut local)
+            if have > 0 {
+                local.seek(std::io::SeekFrom::Start(have)).await.ok();
+                remote
+                    .seek(std::io::SeekFrom::Start(have))
+                    .await
+                    .context("对端文件不支持偏移读取")?;
+            } else {
+                local.set_len(0).await.ok();
+            }
+            let copied = tokio::io::copy(&mut remote, &mut local)
                 .await
                 .context("从对端下载文件失败")?;
-            tokio::io::AsyncWriteExt::flush(&mut local).await.ok();
+            debug_assert_eq!(have + copied, remote_len, "SFTP copy 应到 EOF");
+            local.flush().await.ok();
         }
         store.adopt_downloaded(&tmp, hash).await.inspect_err(|_| {
+            // 校验失败说明续传基础已坏：删掉临时文件，下次从 0 开始
             let _ = std::fs::remove_file(&tmp);
         })?;
         Ok(())

@@ -66,13 +66,10 @@ gh run watch <run-id>
 Release 工作流：
 
 ```
-check (复用 ci.yml)  ──┬─→ publish / windows-latest
-                       ├─→ publish / macos-latest (aarch64)
-                       ├─→ publish / macos-latest (x86_64)
-                       └─→ publish / ubuntu-22.04
+check (复用 ci.yml)  ──→ publish / windows-latest
 ```
 
-`check` 不通过时 publish 全部跳过 —— 这是故意的，坏代码不该变成用户的更新。
+`check` 不通过时 publish 跳过 —— 这是故意的，坏代码不该变成用户的更新。
 
 ### 7. 验证发布结果
 
@@ -83,9 +80,7 @@ gh release view v0.2.0
 必须能看到：
 
 - `FolderSync_0.2.0_x64-setup.exe` + `.sig`
-- `FolderSync_0.2.0_aarch64.dmg` / `x64.dmg`
-- `foldersync_0.2.0_amd64.AppImage` / `.deb`
-- **`latest.json`** ← 客户端靠它判断有没有新版本，缺了自动更新就失效
+- **`latest.json`** ← 旧版客户端靠它判断有没有新版本，缺了自动更新就失效
 
 验证 `latest.json` 内容：
 
@@ -93,7 +88,7 @@ gh release view v0.2.0
 gh release download v0.2.0 -p latest.json -O - | head -30
 ```
 
-里面应该有 `version`、各平台的 `url` 和 `signature`。
+里面应该有 `version`、Windows 平台的 `url` 和 `signature`。
 
 ### 8. 实测更新
 
@@ -119,15 +114,11 @@ gh release download v0.2.0 -p latest.json -O - | head -30
 | 坑 | 症状 | 根因 |
 |----|------|------|
 | release 是草稿 | 客户端检查更新永远 404 | 草稿不出现在 `releases/latest`，别传 `releaseDraft` |
-| tauri-action 找不到产物 | `No artifacts were found` | 它按 `info.name` 猜文件名，Linux 上是 kebab-case（`folder-sync`），对不上 |
 | 产物目录找不到 | `target/release/bundle: No such file` | 带 `--target` 构建时在 `target/<triple>/release/bundle` |
-| Linux/macOS 没产物 | 只出了裸二进制 | 没传 `--bundles`，tauri 在 CI 上会跳过打包 |
 | 签名卡死 | 构建停在 "expect a prompt for password" | 私钥无密码时要同时给空串**和** `CI=true`，否则 CLI 走交互式提示 |
 | latest.json 的 URL 404 | 下载 `vv0.1.0` 或文件名带 `v` | tag 本身带 `v`，拼 URL/文件名前必须先去掉 |
-| macOS 两个架构指向同一个包 | 下载下来是错的架构 | `.app.tar.gz` 两个架构同名，上传前要改名带架构 |
 | TS 绑定检查永远失败 | diff 内容看起来一模一样 | 自己用 `TS::decl` 拼文件，丢了 ts-rs 的文件头和 rustdoc；要用官方的 `export_to_string` |
 | Windows 上脚本崩 | `UnicodeEncodeError: charmap` | Windows runner 的 Python stdout 是 cp1252，脚本输出只能英文 |
-| macOS 上脚本 exit 127 | `python: command not found` | macOS 只有 `python3`，Windows 只有 `python`，用 `command -v python3 \|\| command -v python` |
 
 ## 绝对不能做的事
 

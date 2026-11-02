@@ -1,7 +1,7 @@
-# FolderSync 协议 v2（SSH + SFTP）
+# FolderSync 协议（SSH + SFTP）
 
 当前协议版本：`PROTOCOL_VERSION = 3`（定义见 `crates/fs-sync-net/src/message.rs`）。
-v1 的 iroh / QUIC 协议已弃用；v2 与 v3 的枚举尾部新增 `IndexChunk`，跨版本连接会由 `Hello` 握手拒绝。
+v1 的 iroh / QUIC 协议已弃用；v3 新增 `IndexChunk` 大索引分页，并对 0.2.5 及更早的 v2 对端保留兼容握手。
 
 ## 1. 传输层
 
@@ -26,8 +26,9 @@ v1 的 iroh / QUIC 协议已弃用；v2 与 v3 的枚举尾部新增 `IndexChunk
 | `length` | `u32`（大端） | postcard 消息体的字节数 |
 | `body` | `bytes` | postcard 编码的 `Message` |
 
-- 单帧上限 `MAX_FRAME = 64 MiB`：索引可能很大，但必须有界，防恶意对端；超大索引按 4000 条分页为 `IndexChunk`。
-- 帧本身不带版本字段。`Hello` 消息携带 `protocol_version: u16`（当前为 3），双方必须匹配；中继模式的 `index.json` 顶层也带同名的 `protocol_version`。
+- 单帧上限 `MAX_FRAME = 64 MiB`：索引可能很大，但必须有界，防恶意对端；v3 对端超大索引按 4000 条分页为 `IndexChunk`。
+- 帧本身不带版本字段。`Hello` 消息携带 `protocol_version: u16`（当前为 3），服务端同时接受 v2 兼容握手；v2 对端不会收到 `IndexChunk`，超过 4000 条的索引会退回单条 `Index`。中继模式的 `index.json` 顶层也带同名的 `protocol_version`。
+- v3 客户端首次用 v3 握手；若旧服务端返回 `PROTOCOL_MISMATCH`，会自动用 v2 重连一次。新服务端收到 v2 `Hello` 时按 v2 应答。
 - 所有消息定义以 `crates/fs-sync-net/src/message.rs` 为准。
 
 ## 3. 消息
@@ -189,4 +190,5 @@ struct FolderSummary {
 ## 7. 版本历史
 
 - **v1**：iroh 1.4.1 + iroh-blobs 0.103.1，ALPN `/foldersync/1`，QUIC/UDP。已弃用，不再维护。
-- **v2**：SSH（russh 0.65）+ SFTP（russh-sftp 3.0.1），Tailscale 直连 / 自建中继。当前版本。
+- **v2**：SSH（russh 0.65）+ SFTP（russh-sftp 3.0.1），Tailscale 直连 / 自建中继；0.2.5 及更早使用。
+- **v3**：新增 `IndexChunk` 分页索引；与 v2 对端自动降级兼容（不发送分页消息）。

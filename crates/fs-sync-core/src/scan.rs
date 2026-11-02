@@ -1,7 +1,8 @@
 //! 目录扫描：遍历文件夹生成 FileEntry 列表（含 blake3 哈希），应用忽略规则。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use blake3::Hasher;
 use ignore::WalkBuilder;
@@ -9,6 +10,23 @@ use ignore::WalkBuilder;
 use crate::entry::FileEntry;
 use crate::ignore_mod::IgnoreMatcher;
 use crate::version::VersionVector;
+
+/// 待并行计算哈希的文件；遍历阶段只收集元数据，避免大文件夹串行读盘。
+struct PendingFile {
+    rel: String,
+    abs: PathBuf,
+    size: u64,
+    mtime: i64,
+    mode: u32,
+}
+
+/// 已知索引快照：size+mtime 一致的文件直接复用旧 hash，不重读文件。
+///
+/// 之前兜底扫描每 10 分钟对所有文件全量重哈希（10 万文件 ≈ 每次读几十 GB），
+/// 磁盘持续被打满。绝大多数文件从未变化；同秒等长写入的漏检风险由
+/// `needs_fresh_hash`（mtime 变化才跳过）保持——mtime 完全相同才复用，
+/// 外部程序改写文件几乎必然更新 mtime。
+pub type KnownIndex = HashMap<String, FileEntry>;
 
 /// 扫描结果。
 #[derive(Debug, Clone, Default)]
@@ -20,6 +38,9 @@ pub struct ScanResult {
     /// 读取失败的路径（权限不足、被占用等）。调用方必须保留这些路径（及其子路径）
     /// 的旧条目，不能当成"已删除"生成墓碑。
     pub unreadable: Vec<String>,
+    /// 待哈希文件（rel, size, mtime, abs）。由 scan_folder / scan_folder_known 消费，
+    /// 返回给调用方时已清空。
+    pending: Vec<(String, u64, i64, PathBuf, u32)>,
 }
 
 impl ScanResult {
@@ -30,6 +51,18 @@ impl ScanResult {
                 || (path.len() > u.len()
                     && path.starts_with(u.as_str())
                     && path.as_bytes()[u.len()] == b'/')
+        })
+    }
+
+    /// `path` 本身或其某个祖先被跳过（符号链接等）。跳过 ≠ 删除：
+    /// 常规文件被替换成 symlink 后扫描把它归入 skipped，如果当成"已消失"
+    /// 产墓碑，对端会把真实文件删掉。调用方必须保留这些路径的旧条目。
+    pub fn is_skipped(&self, path: &str) -> bool {
+        self.skipped.iter().any(|s| {
+            path == s
+                || (path.len() > s.len()
+                    && path.starts_with(s.as_str())
+                    && path.as_bytes()[s.len()] == b'/')
         })
     }
 }
@@ -54,7 +87,71 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
 }
 
 /// 扫描整个文件夹。跳过符号链接（初版不同步链接，提示词 4.8）。
+///
+/// `known`：上一次的索引快照。size+mtime 与已知一致（且非墓碑）的文件
+/// 直接复用旧 hash，不产生任何文件读取；其余文件照常哈希。
+pub fn scan_folder_known(
+    root: &Path,
+    matcher: &IgnoreMatcher,
+    known: &KnownIndex,
+) -> std::io::Result<ScanResult> {
+    let mut res = scan_metadata(root, matcher)?;
+    // 需要真读文件的：known 里没有 / 已删除 / size 或 mtime 变了
+    let mut files: Vec<PendingFile> = Vec::new();
+    for (rel, size, mtime, abs, mode) in res.pending.drain(..) {
+        if let Some(old) = known.get(&rel)
+            && !old.deleted
+            && !old.is_dir
+            && old.size == size
+            && old.mtime == mtime
+        {
+            res.entries.insert(
+                rel.clone(),
+                FileEntry {
+                    path: rel,
+                    size,
+                    mtime,
+                    hash: old.hash.clone(),
+                    is_dir: false,
+                    deleted: false,
+                    version: VersionVector::new(),
+                    modified_by: String::new(),
+                    mode: old.mode,
+                },
+            );
+            continue;
+        }
+        files.push(PendingFile {
+            rel,
+            abs,
+            size,
+            mtime,
+            mode,
+        });
+    }
+    hash_pending(&mut res, files);
+    Ok(res)
+}
+
+/// 扫描整个文件夹（无已知索引，全部文件重哈希）。等价 `scan_folder_known(root, m, &{})`。
 pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<ScanResult> {
+    let mut res = scan_metadata(root, matcher)?;
+    let files = std::mem::take(&mut res.pending)
+        .into_iter()
+        .map(|(rel, size, mtime, abs, mode)| PendingFile {
+            rel,
+            abs,
+            size,
+            mtime,
+            mode,
+        })
+        .collect();
+    hash_pending(&mut res, files);
+    Ok(res)
+}
+
+/// 遍历目录收集元数据；文件部分暂存在 `ScanResult::pending`。
+fn scan_metadata(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<ScanResult> {
     let mut res = ScanResult::default();
 
     // 关掉 walker 的所有内置过滤（隐藏文件、.gitignore、.ignore 等），
@@ -115,49 +212,124 @@ pub fn scan_folder(root: &Path, matcher: &IgnoreMatcher) -> std::io::Result<Scan
         };
 
         // 忽略规则已在 filter_entry 里处理（含目录剪枝）
-        let is_dir = meta.is_dir();
+        if meta.is_dir() {
+            res.entries.insert(
+                rel_str.clone(),
+                FileEntry {
+                    path: rel_str,
+                    size: 0,
+                    mtime: 0,
+                    hash: String::new(),
+                    is_dir: true,
+                    deleted: false,
+                    version: VersionVector::new(),
+                    modified_by: String::new(),
+                    #[cfg(unix)]
+                    mode: {
+                        use std::os::unix::fs::PermissionsExt;
+                        md.permissions().mode()
+                    },
+                    #[cfg(not(unix))]
+                    mode: 0,
+                },
+            );
+            continue;
+        }
 
-        let (size, mtime, hash) = if is_dir {
-            (0u64, 0i64, String::new())
-        } else {
-            let md = match std::fs::metadata(abs) {
-                Ok(m) => m,
-                Err(_) => {
-                    res.unreadable.push(rel_str);
-                    continue;
-                }
-            };
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // 哈希失败（文件被独占锁定等）不能写空 hash，否则会被当成内容变化广播出去
-            let hash = match hash_file(abs) {
-                Ok(h) => h,
-                Err(_) => {
-                    res.unreadable.push(rel_str);
-                    continue;
-                }
-            };
-            (md.len(), mtime, hash)
+        let md = match std::fs::metadata(abs) {
+            Ok(m) => m,
+            Err(_) => {
+                res.unreadable.push(rel_str);
+                continue;
+            }
         };
-
-        let entry = FileEntry {
-            path: rel_str.clone(),
-            size,
-            mtime,
-            hash,
-            is_dir,
-            deleted: false,
-            version: VersionVector::new(),
-            modified_by: String::new(), // 扫描不产生版本，由调用方按文件夹逻辑填充
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        // Unix 权限位随条目同步；Windows 上没有等价语义，恒 0
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            md.permissions().mode()
         };
-        res.entries.insert(rel_str, entry);
+        #[cfg(not(unix))]
+        let mode = 0u32;
+        res.pending
+            .push((rel_str, md.len(), mtime, abs.to_path_buf(), mode));
     }
 
     Ok(res)
+}
+
+/// 对收集到的文件并行哈希并写入 res.entries；失败的进 unreadable。
+fn hash_pending(res: &mut ScanResult, files: Vec<PendingFile>) {
+    let hashes = hash_pending_files(&files);
+    for (file, hash) in files.into_iter().zip(hashes) {
+        // 哈希失败（文件被独占锁定等）不能写空 hash，否则会被当成内容变化广播出去
+        let Some(hash) = hash else {
+            res.unreadable.push(file.rel);
+            continue;
+        };
+        res.entries.insert(
+            file.rel.clone(),
+            FileEntry {
+                path: file.rel,
+                size: file.size,
+                mtime: file.mtime,
+                hash,
+                is_dir: false,
+                deleted: false,
+                version: VersionVector::new(),
+                modified_by: String::new(), // 扫描不产生版本，由调用方按文件夹逻辑填充
+                mode: file.mode,
+            },
+        );
+    }
+}
+
+/// 并行哈希；返回顺序与 `files` 一致，读取失败为 None。
+fn hash_pending_files(files: &[PendingFile]) -> Vec<Option<String>> {
+    let mut hashes = vec![None; files.len()];
+    if files.is_empty() {
+        return hashes;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(files.len());
+    if workers <= 1 {
+        for (i, file) in files.iter().enumerate() {
+            hashes[i] = hash_file(&file.abs).ok();
+        }
+        return hashes;
+    }
+
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= files.len() {
+                        break;
+                    }
+                    let _ = tx.send((i, hash_file(&files[i].abs).ok()));
+                }
+            });
+        }
+        drop(tx);
+        for (i, hash) in rx {
+            hashes[i] = hash;
+        }
+    });
+    hashes
 }
 
 /// 分块计算文件 blake3 哈希，返回 hex。
@@ -204,6 +376,34 @@ mod tests {
         assert!(r.entries["sub"].is_dir);
         assert_eq!(r.entries["sub"].hash, "");
         assert!(r.skipped.is_empty());
+    }
+
+    #[test]
+    fn parallel_hash_returns_results_in_input_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..16 {
+            let path = tmp.path().join(format!("{i}.txt"));
+            let content = format!("value-{i}");
+            std::fs::write(&path, &content).unwrap();
+            files.push(PendingFile {
+                rel: format!("{i}.txt"),
+                abs: path,
+                size: content.len() as u64,
+                mtime: 0,
+                mode: 0,
+            });
+        }
+        let hashes = hash_pending_files(&files);
+        assert_eq!(hashes.len(), files.len());
+        for (i, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(
+                hash.unwrap(),
+                blake3::hash(format!("value-{i}").as_bytes())
+                    .to_hex()
+                    .to_string()
+            );
+        }
     }
 
     #[test]
@@ -254,6 +454,21 @@ mod tests {
         assert!(r.is_unreadable("locked/a.txt"));
         assert!(!r.is_unreadable("locked2"));
         assert!(!r.is_unreadable("other"));
+    }
+
+    #[test]
+    fn is_skipped_matches_self_and_children_only() {
+        let r = ScanResult {
+            skipped: vec!["link.txt".into()],
+            ..Default::default()
+        };
+        assert!(r.is_skipped("link.txt"));
+        assert!(
+            r.is_skipped("link.txt/child.txt"),
+            "链接目录下的子路径也要保留"
+        );
+        assert!(!r.is_skipped("link.txt2"));
+        assert!(!r.is_skipped("other.txt"));
     }
 
     #[test]

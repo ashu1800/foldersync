@@ -106,15 +106,25 @@ impl SyncEngine {
 
     /// 把远端条目写入本地（内容已从 blob 存储取到）。
     ///
-    /// 流程（提示词 4.5）：校验路径 → 原子落盘 → 更新索引 → 登记自写抑制。
+    /// 流程（提示词 4.5）：校验路径 → 忽略规则复查 → 原子落盘 → 更新索引 → 登记自写抑制。
     pub async fn apply_pulled(&self, entry: &FileEntry, blob_hash: &str) -> Result<()> {
         // 安全：路径必过校验（对端不可信）
         let rel =
             validate_path(&entry.path).with_context(|| format!("拒绝非法路径: {}", entry.path))?;
-        let dest = self.root.join(&rel);
+        // \\?\ 前缀突破 MAX_PATH 260（深层 node_modules 等场景必需）
+        let dest = fs_sync_core::long_path(&self.root.join(&rel));
 
         // 防御：规范化后必须仍在文件夹内
         ensure_within(&self.root, &dest)?;
+
+        // 忽略规则复查：本端已忽略的路径不再收对端推送。
+        // 没有这一步会出现回弹震荡：本端把文件加入 .syncignore → 索引移除（不产墓碑）
+        // → 对端 diff 判"本地有、远端无" → 推回来 → 本端写盘 → 下轮扫描又移除 → 循环。
+        // 对端推的条目不含 is_dir 之外的本端视角，用条目自身类型判断。
+        let matcher = fs_sync_core::matcher_for_folder(&self.root);
+        if matcher.matched(&entry.path, entry.is_dir) {
+            anyhow::bail!("路径已被本端忽略规则排除，拒绝落盘: {}", entry.path);
+        }
 
         if entry.is_dir {
             tokio::fs::create_dir_all(&dest)
@@ -144,6 +154,22 @@ impl SyncEngine {
             }
         }
 
+        // Unix 权限位对齐：可执行位等随文件同步。mode=0（旧版本/Windows 来源）
+        // 跳过，避免把文件 chmod 成 000。Windows 无等价语义，恒跳过。
+        #[cfg(unix)]
+        if entry.mode != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dest.clone();
+            let mode = entry.mode;
+            let r = tokio::task::spawn_blocking(move || {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+            })
+            .await;
+            if let Ok(Err(e)) = r {
+                warn!(path = %rel, "设置权限位失败: {e}");
+            }
+        }
+
         // 自写抑制：避免监听循环
         self.suppression.insert(&rel, blob_hash).await;
         self.mark_applied(entry).await?;
@@ -166,8 +192,15 @@ impl SyncEngine {
     /// 删除本地文件（墓碑生效）。
     pub async fn apply_delete(&self, rel_path: &str) -> Result<()> {
         let rel = validate_path(rel_path).with_context(|| format!("拒绝非法路径: {rel_path}"))?;
-        let dest = self.root.join(&rel);
+        let dest = fs_sync_core::long_path(&self.root.join(&rel));
         ensure_within(&self.root, &dest)?;
+
+        // 已忽略的路径不执行对端删除：与 apply_pulled 的复查对称，
+        // 否则用户忽略某文件后对端一删，本地文件反而被牵连删掉。
+        let matcher = fs_sync_core::matcher_for_folder(&self.root);
+        if matcher.matched(rel_path, dest.is_dir()) {
+            anyhow::bail!("路径已被本端忽略规则排除，跳过删除: {rel_path}");
+        }
 
         if dest.is_dir() {
             // 只删空目录，避免误删用户内容
@@ -235,8 +268,36 @@ impl SyncEngine {
         }
         self.suppression.insert(&conflict_rel, "").await;
 
+        // 副本立即进索引：以前只写盘不入索引，要等 10 分钟快扫才被发现同步，
+        // 期间用户在界面上也看不到这份副本。mtime/size 从磁盘取真实值。
+        let copy_meta = tokio::fs::metadata(&conflict_dest).await.ok();
+        let mut copy_entry = FileEntry::new(
+            conflict_rel.clone(),
+            copy_meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            copy_meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            String::new(),
+            false,
+            device_name,
+        );
+        if let Ok(hash) = fs_sync_core::hash_file(&conflict_dest) {
+            copy_entry.hash = hash;
+        }
+        self.store.upsert_entry(&self.folder_id, &copy_entry)?;
+
         // 胜者落到原路径
         self.apply_pulled(winner, winner_hash).await?;
+
+        // 副本内容进 blob 存储，供对端拉取
+        if !copy_entry.hash.is_empty()
+            && let Err(e) = self.ensure_blob(&copy_entry).await
+        {
+            warn!(path = %conflict_rel, "冲突副本加入 blob 失败: {e}");
+        }
 
         self.store.log_activity(
             "conflict",
@@ -257,7 +318,7 @@ impl SyncEngine {
     /// 把本地条目推给对端前，确保内容已进 blob 存储，返回 hash。
     pub async fn ensure_blob(&self, entry: &FileEntry) -> Result<String> {
         let rel = validate_path(&entry.path)?;
-        let abs = self.root.join(&rel);
+        let abs = fs_sync_core::long_path(&self.root.join(&rel));
         if self.blobs.has(&entry.hash).await {
             return Ok(entry.hash.clone());
         }
@@ -294,9 +355,27 @@ impl SyncEngine {
 
 /// 确认 `path` 规范化后仍在 `root` 内（防路径穿越）。
 pub fn ensure_within(root: &Path, path: &Path) -> Result<()> {
-    let root_c = root
-        .canonicalize()
-        .with_context(|| format!("文件夹根不存在: {}", root.display()))?;
+    // \\?\ 前缀后的 canonicalize 会保留前缀，比较前把两边归一掉
+    #[cfg(windows)]
+    fn strip_extended(p: &std::path::Path) -> std::path::PathBuf {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            std::path::PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            std::path::PathBuf::from(rest)
+        } else {
+            p.to_path_buf()
+        }
+    }
+    #[cfg(not(windows))]
+    fn strip_extended(p: &std::path::Path) -> std::path::PathBuf {
+        p.to_path_buf()
+    }
+    let root_c = strip_extended(
+        &root
+            .canonicalize()
+            .with_context(|| format!("文件夹根不存在: {}", root.display()))?,
+    );
     // 目标可能还不存在：规范化其最近的已存在祖先
     let mut parent = path;
     while !parent.exists() {
@@ -305,9 +384,11 @@ pub fn ensure_within(root: &Path, path: &Path) -> Result<()> {
             None => break,
         };
     }
-    let parent_c = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let parent_c = strip_extended(
+        &parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf()),
+    );
     if !parent_c.starts_with(&root_c) {
         anyhow::bail!(
             "路径逃逸文件夹根: {} 不在 {} 内",
@@ -333,6 +414,7 @@ mod tests {
             deleted: false,
             version: VersionVector::new(),
             modified_by: "peer".into(),
+            mode: 0,
         }
     }
 
@@ -402,6 +484,44 @@ mod tests {
         std::fs::write(eng.root.join("gone.txt"), b"x").unwrap();
         eng.apply_delete("gone.txt").await.unwrap();
         assert!(!eng.root.join("gone.txt").exists());
+    }
+
+    /// 回归：本端已忽略的路径必须拒绝对端推送与删除，否则出现回弹震荡——
+    /// 本端加入 .syncignore → 索引移除 → 对端按"本地有、远端无"反复推回，
+    /// 中继模式每 1-5 秒重写一次该文件。
+    #[tokio::test]
+    async fn ignored_path_rejects_pull_and_delete() {
+        let (eng, _tmp) = engine().await;
+        // 默认规则：*.swp / node_modules/ 都忽略；用 node_modules 更直观
+        let hash = eng.blobs.add_bytes(b"junk".to_vec()).await.unwrap();
+        let e = entry("node_modules/pkg/index.js", &hash);
+        assert!(
+            eng.apply_pulled(&e, &hash).await.is_err(),
+            "已忽略路径的推送必须被拒绝"
+        );
+        assert!(
+            !eng.root.join("node_modules/pkg/index.js").exists(),
+            "拒绝落盘后不应有文件产生"
+        );
+
+        // 删除同样拒绝（对端删了它已忽略的东西，本地不该被牵连）
+        std::fs::create_dir_all(eng.root.join("node_modules/pkg")).unwrap();
+        std::fs::write(eng.root.join("node_modules/pkg/keep.js"), b"x").unwrap();
+        assert!(eng.apply_delete("node_modules/pkg/keep.js").await.is_err());
+        assert!(
+            eng.root.join("node_modules/pkg/keep.js").exists(),
+            "已忽略路径的删除必须被跳过"
+        );
+    }
+
+    /// 反向确认：未忽略的路径不受影响（防止复查把正常同步也拦了）。
+    #[tokio::test]
+    async fn non_ignored_path_still_applies() {
+        let (eng, _tmp) = engine().await;
+        let hash = eng.blobs.add_bytes(b"ok".to_vec()).await.unwrap();
+        let e = entry("src/main.rs", &hash);
+        eng.apply_pulled(&e, &hash).await.unwrap();
+        assert!(eng.root.join("src/main.rs").exists());
     }
 
     #[tokio::test]

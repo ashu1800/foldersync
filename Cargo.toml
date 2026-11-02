@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -56,6 +56,8 @@ notify = "8"
 notify-debouncer-full = "0.5"
 ignore = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# LAN 本地发现（mDNS/DNS-SD）：无 Tailscale 时同网段直连
+mdns-sd = "0.13"
 
 [profile.release]
 lto = "thin"

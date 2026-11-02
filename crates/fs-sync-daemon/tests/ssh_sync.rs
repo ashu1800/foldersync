@@ -76,6 +76,8 @@ async fn node() -> Node {
         paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         runtimes: Arc::new(std::sync::Mutex::new(vec![runtime.clone()])),
         online: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        relay_host_keys: fs_sync_daemon::runtime::test_relay_host_keys(),
+        sftp_bandwidth: None,
     });
     Node {
         _dir: dir,
@@ -136,6 +138,8 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_a.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
+        relay_host_keys: fs_sync_daemon::runtime::test_relay_host_keys(),
+        relay_uploaded_blobs: None,
         store: a.shared.store.clone(),
         blobs: a.shared.blobs.clone(),
         sync_root: a.shared.sync_root.clone(),
@@ -148,6 +152,8 @@ async fn two_nodes_sync_files_over_real_ssh() {
         ssh_port: server_b.port,
         mode: NetworkMode::Tailscale,
         relay_url: None,
+        relay_host_keys: fs_sync_daemon::runtime::test_relay_host_keys(),
+        relay_uploaded_blobs: None,
         store: b.shared.store.clone(),
         blobs: b.shared.blobs.clone(),
         sync_root: b.shared.sync_root.clone(),

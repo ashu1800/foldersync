@@ -48,7 +48,9 @@ pub fn conflict_winner(local: &FileEntry, remote: &FileEntry) -> Side {
 
 /// 计算 本地索引 → 需要执行的同步动作。
 ///
-/// `local`/`remote`：path → entry（含墓碑）。返回动作按 path 排序，保证确定性。
+/// 返回动作按 path 排序保证确定性，**但 Pull-删除例外**：目录删除排在
+/// 文件删除之后（深度优先）。以前父目录排在前，`remove_dir` 遇到还没删的
+/// 子内容必然失败一次（非空目录跳过），要等下一轮全量交换才补删。
 pub fn diff(
     local: &HashMap<String, FileEntry>,
     remote: &HashMap<String, FileEntry>,
@@ -128,6 +130,14 @@ pub fn diff(
             (None, None) => unreachable!(),
         }
     }
+
+    // 目录删除排到文件删除之后：先删文件、目录自然变空，`remove_dir` 一次成功。
+    // 排序键：删除动作里"是目录"的放最后，其余保持原相对顺序（稳定排序）。
+    actions.sort_by_key(|a| match a {
+        // Pull 一个 deleted 的目录条目 = 本地要删目录
+        SyncAction::Pull { path } => remote.get(path).is_some_and(|e| e.deleted && e.is_dir),
+        _ => false,
+    });
     actions
 }
 

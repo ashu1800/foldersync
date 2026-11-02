@@ -168,18 +168,23 @@ export function Empty({
 }
 
 export function ErrorBanner({
+  error,
   message,
   onRetry,
   onDismiss,
 }: {
-  message: string;
+  /** 结构化后端错误：按 code 本地化（推荐） */
+  error?: unknown;
+  /** 纯文本兜底：直接展示（无 i18n 映射时用） */
+  message?: string;
   onRetry?: () => void;
   onDismiss?: () => void;
 }) {
   const { t } = useTranslation();
+  const text = message ?? api.localizedError(error ?? "unknown", t);
   return (
     <div className="error-banner" role="alert">
-      <span>{message}</span>
+      <span>{text}</span>
       <span className="btn-row">
         {onRetry && (
           <button className="btn btn-sm" onClick={onRetry}>
@@ -439,7 +444,7 @@ export function RelayGuideModal({ onClose }: { onClose: () => void }) {
         </button>
       }
     >
-      {error && <ErrorBanner message={error} />}
+      {error && <ErrorBanner error={error} />}
       {guide ? (
         <pre className="guide-pre">{guide}</pre>
       ) : (
