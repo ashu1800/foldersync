@@ -473,6 +473,8 @@ pub struct PeerLoopConfig {
     pub blobs: Arc<BlobStore>,
     pub sync_root: PathBuf,
     pub paused_all: Arc<AtomicBool>,
+    /// 新文件夹邀请挂起时的回调（桌面端转发前端事件；CLI/测试为 None）。
+    pub on_invite: Option<crate::pairing::OnInviteCb>,
 }
 
 /// 中继 host key 读写回调类型。
@@ -1381,6 +1383,7 @@ mod tests {
             blobs,
             sync_root: data.join("FolderSync"),
             paused_all: Arc::new(AtomicBool::new(false)),
+            on_invite: None,
         };
         let peer = Device {
             id: "peer".into(),

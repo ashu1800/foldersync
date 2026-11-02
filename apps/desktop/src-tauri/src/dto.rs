@@ -339,11 +339,9 @@ pub struct InviteDto {
     pub from_device: String,
     /// 建议的本地路径
     pub suggested_path: String,
-    /// 文件数
-    pub file_count: u32,
-    /// 总字节数
+    /// 收到时间（Unix 秒）
     #[ts(type = "number")]
-    pub total_size: i64,
+    pub received_at: i64,
 }
 
 /// 忽略规则配置。

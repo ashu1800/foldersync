@@ -8,6 +8,7 @@ import type {
   ConflictDto,
   DeviceDto,
   FolderDto,
+  InviteDto,
   OverviewDto,
   PendingPairingDto,
   SettingsDto,
@@ -20,6 +21,7 @@ interface State {
   folders: FolderDto[];
   settings: SettingsDto | null;
   pendingPairings: PendingPairingDto[];
+  pendingInvites: InviteDto[];
   conflicts: ConflictDto[];
 
   loading: boolean;
@@ -38,6 +40,7 @@ interface State {
   refreshFolders: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshPendingPairings: () => Promise<void>;
+  refreshPendingInvites: () => Promise<void>;
   refreshConflicts: () => Promise<void>;
   refreshAll: () => Promise<void>;
 
@@ -45,6 +48,8 @@ interface State {
   setFolder: (f: FolderDto) => void;
   addPendingPairing: (p: PendingPairingDto) => void;
   removePendingPairing: (id: string) => void;
+  addPendingInvite: (inv: InviteDto) => void;
+  removePendingInvite: (folderId: string) => void;
   addConflict: (c: ConflictDto) => void;
 }
 
@@ -54,6 +59,7 @@ export const useStore = create<State>((set, get) => ({
   folders: [],
   settings: null,
   pendingPairings: [],
+  pendingInvites: [],
   conflicts: [],
   loading: false,
   overviewLoaded: false,
@@ -118,6 +124,14 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
+  refreshPendingInvites: async () => {
+    try {
+      set({ pendingInvites: await api.listPendingInvites() });
+    } catch {
+      // 同上：静默失败，5 秒后轮询会再试
+    }
+  },
+
   refreshConflicts: async () => {
     try {
       set({
@@ -139,6 +153,7 @@ export const useStore = create<State>((set, get) => ({
       get().refreshFolders(),
       get().refreshSettings(),
       get().refreshPendingPairings(),
+      get().refreshPendingInvites(),
       get().refreshConflicts(),
     ]);
     set({ loading: false });
@@ -173,6 +188,18 @@ export const useStore = create<State>((set, get) => ({
   removePendingPairing: (id) =>
     set((s) => ({
       pendingPairings: s.pendingPairings.filter((x) => x.request_id !== id),
+    })),
+
+  addPendingInvite: (inv) =>
+    set((s) =>
+      s.pendingInvites.some((x) => x.folder_id === inv.folder_id)
+        ? s
+        : { pendingInvites: [...s.pendingInvites, inv] },
+    ),
+
+  removePendingInvite: (folderId) =>
+    set((s) => ({
+      pendingInvites: s.pendingInvites.filter((x) => x.folder_id !== folderId),
     })),
 
   addConflict: (c) =>

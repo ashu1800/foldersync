@@ -17,6 +17,7 @@ import type {
   ErrorDto,
   FolderDto,
   IgnoreRulesDto,
+  InviteDto,
   OverviewDto,
   PairingCodeDto,
   PendingPairingDto,
@@ -84,6 +85,14 @@ export const confirmPairing = (requestId: string, accept: boolean) =>
   call<void>("confirm_pairing", { requestId, accept });
 export const listPendingPairings = () =>
   call<PendingPairingDto[]>("list_pending_pairings");
+
+// ---------- 待确认的文件夹共享邀请 ----------
+
+export const listPendingInvites = () => call<InviteDto[]>("list_pending_invites");
+export const acceptPendingInvite = (inviteId: string, path: string) =>
+  call<FolderDto>("accept_pending_invite", { inviteId, path });
+export const declinePendingInvite = (inviteId: string) =>
+  call<void>("decline_pending_invite", { inviteId });
 export const renameDevice = (id: string, name: string) =>
   call<void>("rename_device", { id, name });
 export const removeDevice = (id: string) => call<void>("remove_device", { id });
@@ -188,6 +197,7 @@ export interface EventMap {
   "folder://status": FolderDto;
   "sync://activity": ActivityDto;
   "pairing://request": PendingPairingDto;
+  "folder://invite": InviteDto;
   "conflict://new": ConflictDto;
   "update://available": UpdateDto;
   "update://progress": UpdateProgressDto;

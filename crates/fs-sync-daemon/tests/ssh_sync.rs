@@ -78,6 +78,7 @@ async fn node() -> Node {
         online: Arc::new(tokio::sync::Mutex::new(Default::default())),
         relay_host_keys: fs_sync_daemon::runtime::test_relay_host_keys(),
         sftp_bandwidth: None,
+        on_invite: Arc::new(std::sync::RwLock::new(None)),
     });
     Node {
         _dir: dir,
@@ -144,6 +145,7 @@ async fn two_nodes_sync_files_over_real_ssh() {
         blobs: a.shared.blobs.clone(),
         sync_root: a.shared.sync_root.clone(),
         paused_all: a.shared.paused_all.clone(),
+        on_invite: None,
     }));
     let cfg_b = Arc::new(RwLock::new(PeerLoopConfig {
         identity: b.identity.clone(),
@@ -158,6 +160,7 @@ async fn two_nodes_sync_files_over_real_ssh() {
         blobs: b.shared.blobs.clone(),
         sync_root: b.shared.sync_root.clone(),
         paused_all: b.shared.paused_all.clone(),
+        on_invite: None,
     }));
 
     let rt_a = a.shared.runtimes.clone();

@@ -11,11 +11,14 @@ pub mod trust;
 pub mod watcher;
 
 pub use engine::{SyncEngine, WriteSuppression, ensure_within};
+pub use pairing::OnInviteCb;
 pub use pairing::{PairingManager, PendingPairing, fingerprint_str};
 pub use relay_sync::relay_sync_round;
 pub use runtime::{FolderRuntime, PeerLoopConfig, RelayHostKeys, run_peer_loop};
 pub use session::{SessionConfig, SyncSession, run_event_loop, run_periodic, to_index_update};
-pub use ssh_server::{SshServerHandle, SshServerShared, host_public_key_text, run_ssh_server};
+pub use ssh_server::{
+    SshServerHandle, SshServerShared, host_public_key_text, is_safe_folder_name, run_ssh_server,
+};
 pub use sync::{SyncStats, make_ssh_puller, read_blob_bytes, run_sync, scan_and_index};
 pub use trust::{Trust, TrustError};
 pub use watcher::{EventKind, FileEvent, watch_folder};

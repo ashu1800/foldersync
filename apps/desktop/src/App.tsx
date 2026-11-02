@@ -7,6 +7,7 @@ import * as api from "./lib/tauri";
 import { useStore } from "./stores/app";
 import { OverallBadge, Icon } from "./components/ui";
 import UpdatePrompt from "./components/UpdatePrompt";
+import InvitePrompt from "./components/InvitePrompt";
 import Dashboard from "./pages/Dashboard";
 import Devices from "./pages/Devices";
 import Folders from "./pages/Folders";
@@ -35,7 +36,9 @@ export default function App() {
     refreshFolders,
     refreshConflicts,
     refreshPendingPairings,
+    refreshPendingInvites,
     addPendingPairing,
+    addPendingInvite,
     addConflict,
     setDevice,
     setFolder,
@@ -56,6 +59,9 @@ export default function App() {
         api.on("pairing://request", (p) => {
           addPendingPairing(p);
         }),
+        api.on("folder://invite", (inv) => {
+          addPendingInvite(inv);
+        }),
         api.on("conflict://new", (c) => {
           addConflict(c);
         }),
@@ -75,7 +81,14 @@ export default function App() {
       cancelled = true;
       for (const fn of unlisteners) fn();
     };
-  }, [addConflict, addPendingPairing, refreshOverview, setDevice, setFolder]);
+  }, [
+    addConflict,
+    addPendingInvite,
+    addPendingPairing,
+    refreshOverview,
+    setDevice,
+    setFolder,
+  ]);
 
   // 周期性拉概览：RTT / 在线状态靠事件推不全，低频兜底
   useEffect(() => {
@@ -83,9 +96,10 @@ export default function App() {
       if (document.hidden) return;
       void refreshOverview();
       void refreshPendingPairings();
+      void refreshPendingInvites();
     }, 5000);
     return () => window.clearInterval(id);
-  }, [refreshOverview, refreshPendingPairings]);
+  }, [refreshOverview, refreshPendingPairings, refreshPendingInvites]);
 
   // 设备在线状态与冲突数量：列表页停留期间也要保持最新
   useEffect(() => {
@@ -107,6 +121,8 @@ export default function App() {
 
   const conflictCount = conflicts.length;
   const pendingCount = pendingPairings.length;
+  const pendingInvites = useStore((s) => s.pendingInvites);
+  const inviteCount = pendingInvites.length;
 
   return (
     <div className="app">
@@ -138,6 +154,9 @@ export default function App() {
               {n.key === "conflicts" && conflictCount > 0 && (
                 <span className="nav-badge">{conflictCount}</span>
               )}
+              {n.key === "folders" && inviteCount > 0 && (
+                <span className="nav-badge">{inviteCount}</span>
+              )}
               {n.key === "devices" && pendingCount > 0 && (
                 <span className="nav-badge">{pendingCount}</span>
               )}
@@ -157,6 +176,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
+      <InvitePrompt />
       <UpdatePrompt />
     </div>
   );

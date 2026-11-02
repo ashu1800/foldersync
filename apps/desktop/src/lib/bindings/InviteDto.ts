@@ -9,10 +9,6 @@ export type InviteDto = { invite_id: string, folder_id: string, folder_name: str
  */
 suggested_path: string,
 /**
- * 文件数
+ * 收到时间（Unix 秒）
  */
-file_count: number,
-/**
- * 总字节数
- */
-total_size: number, };
+received_at: number, };

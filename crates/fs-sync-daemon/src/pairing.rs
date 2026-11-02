@@ -38,6 +38,9 @@ type PendingMap = HashMap<String, (PendingPairing, oneshot::Sender<bool>)>;
 /// 新配对请求回调（桌面端转发给前端事件用）。
 type OnRequestCb = Arc<dyn Fn(PendingPairing) + Send + Sync>;
 
+/// 新文件夹共享邀请回调（桌面端转发给前端事件用）。
+pub type OnInviteCb = Arc<dyn Fn(fs_sync_store::PendingFolderInvite) + Send + Sync>;
+
 /// 配对会话管理器。
 #[derive(Clone)]
 pub struct PairingManager {

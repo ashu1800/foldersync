@@ -76,6 +76,17 @@ pub struct Activity {
     pub detail: String,
 }
 
+/// 待用户确认的文件夹共享邀请。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingFolderInvite {
+    pub folder_id: String,
+    pub folder_name: String,
+    /// 邀请方设备名（展示用）
+    pub from_device: String,
+    /// 收到时间（Unix 秒）
+    pub received_at: i64,
+}
+
 /// SQLite 存储。Clone 便宜（内部 Arc）。
 #[derive(Clone)]
 pub struct Store {
@@ -165,6 +176,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS declined_folder_invites (
                 folder_id TEXT PRIMARY KEY,
                 declined_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_folder_invites (
+                folder_id TEXT PRIMARY KEY,
+                folder_name TEXT NOT NULL,
+                from_device TEXT NOT NULL,
+                received_at INTEGER NOT NULL
             );
             "#,
         )?;
@@ -384,6 +401,20 @@ impl Store {
         Ok(())
     }
 
+    /// 记录"用户已拒绝该文件夹邀请"标记（不删任何数据）。
+    pub fn upsert_declined_folder_invite(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT OR REPLACE INTO declined_folder_invites (folder_id, declined_at) VALUES (?1, ?2)",
+            rusqlite::params![id, now],
+        )?;
+        Ok(())
+    }
+
     /// 已在本机明确移除的文件夹，不再接受同 id 的自动邀请。
     pub fn is_folder_invite_declined(&self, id: &str) -> Result<bool> {
         let conn = self.lock();
@@ -399,6 +430,77 @@ impl Store {
         let conn = self.lock();
         conn.execute(
             "DELETE FROM declined_folder_invites WHERE folder_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    // ---- pending_folder_invites（待用户确认的共享邀请）----
+
+    /// 记录一条待确认邀请（同 id 覆盖刷新时间）。
+    pub fn upsert_pending_folder_invite(&self, inv: &PendingFolderInvite) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO pending_folder_invites (folder_id, folder_name, from_device, received_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(folder_id) DO UPDATE SET
+                folder_name = ?2, from_device = ?3, received_at = ?4",
+            rusqlite::params![
+                inv.folder_id,
+                inv.folder_name,
+                inv.from_device,
+                inv.received_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 全部待确认邀请（按时间正序）。
+    pub fn list_pending_folder_invites(&self) -> Result<Vec<PendingFolderInvite>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT folder_id, folder_name, from_device, received_at
+             FROM pending_folder_invites ORDER BY received_at",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(PendingFolderInvite {
+                    folder_id: r.get(0)?,
+                    folder_name: r.get(1)?,
+                    from_device: r.get(2)?,
+                    received_at: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 取一条；不存在返回 None（已被处理/已清）。
+    pub fn get_pending_folder_invite(&self, id: &str) -> Result<Option<PendingFolderInvite>> {
+        let conn = self.lock();
+        let mut st = conn.prepare(
+            "SELECT folder_id, folder_name, from_device, received_at
+             FROM pending_folder_invites WHERE folder_id = ?1",
+        )?;
+        let mut rows = st.query_map([id], |r| {
+            Ok(PendingFolderInvite {
+                folder_id: r.get(0)?,
+                folder_name: r.get(1)?,
+                from_device: r.get(2)?,
+                received_at: r.get(3)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 处理完成（接受或拒绝）后删除。
+    pub fn remove_pending_folder_invite(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM pending_folder_invites WHERE folder_id = ?1",
             [id],
         )?;
         Ok(())
@@ -785,6 +887,42 @@ mod tests {
         s.remove_folder("f1").unwrap();
         assert!(s.list_folders().unwrap().is_empty());
         assert!(s.is_folder_invite_declined("f1").unwrap());
+    }
+
+    #[test]
+    fn pending_folder_invite_crud() {
+        let s = Store::open_in_memory().unwrap();
+        let inv = PendingFolderInvite {
+            folder_id: "f9".into(),
+            folder_name: "共享".into(),
+            from_device: "ashu_work".into(),
+            received_at: 100,
+        };
+        s.upsert_pending_folder_invite(&inv).unwrap();
+        assert_eq!(s.list_pending_folder_invites().unwrap(), vec![inv.clone()]);
+        assert_eq!(
+            s.get_pending_folder_invite("f9").unwrap(),
+            Some(inv.clone())
+        );
+        assert_eq!(s.get_pending_folder_invite("nope").unwrap(), None);
+
+        // 同 id 覆盖：不产生重复行
+        let mut upd = inv.clone();
+        upd.received_at = 200;
+        s.upsert_pending_folder_invite(&upd).unwrap();
+        assert_eq!(s.list_pending_folder_invites().unwrap().len(), 1);
+        assert_eq!(
+            s.get_pending_folder_invite("f9")
+                .unwrap()
+                .unwrap()
+                .received_at,
+            200
+        );
+
+        s.remove_pending_folder_invite("f9").unwrap();
+        assert!(s.list_pending_folder_invites().unwrap().is_empty());
+        // 重复删除幂等
+        s.remove_pending_folder_invite("f9").unwrap();
     }
 
     #[test]

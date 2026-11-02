@@ -292,6 +292,7 @@ async fn start_sync_server(
         online: Arc::new(tokio::sync::Mutex::new(Default::default())),
         relay_host_keys: cli_relay_host_keys(&ctx.data_dir),
         sftp_bandwidth: None,
+        on_invite: Arc::new(std::sync::RwLock::new(None)),
     });
     let server = run_ssh_server(shared).await?;
     ctx.pairing.set_ssh_port(server.port);
@@ -368,6 +369,7 @@ async fn serve(cli: &Cli, auto_confirm: bool, folders: Vec<String>) -> Result<()
             .unwrap_or_else(|| ctx.data_dir.clone())
             .join("FolderSync"),
         paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        on_invite: None,
     }));
     let rt2 = runtimes.clone();
     let trust2 = ctx.trust.clone();

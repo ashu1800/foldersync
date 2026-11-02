@@ -103,6 +103,12 @@ pub fn run() {
                         use tauri::Emitter;
                         let _ = handle.emit("pairing://request", p);
                     }));
+                    // 文件夹共享邀请挂起推送：SSH 直连与中继两条路径都走这里。
+                    let handle = app.handle().clone();
+                    st.set_on_folder_invite(Arc::new(move |inv| {
+                        use tauri::Emitter;
+                        let _ = handle.emit("folder://invite", inv);
+                    }));
                     let restore = st.clone();
                     app.manage(st);
                     tauri::async_runtime::spawn(async move {
@@ -146,6 +152,9 @@ pub fn run() {
             commands::accept_pairing_code,
             commands::confirm_pairing,
             commands::list_pending_pairings,
+            commands::list_pending_invites,
+            commands::accept_pending_invite,
+            commands::decline_pending_invite,
             commands::rename_device,
             commands::remove_device,
             commands::list_folders,

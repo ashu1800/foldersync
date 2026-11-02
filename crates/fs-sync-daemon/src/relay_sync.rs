@@ -388,7 +388,8 @@ fn fallback_folder_name(folder_id: &str) -> String {
     }
 }
 
-/// 中继索引里出现本机没有的文件夹时，按邀请自动创建（仅新建空目录，绝不覆盖已有内容）。
+/// 中继索引里出现本机没有的文件夹时，挂起为待确认邀请（由用户在界面接受/拒绝）。
+/// 已存在同 id 或已拒绝过的保持原语义：不自动恢复、不重复提示。
 async fn ensure_peer_folder(
     cfg: &PeerLoopConfig,
     peer: &Device,
@@ -422,109 +423,31 @@ async fn ensure_peer_folder(
         // 已存在但 runtime 没起来，通常是用户暂停了：不自动恢复。
         return false;
     }
-    let target = cfg.sync_root.join(&name);
-    if existing.iter().any(|f| f.local_path == target) {
-        warn!(path = %target.display(), "中继邀请路径已被其他文件夹占用");
-        return false;
-    }
-    if std::fs::create_dir_all(&cfg.sync_root).is_err() {
-        return false;
-    }
-    let Ok(root_canon) = std::fs::canonicalize(&cfg.sync_root) else {
-        return false;
+    // 新文件夹：挂起待确认，不再自动在同步根目录建目录。
+    // 恒回 true：索引里这条让后续流程自然跳过（找不到 runtime 就 continue），
+    // 回 false 与 true 在调用点效果相同，但 true 语义是"已处理"。
+    let received_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let inv = fs_sync_store::PendingFolderInvite {
+        folder_id: folder.folder_id.clone(),
+        folder_name: name.clone(),
+        from_device: peer.name.clone(),
+        received_at,
     };
-    if target.exists() {
-        let empty = std::fs::read_dir(&target)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false);
-        if !empty {
-            warn!(peer = %peer.name, path = %target.display(), "拒绝中继邀请复用非空目录");
-            return false;
-        }
-    }
-    if std::fs::create_dir_all(&target).is_err() {
+    if let Err(e) = cfg.store.upsert_pending_folder_invite(&inv) {
+        warn!(peer = %peer.name, folder = %folder.folder_id, "记录待确认中继邀请失败: {e}");
         return false;
     }
-    let Ok(canon_target) = std::fs::canonicalize(&target) else {
-        return false;
-    };
-    if !canon_target.starts_with(&root_canon) || canon_target == root_canon {
-        return false;
+    if let Some(cb) = cfg.on_invite.as_ref() {
+        cb(inv.clone());
     }
-    if cfg
-        .store
-        .add_folder_from_invite(&fs_sync_store::Folder {
-            id: folder.folder_id.clone(),
-            name: name.to_string(),
-            local_path: target.clone(),
-            paused: false,
-            tombstone_days: 30,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            shared_with: vec![peer.id.clone()],
-        })
-        .is_err()
-    {
-        return false;
-    }
-    let created_path = target.clone();
-    let rt = match FolderRuntime::start(
-        folder.folder_id.clone(),
-        target,
-        cfg.device_id.clone(),
-        cfg.store.clone(),
-        cfg.blobs.clone(),
-        400,
-    )
-    .await
-    {
-        Ok(rt) => Arc::new(rt),
-        Err(e) => {
-            let _ = cfg.store.discard_folder_record(&folder.folder_id);
-            warn!(peer = %peer.name, "中继邀请启动同步失败: {e}");
-            return false;
-        }
-    };
-    rt.set_shared_with(vec![peer.id.clone()]);
-    let pushed = {
-        let mut guard = runtimes.lock().unwrap();
-        let valid = !cfg.paused_all.load(std::sync::atomic::Ordering::Relaxed)
-            && cfg
-                .store
-                .list_folders()
-                .map(|v| {
-                    v.iter().any(|f| {
-                        f.id == folder.folder_id && !f.paused && f.local_path == created_path
-                    })
-                })
-                .unwrap_or(false);
-        if valid {
-            guard.push(rt.clone());
-        }
-        valid
-    };
-    if !pushed {
-        rt.cancel();
-        // 若用户只是暂停/重定位，保留文件夹记录；只有记录确实不存在才回滚。
-        let still_exists = cfg
-            .store
-            .list_folders()
-            .map(|v| v.iter().any(|f| f.id == folder.folder_id))
-            .unwrap_or(true);
-        if !still_exists {
-            let _ = cfg.store.discard_folder_record(&folder.folder_id);
-        }
-        return false;
-    }
-    let _ = cfg.store.log_activity(
-        "info",
-        &folder.folder_id,
-        "",
-        &format!("已接受来自「{}」的共享文件夹（中继）", peer.name),
+    info!(
+        peer = %peer.name,
+        folder = %name,
+        "中继共享邀请已挂起，等待用户确认"
     );
-    info!(peer = %peer.name, folder = %name, "已接受中继共享文件夹");
     true
 }
 
@@ -647,7 +570,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn relay_invite_creates_folder_once() {
+    async fn relay_invite_pends_for_user_confirmation() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().to_path_buf();
         let identity = fs_sync_net::identity::SshIdentity::load_or_create(&data).unwrap();
@@ -666,6 +589,7 @@ mod tests {
             blobs,
             sync_root: data.join("FolderSync"),
             paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            on_invite: None,
         };
         let peer = Device {
             id: "peer-a".into(),
@@ -686,15 +610,26 @@ mod tests {
             folder_name: "Shared".into(),
             entries: Vec::new(),
         };
+        // 新邀请：挂起为待确认，不建目录、不建文件夹记录
         assert!(ensure_peer_folder(&cfg, &peer, &folder, &runtimes).await);
-        assert_eq!(store.list_folders().unwrap().len(), 1);
-        assert_eq!(
-            store.list_folders().unwrap()[0].local_path,
-            data.join("FolderSync/Shared")
-        );
-        // 第二轮不应重复创建
+        assert!(store.list_folders().unwrap().is_empty());
+        assert!(!data.join("FolderSync/Shared").exists());
+        let pending = store.list_pending_folder_invites().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].folder_id, "folder-shared");
+        assert_eq!(pending[0].folder_name, "Shared");
+        assert_eq!(pending[0].from_device, "node-a");
+
+        // 第二轮：同一邀请只更新时间戳，不产生重复行
         assert!(ensure_peer_folder(&cfg, &peer, &folder, &runtimes).await);
-        assert_eq!(store.list_folders().unwrap().len(), 1);
+        assert_eq!(store.list_pending_folder_invites().unwrap().len(), 1);
+
+        // 用户拒绝后：不再挂起
+        store
+            .upsert_declined_folder_invite(&folder.folder_id)
+            .unwrap();
+        assert!(!ensure_peer_folder(&cfg, &peer, &folder, &runtimes).await);
+        assert_eq!(store.list_pending_folder_invites().unwrap().len(), 1);
 
         // 旧版索引没有 folder_name：按 folder_id 生成安全回退名
         let legacy = RelayFolder {
@@ -703,14 +638,13 @@ mod tests {
             entries: Vec::new(),
         };
         assert!(ensure_peer_folder(&cfg, &peer, &legacy, &runtimes).await);
-        let folders = store.list_folders().unwrap();
-        assert_eq!(folders.len(), 2);
-        assert!(folders.iter().any(|f| {
-            f.local_path
-                == data
-                    .join("FolderSync")
-                    .join(fallback_folder_name("folder-legacy"))
-        }));
+        let pending = store.list_pending_folder_invites().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.folder_name == fallback_folder_name("folder-legacy"))
+        );
     }
 
     #[test]

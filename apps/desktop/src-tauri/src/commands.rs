@@ -345,6 +345,188 @@ pub async fn list_pending_pairings(
         .collect())
 }
 
+// ---------- 待确认的文件夹共享邀请 ----------
+
+/// 待确认邀请 → DTO（suggested_path = 同步根目录/<名称>）。
+fn invite_dto(inv: fs_sync_store::PendingFolderInvite, sync_root: &std::path::Path) -> InviteDto {
+    InviteDto {
+        invite_id: inv.folder_id.clone(),
+        folder_id: inv.folder_id,
+        suggested_path: sync_root
+            .join(&inv.folder_name)
+            .to_string_lossy()
+            .into_owned(),
+        folder_name: inv.folder_name,
+        from_device: inv.from_device,
+        received_at: inv.received_at,
+    }
+}
+
+/// 待确认的文件夹共享邀请列表。
+#[tauri::command]
+pub async fn list_pending_invites(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<InviteDto>> {
+    let sync_root = state.ssh_shared.sync_root.clone();
+    Ok(state
+        .store
+        .list_pending_folder_invites()
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?
+        .into_iter()
+        .map(|inv| invite_dto(inv, &sync_root))
+        .collect())
+}
+
+/// 接受邀请：在用户选择的路径建立文件夹并启动同步。
+///
+/// 校验复用 ssh_server::accept_invite 的规则（路径不越界、不复用非空目录、
+/// 不与其他文件夹冲突），通过后写库 + 启动 runtime，与手动添加一致。
+#[tauri::command]
+pub async fn accept_pending_invite(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    invite_id: String,
+    path: String,
+) -> CmdResult<FolderDto> {
+    let inv = state
+        .store
+        .get_pending_folder_invite(&invite_id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?
+        .ok_or_else(|| ErrorDto::new("not_found", "邀请不存在或已被处理"))?;
+    if !fs_sync_daemon::is_safe_folder_name(inv.folder_name.trim()) {
+        return Err(ErrorDto::new("invalid", "文件夹名不安全"));
+    }
+
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_dir() {
+        return Err(ErrorDto::new("bad_path", "目标目录不存在或不是文件夹"));
+    }
+    // 允许"选一个还不存在的子目录"：父目录存在即可，接受时创建
+    let target = if target
+        .read_dir()
+        .map(|mut i| i.next().is_none())
+        .unwrap_or(false)
+        && target.file_name().map(|n| n.to_string_lossy()) == Some(inv.folder_name.as_str().into())
+    {
+        target
+    } else {
+        target.join(&inv.folder_name)
+    };
+
+    let folders = state.store.list_folders().unwrap_or_default();
+    // 同 id 已存在（例如另一端先建过）：只允许名称一致
+    if folders
+        .iter()
+        .find(|f| f.id == inv.folder_id)
+        .is_some_and(|existing| existing.name != inv.folder_name)
+    {
+        return Err(ErrorDto::new("duplicate", "同名文件夹已在同步列表中"));
+    }
+    // 路径不能与其他文件夹重复
+    if folders.iter().any(|f| {
+        std::fs::canonicalize(&f.local_path)
+            .ok()
+            .zip(std::fs::canonicalize(&target).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false)
+    }) {
+        return Err(ErrorDto::new("duplicate", "该路径已被其他文件夹使用"));
+    }
+    if target.exists() {
+        let empty = std::fs::read_dir(&target)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            return Err(ErrorDto::new(
+                "not_empty",
+                "目标目录非空，为避免覆盖已有内容请另选路径",
+            ));
+        }
+    }
+    std::fs::create_dir_all(&target)
+        .map_err(|e| ErrorDto::new("io", format!("创建目录失败: {e}")))?;
+
+    let now = now_secs();
+    state
+        .store
+        .add_folder_from_invite(&Folder {
+            id: inv.folder_id.clone(),
+            name: inv.folder_name.clone(),
+            local_path: target.clone(),
+            paused: false,
+            tombstone_days: 30,
+            created_at: now,
+            shared_with: vec![], // 空 = 所有已配对设备，与手动添加一致
+        })
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    state
+        .store
+        .remove_pending_folder_invite(&invite_id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    state
+        .store
+        .clear_folder_invite_declined(&inv.folder_id)
+        .ok();
+
+    // 首扫可能较久：后台启动，界面显示「扫描中」
+    let st = state.inner().clone();
+    let start_id = inv.folder_id.clone();
+    let start_path = target.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = st.start_folder(start_id, start_path).await {
+            warn!("启动受邀文件夹同步失败: {e:#}");
+        }
+    });
+
+    let _ = state.store.log_activity(
+        "info",
+        &inv.folder_id,
+        "",
+        &format!("已接受来自「{}」的共享文件夹", inv.from_device),
+    );
+    info!(folder = %inv.folder_name, "已接受文件夹邀请");
+    emit_folder_status(&app, &state, &inv.folder_id).await;
+
+    Ok(FolderDto {
+        id: inv.folder_id,
+        name: inv.folder_name,
+        path: target.to_string_lossy().into_owned(),
+        status: FolderStatus::Scanning,
+        paused: false,
+        last_sync_at: None,
+        pending: 0,
+        file_count: 0,
+        shared_with: vec![],
+        last_error: None,
+    })
+}
+
+/// 拒绝邀请：记录拒绝标记，之后同 id 的重复邀请不再提示。
+#[tauri::command]
+pub async fn decline_pending_invite(
+    state: State<'_, Arc<AppState>>,
+    invite_id: String,
+) -> CmdResult<()> {
+    let inv = state
+        .store
+        .get_pending_folder_invite(&invite_id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?
+        .ok_or_else(|| ErrorDto::new("not_found", "邀请不存在或已被处理"))?;
+    state
+        .store
+        .remove_pending_folder_invite(&invite_id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    state
+        .store
+        .upsert_declined_folder_invite(&invite_id)
+        .map_err(|e| ErrorDto::new("store", e.to_string()))?;
+    let _ = state.store.log_activity(
+        "info",
+        &invite_id,
+        "",
+        &format!("已拒绝来自「{}」的共享文件夹", inv.from_device),
+    );
+    Ok(())
+}
+
 /// 重命名已配对设备。
 #[tauri::command]
 pub async fn rename_device(

@@ -29,7 +29,7 @@ use crate::pairing::PairingManager;
 use crate::runtime::{FolderRuntime, PeerLoopConfig, handle_incoming};
 use crate::trust::Trust;
 use fs_sync_net::blobstore::BlobStore;
-use fs_sync_store::{Folder, Store};
+use fs_sync_store::Store;
 
 /// SSH 服务端共享状态。
 pub struct SshServerShared {
@@ -61,10 +61,14 @@ pub struct SshServerShared {
         fs_sync_net::sftp_fs::BandwidthFn,
         fs_sync_net::sftp_fs::BandwidthFn,
     )>,
+    /// 新文件夹邀请挂起时的回调（桌面端转发前端事件；CLI/测试为 None）。
+    /// RwLock<Option<_>>：AppState 构造在服务端启动之后才能拿到 AppHandle 注入。
+    pub on_invite: Arc<std::sync::RwLock<Option<crate::pairing::OnInviteCb>>>,
 }
 
 impl SshServerShared {
     fn peer_cfg(&self) -> PeerLoopConfig {
+        let on_invite = self.on_invite.read().ok().and_then(|g| g.clone());
         PeerLoopConfig {
             identity: self.identity.clone(),
             device_id: self.device_id.clone(),
@@ -78,11 +82,20 @@ impl SshServerShared {
             blobs: self.blobs.clone(),
             sync_root: self.sync_root.clone(),
             paused_all: self.paused_all.clone(),
+            on_invite,
         }
     }
 
-    /// 接受已配对设备的文件夹邀请：在 `~/FolderSync/<name>` 建目录并启动同步。
-    /// 只接受可信设备、且文件夹名做严格白名单校验，防止路径穿越。
+    /// 收到已配对设备的文件夹邀请。
+    ///
+    /// 两种情况直接处理：
+    /// - 非法名 / 已拒绝过 / 正在删除：忽略，回 false；
+    /// - 本地已有同 id 文件夹且名称一致：续上（补共享列表、确保 runtime），回 true。
+    ///
+    /// 其余情况（新文件夹、路径冲突）一律挂起为待确认邀请，由用户在界面
+    /// 上选择存储路径后接受，或拒绝。不再自动在同步根目录建目录。
+    /// 恒回 true（accepted）：新邀请已挂起待用户处理，回 false 会让邀请方
+    /// 的文件夹进入"邀请被拒绝"错误态，而实际上用户只是还没看到弹窗。
     async fn accept_invite(
         &self,
         peer: &fs_sync_store::Device,
@@ -113,9 +126,6 @@ impl SshServerShared {
         if std::fs::create_dir_all(&self.sync_root).is_err() {
             return Ok(false);
         }
-        let Ok(root_canon) = std::fs::canonicalize(&self.sync_root) else {
-            return Ok(false);
-        };
         let target = self.sync_root.join(name);
         let folders = self.store.list_folders().unwrap_or_default();
 
@@ -173,91 +183,32 @@ impl SshServerShared {
             rt.cancel();
             return Ok(false);
         }
-
-        // 同一路径只能被一个文件夹使用，且不能静默复用已有内容。
-        if folders.iter().any(|f| {
-            std::fs::canonicalize(&f.local_path)
-                .ok()
-                .zip(std::fs::canonicalize(&target).ok())
-                .map(|(a, b)| a == b)
-                .unwrap_or(false)
-        }) {
-            warn!(peer = %peer.name, path = %target.display(), "邀请路径已被其他文件夹占用");
-            return Ok(false);
-        }
-        if target.exists() {
-            let empty = std::fs::read_dir(&target)
-                .map(|mut it| it.next().is_none())
-                .unwrap_or(false);
-            if !empty {
-                warn!(peer = %peer.name, path = %target.display(), "拒绝复用非空目录");
-                return Ok(false);
-            }
-        }
-        if let Err(e) = std::fs::create_dir_all(&target) {
-            warn!(path = %target.display(), "创建邀请文件夹失败: {e}");
-            return Ok(false);
-        }
-        let Ok(canon_target) = std::fs::canonicalize(&target) else {
-            return Ok(false);
+        // 已存在同 id 的续上路径在上面已 return；到这里是新邀请：
+        // 不再自动建目录，挂起为待确认邀请，由用户在界面上接受/拒绝。
+        let received_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let inv = fs_sync_store::PendingFolderInvite {
+            folder_id: invite.folder_id.clone(),
+            folder_name: name.to_string(),
+            from_device: peer.name.clone(),
+            received_at,
         };
-        if !canon_target.starts_with(&root_canon) || canon_target == root_canon {
-            warn!(peer = %peer.name, path = %target.display(), "邀请路径越界");
+        if let Err(e) = self.store.upsert_pending_folder_invite(&inv) {
+            warn!(peer = %peer.name, folder = %invite.folder_id, "记录待确认邀请失败: {e}");
             return Ok(false);
         }
-        self.store
-            .add_folder_from_invite(&Folder {
-                id: invite.folder_id.clone(),
-                name: name.to_string(),
-                local_path: target.clone(),
-                paused: false,
-                tombstone_days: 30,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                shared_with: vec![peer.id.clone()],
-            })
-            .map_err(|e| anyhow::anyhow!("写入邀请文件夹失败: {e}"))?;
-        if self.paused_all.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = self.store.log_activity(
-                "info",
-                &invite.folder_id,
-                "",
-                &format!("已接受来自「{}」的共享文件夹（当前全局暂停）", peer.name),
-            );
-            return Ok(true);
-        }
-        let created_path = target.clone();
-        let rt = match FolderRuntime::start(
-            invite.folder_id.clone(),
-            target,
-            self.device_id.clone(),
-            self.store.clone(),
-            self.blobs.clone(),
-            400,
-        )
-        .await
+        if let Ok(guard) = self.on_invite.read()
+            && let Some(f) = guard.as_ref()
         {
-            Ok(rt) => Arc::new(rt),
-            Err(e) => {
-                let _ = self.store.discard_folder_record(&invite.folder_id);
-                return Err(e);
-            }
-        };
-        rt.set_shared_with(vec![peer.id.clone()]);
-        if !self.push_runtime_if_valid(&invite.folder_id, &created_path, rt.clone()) {
-            rt.cancel();
-            let _ = self.store.discard_folder_record(&invite.folder_id);
-            return Ok(false);
+            f(inv.clone());
         }
-        let _ = self.store.log_activity(
-            "info",
-            &invite.folder_id,
-            "",
-            &format!("已接受来自「{}」的共享文件夹", peer.name),
+        info!(
+            peer = %peer.name,
+            folder = %name,
+            "文件夹邀请已挂起，等待用户确认"
         );
-        info!(peer = %peer.name, folder = %invite.folder_name, "已接受文件夹邀请并创建本地文件夹");
         Ok(true)
     }
 
@@ -299,7 +250,7 @@ impl SshServerShared {
 }
 
 /// Windows 文件名白名单；拒绝尾部点/空格、保留设备名和路径分隔符。
-pub(crate) fn is_safe_folder_name(name: &str) -> bool {
+pub fn is_safe_folder_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 || name.ends_with('.') || name.ends_with(' ') {
         return false;
     }
@@ -813,6 +764,7 @@ mod tests {
             online: Arc::new(tokio::sync::Mutex::new(Default::default())),
             relay_host_keys: crate::runtime::test_relay_host_keys(),
             sftp_bandwidth: None,
+            on_invite: Arc::new(std::sync::RwLock::new(None)),
         });
         let server = run_ssh_server(shared.clone()).await.unwrap();
         Fixture {
@@ -959,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn folder_invite_creates_local_folder_for_trusted_peer() {
+    async fn folder_invite_pends_for_user_confirmation() {
         let f = fixture().await;
         let peer = f
             .shared
@@ -974,19 +926,34 @@ mod tests {
             folder_name: "Invited".into(),
             from_name: "peer".into(),
         };
+        // 新邀请：不自动建目录，挂起为待确认；accepted=true（已进入待确认流程）
         assert!(f.shared.accept_invite(&peer, &invite).await.unwrap());
-        let folder = f
-            .shared
+        assert!(
+            f.shared
+                .store
+                .list_folders()
+                .unwrap()
+                .iter()
+                .all(|x| x.id != "folder-invited"),
+            "不应自动创建文件夹记录"
+        );
+        assert!(!f.shared.sync_root.join("Invited").exists());
+        let pending = f.shared.store.list_pending_folder_invites().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].folder_id, "folder-invited");
+        assert_eq!(pending[0].folder_name, "Invited");
+        assert_eq!(pending[0].from_device, "client");
+
+        // 用户拒绝后：重复邀请不再挂起
+        f.shared
             .store
-            .list_folders()
-            .unwrap()
-            .into_iter()
-            .find(|x| x.id == "folder-invited")
-            .expect("邀请应创建本地文件夹记录");
-        assert_eq!(folder.name, "Invited");
-        assert!(folder.local_path.is_dir());
-        assert!(folder.local_path.starts_with(f._tmp.path()));
-        assert_eq!(f.shared.runtimes.lock().unwrap().len(), 1);
+            .upsert_declined_folder_invite("folder-invited")
+            .unwrap();
+        assert!(!f.shared.accept_invite(&peer, &invite).await.unwrap());
+        assert_eq!(
+            f.shared.store.list_pending_folder_invites().unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

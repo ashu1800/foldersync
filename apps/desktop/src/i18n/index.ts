@@ -82,6 +82,14 @@ const zh = {
     accept: "接受",
     reject: "拒绝",
   },
+  invites: {
+    title: "收到共享邀请",
+    message: "设备「{{device}}」想把文件夹「{{name}}」共享给你。",
+    pathLabel: "存储位置（将创建子文件夹）",
+    browse: "浏览…",
+    accept: "接受并同步",
+    decline: "拒绝",
+  },
   folders: {
     title: "文件夹",
     add: "添加文件夹",
@@ -366,6 +374,14 @@ const en: typeof zh = {
     incomingRequest: "Device requests pairing",
     accept: "Accept",
     reject: "Reject",
+  },
+  invites: {
+    title: "Folder share invitation",
+    message: "{{device}} wants to share the folder \"{{name}}\" with you.",
+    pathLabel: "Storage location (a subfolder will be created)",
+    browse: "Browse…",
+    accept: "Accept & sync",
+    decline: "Decline",
   },
   folders: {
     title: "Folders",

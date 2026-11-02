@@ -113,6 +113,7 @@ async fn two_nodes_sync_through_relay() {
             blobs: node.runtime.session.blobs.clone(),
             sync_root: node._dir.path().join("FolderSync"),
             paused_all: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            on_invite: None,
         }))
     };
     let cfg_a = cfg(&a);

@@ -71,6 +71,8 @@ pub struct AppState {
     pub peer_cfg: Arc<std::sync::RwLock<PeerLoopConfig>>,
     /// SSH 服务端句柄（drop 即停）
     pub ssh_server: Mutex<Option<SshServerHandle>>,
+    /// SSH 服务端共享状态引用：setup 阶段向其注入邀请回调。
+    pub ssh_shared: Arc<SshServerShared>,
 }
 
 impl AppState {
@@ -185,8 +187,9 @@ impl AppState {
             online: online.clone(),
             relay_host_keys: relay_host_keys.clone(),
             sftp_bandwidth,
+            on_invite: Arc::new(std::sync::RwLock::new(None)),
         });
-        let server = run_ssh_server(shared)
+        let server = run_ssh_server(shared.clone())
             .await
             .context("启动 SSH 服务端失败")?;
         // 端口被占用时服务端会回退随机端口，配对码要公布实际端口
@@ -210,6 +213,7 @@ impl AppState {
             blobs: blobs.clone(),
             sync_root: sync_root.clone(),
             paused_all: paused_all.clone(),
+            on_invite: None, // 同上，setup 阶段注入
         }));
 
         let state = Arc::new(Self {
@@ -234,6 +238,7 @@ impl AppState {
             limits,
             peer_cfg,
             ssh_server: Mutex::new(Some(server)),
+            ssh_shared: shared.clone(),
         });
 
         // 启动对等连接循环（信任列表为空时只是空转）
@@ -561,6 +566,17 @@ impl AppState {
             .read()
             .map(|g| g.clone())
             .unwrap_or_else(|_| crate::limits::Limits::unlimited())
+    }
+
+    /// 注入"新文件夹邀请挂起"回调：同步挂到 SSH 服务端共享状态与对等循环配置。
+    /// 必须在 AppState 构造后、前端可触发邀请前调用（lib.rs setup 阶段）。
+    pub fn set_on_folder_invite(&self, cb: fs_sync_daemon::OnInviteCb) {
+        // SSH 服务端路径
+        if let Ok(mut guard) = self.ssh_shared.on_invite.write() {
+            *guard = Some(cb.clone());
+        }
+        // 对等连接（中继/Tailscale 主动发起的会话）路径
+        self.peer_cfg.write().unwrap().on_invite = Some(cb);
     }
 }
 
